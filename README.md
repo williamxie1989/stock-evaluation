@@ -27,10 +27,18 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-2. 在 `.env` 文件中配置您的OpenAI API密钥：
+2. 在 `.env` 文件中配置您的API密钥：
 ```env
+# OpenAI配置
 OPENAI_API_KEY=sk-your-openai-api-key-here
+
+# 本地大模型配置
+LOCAL_MODEL_URL=http://your-local-model-url
+LOCAL_MODEL_API_KEY=your-local-api-key
+LOCAL_MODEL_NAME=your-model-name
 ```
+
+注意：可以只配置OpenAI或本地大模型其中一种，优先使用本地大模型配置。
 
 ## 运行程序
 
@@ -86,8 +94,6 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 - [x] 支持自定义分析参数
 - [x] 添加历史回测功能
 - [x] 集成更多数据源
-- [ ] 添加用户管理系统
-- [ ] 支持邮件/短信提醒
 - [ ] 添加多因子分析
 - [ ] 支持策略优化
 
