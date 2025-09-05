@@ -47,6 +47,77 @@ class AkshareDataProvider:
             print(f"通过股票名称获取代码时出错: {e}")
             return None
     
+    def _get_stock_industry_and_market_cap(self, ak_symbol, stock_symbol):
+        """获取股票行业和市值信息"""
+        stock_info = {
+            'symbol': stock_symbol,
+            'longName': stock_symbol,
+            'industry': 'N/A',
+            'marketCap': None
+        }
+        
+        try:
+            # 方法1: 使用个股基本信息接口（主要方法）
+            try:
+                individual_info = ak.stock_individual_info_em(symbol=ak_symbol)
+                if individual_info is not None and not individual_info.empty:
+                    # 查找行业信息
+                    industry_row = individual_info[individual_info['item'] == '行业']
+                    if not industry_row.empty:
+                        industry = industry_row.iloc[0]['value']
+                        stock_info['industry'] = industry if industry and industry != '—' else 'N/A'
+                    
+                    # 查找市值信息
+                    market_cap_row = individual_info[individual_info['item'] == '总市值']
+                    if not market_cap_row.empty:
+                        market_cap_str = str(market_cap_row.iloc[0]['value'])
+                        market_cap_str = market_cap_str.replace(',', '')
+                        try:
+                            market_cap = float(market_cap_str)
+                            stock_info['marketCap'] = market_cap
+                        except ValueError:
+                            print(f"无法解析市值数据: {market_cap_str}")
+                    
+                    # 获取股票名称
+                    name_row = individual_info[individual_info['item'] == '股票简称']
+                    if not name_row.empty:
+                        stock_info['longName'] = name_row.iloc[0]['value']
+            except Exception as e:
+                print(f"获取个股基本信息失败: {e}")
+            
+            # 方法2: 使用实时行情数据作为备选（主要获取市值和名称）
+            try:
+                spot_data = ak.stock_zh_a_spot_em()
+                if spot_data is not None and not spot_data.empty:
+                    # 查找匹配的股票
+                    matched_stock = spot_data[spot_data['代码'] == ak_symbol]
+                    if not matched_stock.empty:
+                        # 获取总市值（转换为亿元）
+                        if '总市值' in matched_stock.columns:
+                            market_cap_str = str(matched_stock.iloc[0]['总市值'])
+                            # 处理市值字符串（可能包含逗号分隔符）
+                            market_cap_str = market_cap_str.replace(',', '')
+                            try:
+                                market_cap = float(market_cap_str)
+                                # 如果个股基本信息接口没有获取到市值，使用实时行情数据
+                                if stock_info['marketCap'] is None:
+                                    stock_info['marketCap'] = market_cap
+                            except ValueError:
+                                print(f"无法解析市值数据: {market_cap_str}")
+                        
+                        # 获取股票名称
+                        if '名称' in matched_stock.columns:
+                            stock_name = matched_stock.iloc[0]['名称']
+                            if stock_info['longName'] == stock_symbol:
+                                stock_info['longName'] = stock_name
+            except Exception as e:
+                print(f"获取实时行情数据失败: {e}")
+                
+        except Exception as e:
+            print(f"获取股票行业和市值信息失败: {e}")
+        
+        return stock_info
+
     def get_stock_data(self, stock_symbol, period="1y"):
         """使用akshare获取股票数据"""
         try:
@@ -127,11 +198,8 @@ class AkshareDataProvider:
                 print(f"获取大盘数据失败: {e}")
                 market_df = None
             
-            # 股票信息
-            stock_info = {
-                'symbol': stock_symbol,
-                'longName': stock_symbol  # akshare可能不提供完整的股票名称
-            }
+            # 获取股票行业和市值信息
+            stock_info = self._get_stock_industry_and_market_cap(ak_symbol, stock_symbol)
             
             return {
                 'stock_data': stock_df,
