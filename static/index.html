@@ -361,17 +361,20 @@
                         type: 'scatter',
                         // scatter 使用 [index, value]，索引对应 xAxis.data
                         data: buyData,
-                        symbol: 'triangle',
-                        symbolRotate: -90,
-                        itemStyle: { color: 'green' },
+                        symbol: 'pin',
+                        symbolSize: 20,
+                        symbolOffset: [0, 15],
+                        itemStyle: { color: '#00ff00' },
                         yAxisIndex: 0
                     },
                     {
                         name: '卖出',
                         type: 'scatter',
                         data: sellData,
-                        symbol: 'rect',
-                        itemStyle: { color: 'red' },
+                        symbol: 'pin',
+                        symbolSize: 20,
+                        symbolOffset: [0, -15],
+                        itemStyle: { color: '#ff0000' },
                         yAxisIndex: 0
                     }
                 ]
