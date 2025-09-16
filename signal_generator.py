@@ -355,13 +355,18 @@ class SignalGenerator:
                 continue
             
             # 检查时间间隔（至少间隔3天）
-            if last_signal_date and (signal['date'] - last_signal_date).days < 3:
-                # 如果同类型信号，跳过；如果不同类型，考虑反转
-                if signal['type'] == last_signal_type:
-                    continue
-                else:
-                    # 反转信号，保留但降低置信度
-                    signal['confidence'] *= 0.8
+            if last_signal_date:
+                # 确保日期是datetime类型
+                current_date = pd.to_datetime(signal['date'])
+                last_date = pd.to_datetime(last_signal_date)
+                
+                if (current_date - last_date).days < 3:
+                    # 如果同类型信号，跳过；如果不同类型，考虑反转
+                    if signal['type'] == last_signal_type:
+                        continue
+                    else:
+                        # 反转信号，保留但降低置信度
+                        signal['confidence'] *= 0.8
             
             filtered_signals.append(signal)
             last_signal_date = signal['date']

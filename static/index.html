@@ -40,7 +40,7 @@
                 <input 
                     type="text" 
                     id="stockInput" 
-                    placeholder="输入股票代码（如：600036.SS）" 
+                    placeholder="输入股票代码（如：600036.SH）" 
                     class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
                 <button 
@@ -61,6 +61,25 @@
                     <!-- 动态加载 -->
                 </div>
             </div>
+        </div>
+
+        <!-- 智能选股榜单 -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <div class="flex justify-between items-center mb-3">
+                <h2 class="text-xl font-semibold text-gray-800">智能选股榜单</h2>
+                <div class="flex items-center gap-2">
+                    <label for="sortMode" class="text-sm text-gray-600">排序</label>
+                    <select id="sortMode" class="px-2 py-1 border border-gray-300 rounded text-sm" onchange="onSortModeChange()">
+                        <option value="expected_return_desc">按预期收益</option>
+                        <option value="prob_up_desc">按30天上涨概率</option>
+                        <option value="default">默认</option>
+                    </select>
+                    <button onclick="loadStockPicks()" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">刷新榜单</button>
+                    <button onclick="refreshDataAndReloadPicks()" class="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm">增量刷新数据</button>
+                </div>
+            </div>
+            <div id="stockPicksLoading" class="hidden mb-3"><div class="loading"></div></div>
+            <div id="stockPicks" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
         </div>
 
         <!-- 结果显示区域 -->
@@ -153,8 +172,8 @@
             
             // 自动添加股票代码后缀
             if (/^\d{6}$/.test(symbol)) {
-                // 6位数字，默认为上海A股
-                symbol = symbol + '.SS';
+                // 6位数字：6 开头默认为上交所，其余默认为深交所
+                symbol = symbol.startsWith('6') ? symbol + '.SH' : symbol + '.SZ';
             }
 
             // 显示加载中
@@ -454,6 +473,108 @@
 
         // 页面加载时获取热门股票
         loadPopularStocks();
+
+        // 新增：全局缓存与排序模式
+        let picksCache = [];
+        let sortMode = 'expected_return_desc';
+        async function loadStockPicks() {
+            try {
+                console.log('开始加载智能选股榜单...');
+                document.getElementById('stockPicksLoading').classList.remove('hidden');
+                const resp = await fetch('/api/stock-picks');
+                console.log('API响应状态:', resp.status);
+                const data = await resp.json();
+                console.log('API响应数据:', data);
+                const picks = (data && data.data && data.data.picks) ? data.data.picks : [];
+                const msg = (data && data.data && data.data.message) ? data.data.message : '';
+                console.log('解析的picks数量:', picks.length);
+                // 缓存数据
+                picksCache = picks;
+                renderStockPicks(picksCache, msg);
+            } catch (e) {
+                console.error('加载选股榜单失败:', e);
+                renderStockPicks([], '获取选股榜单失败');
+            } finally {
+                document.getElementById('stockPicksLoading').classList.add('hidden');
+            }
+        }
+
+        // 新增：排序模式变更
+        function onSortModeChange() {
+            const sel = document.getElementById('sortMode');
+            sortMode = sel ? sel.value : 'expected_return_desc';
+            renderStockPicks(picksCache);
+        }
+
+        // 新增：排序逻辑
+        function applySort(arr) {
+            const list = Array.isArray(arr) ? [...arr] : [];
+            if (sortMode === 'expected_return_desc') {
+                return list.sort((a, b) => {
+                    const av = (a && a.expected_return_30d != null) ? a.expected_return_30d : -Infinity;
+                    const bv = (b && b.expected_return_30d != null) ? b.expected_return_30d : -Infinity;
+                    return bv - av;
+                });
+            } else if (sortMode === 'prob_up_desc') {
+                return list.sort((a, b) => {
+                    const ap = (a && (a.prob_up_30d != null ? a.prob_up_30d : a.probability != null ? a.probability : 0));
+                    const bp = (b && (b.prob_up_30d != null ? b.prob_up_30d : b.probability != null ? b.probability : 0));
+                    return bp - ap;
+                });
+            }
+            return list;
+        }
+
+        function renderStockPicks(picks, message) {
+            const container = document.getElementById('stockPicks');
+            if (!Array.isArray(picks) || picks.length === 0) {
+                container.innerHTML = `<p class="text-gray-500">${message || '暂无数据，请尝试点击"增量刷新数据"'}</p>`;
+                return;
+            }
+            const sorted = applySort(picks);
+            container.innerHTML = sorted.map(p => {
+                const probVal = (p && (p.prob_up_30d != null ? p.prob_up_30d : p.probability != null ? p.probability : null));
+                const probPct = probVal != null ? (probVal * 100).toFixed(1) + '%' : '-';
+                const expectedRet = (p && p.expected_return_30d != null) ? (p.expected_return_30d * 100).toFixed(1) + '%' : '-';
+                const probColor = (probVal != null && probVal > 0.5) ? 'text-green-600' : 'text-gray-600';
+                return `
+                <div class="border border-gray-200 rounded p-3 hover:shadow cursor-pointer" onclick="document.getElementById('stockInput').value='${p.symbol}'; analyzeStock();">
+                    <div class="flex justify-between">
+                        <div>
+                            <div class="font-semibold text-gray-800">${p.name || p.symbol}</div>
+                            <div class="text-xs text-gray-500">${p.symbol}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-lg font-bold ${probColor}">${probPct}</div>
+                            <div class="text-xs text-gray-500">30天上涨概率</div>
+                        </div>
+                    </div>
+                    <div class="mt-2 text-sm text-gray-700">
+                        <span>收盘: ${p.last_close!=null? Number(p.last_close).toFixed(2) : '-'}</span>
+                        <span class="ml-3">看多: ${p.sentiment || '-'}</span>
+                        <span class="ml-3">信心: ${p.confidence!=null? p.confidence.toFixed(1)+'%' : '-'}</span>
+                        <span class="ml-3 text-green-700">看多: ${p.long_signals ?? '-'}</span>
+                        <span class="ml-3 text-red-700">看空: ${p.short_signals ?? '-'}</span>
+                        <span class="ml-3 font-medium">30天预期收益: <span class="${(p.expected_return_30d!=null && p.expected_return_30d>=0)?'text-green-700':'text-red-700'}">${expectedRet}</span></span>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        async function refreshDataAndReloadPicks() {
+            try {
+                document.getElementById('stockPicksLoading').classList.remove('hidden');
+                await fetch('/api/refresh-data?max_symbols=50', { method: 'POST' });
+            } catch (e) {
+                // ignore
+            } finally {
+                document.getElementById('stockPicksLoading').classList.add('hidden');
+            }
+            loadStockPicks();
+        }
+
+        // 页面加载时获取智能选股榜单
+        loadStockPicks();
     </script>
 </body>
 </html>
