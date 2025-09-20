@@ -578,12 +578,32 @@
                 const probPct = probVal != null ? (probVal * 100).toFixed(1) + '%' : '-';
                 const expectedRet = (p && p.expected_return_30d != null) ? (p.expected_return_30d * 100).toFixed(1) + '%' : '-';
                 const probColor = (probVal != null && probVal > 0.5) ? 'text-green-600' : 'text-gray-600';
+                // 构建雪球链接 - 修复链接格式，去掉市场后缀
+                let cleanSymbol = p.symbol;
+                // 去掉.SH、.SZ等市场后缀
+                if (cleanSymbol.includes('.')) {
+                    cleanSymbol = cleanSymbol.split('.')[0];
+                }
+                // 确保有正确的市场前缀
+                const symbol = cleanSymbol.startsWith('SH') || cleanSymbol.startsWith('SZ') ? cleanSymbol : 
+                              (cleanSymbol.startsWith('0') || cleanSymbol.startsWith('3') ? 'SZ' + cleanSymbol : 'SH' + cleanSymbol);
+                const xueqiuUrl = `https://xueqiu.com/S/${symbol}`;
                 return `
-                <div class="border border-gray-200 rounded p-3 hover:shadow cursor-pointer" onclick="document.getElementById('stockInput').value='${p.symbol}'; analyzeStock();">
+                <div class="border border-gray-200 rounded p-3 hover:shadow cursor-pointer relative" onclick="window.open('${xueqiuUrl}', '_blank');">
                     <div class="flex justify-between">
-                        <div>
-                            <div class="font-semibold text-gray-800">${p.name || p.symbol}</div>
-                            <div class="text-xs text-gray-500">${p.symbol}</div>
+                        <div class="flex items-center">
+                            <div>
+                                <div class="font-semibold text-gray-800">${p.name || p.symbol}</div>
+                                <div class="text-xs text-gray-500">${p.symbol}</div>
+                            </div>
+                            <!-- 分析按钮移到股票名字旁边 -->
+                            <button class="ml-3 w-7 h-7 bg-blue-500 hover:bg-blue-600 text-white rounded-full flex items-center justify-center text-sm transition-colors" 
+                                    onclick="event.stopPropagation(); document.getElementById('stockInput').value='${p.symbol}'; analyzeStock();" 
+                                    title="分析股票">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                                </svg>
+                            </button>
                         </div>
                         <div class="text-right">
                             <div class="text-lg font-bold ${probColor}">${probPct}</div>
