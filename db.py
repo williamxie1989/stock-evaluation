@@ -45,6 +45,8 @@ class DatabaseManager:
                     board_type TEXT,                   -- 板块类型（主板、创业板、科创板等）
                     exchange TEXT,                     -- 交易所名称
                     ah_pair TEXT,                      -- 若有，对应另一市场代码，例如 H 股代码
+                    industry TEXT,                     -- 行业
+                    market_cap REAL,                   -- 总市值（元）
                     UNIQUE(symbol)
                 );
                 """
@@ -62,6 +64,7 @@ class DatabaseManager:
                     low REAL,
                     close REAL,
                     volume REAL,
+                    amount REAL,
                     source TEXT,                      -- 数据来源（akshare接口名等）
                     UNIQUE(symbol, date)
                 );
@@ -135,6 +138,21 @@ class DatabaseManager:
             if 'exchange' not in columns:
                 cur.execute("ALTER TABLE stocks ADD COLUMN exchange TEXT")
                 print("已添加exchange字段到stocks表")
+
+            # 新增：stocks表添加行业与市值
+            if 'industry' not in columns:
+                cur.execute("ALTER TABLE stocks ADD COLUMN industry TEXT")
+                print("已添加industry字段到stocks表")
+            if 'market_cap' not in columns:
+                cur.execute("ALTER TABLE stocks ADD COLUMN market_cap REAL")
+                print("已添加market_cap字段到stocks表")
+
+            # 新增：prices_daily表添加成交额amount
+            cur.execute("PRAGMA table_info(prices_daily)")
+            pd_columns = [column[1] for column in cur.fetchall()]
+            if 'amount' not in pd_columns:
+                cur.execute("ALTER TABLE prices_daily ADD COLUMN amount REAL")
+                print("已添加amount字段到prices_daily表")
                 
         except Exception as e:
             print(f"数据库迁移失败: {e}")
@@ -185,6 +203,9 @@ class DatabaseManager:
             # 替换为规范symbol
             s2 = dict(s)
             s2['symbol'] = ns
+            # 兼容新增字段：行业与市值
+            s2['industry'] = s.get('industry') if 'industry' in s else None
+            s2['market_cap'] = s.get('market_cap') if 'market_cap' in s else None
             cleaned.append(s2)
         if not cleaned:
             print(f"[upsert_stocks] 所有输入记录均被过滤，跳过写入。跳过 {skipped} 条。")
@@ -193,8 +214,16 @@ class DatabaseManager:
             cur = conn.cursor()
             cur.executemany(
                 """
-                INSERT OR REPLACE INTO stocks(symbol, name, market, board_type, exchange, ah_pair)
-                VALUES(:symbol, :name, :market, :board_type, :exchange, :ah_pair)
+                INSERT INTO stocks(symbol, name, market, board_type, exchange, ah_pair, industry, market_cap)
+                VALUES(:symbol, :name, :market, :board_type, :exchange, :ah_pair, :industry, :market_cap)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name=excluded.name,
+                    market=excluded.market,
+                    board_type=excluded.board_type,
+                    exchange=excluded.exchange,
+                    ah_pair=excluded.ah_pair,
+                    industry=COALESCE(excluded.industry, stocks.industry),
+                    market_cap=COALESCE(excluded.market_cap, stocks.market_cap)
                 """,
                 cleaned
             )
@@ -228,8 +257,12 @@ class DatabaseManager:
         # 日期标准化
         data["date"] = pd.to_datetime(data["date"]).dt.strftime("%Y-%m-%d")
 
+        # 若无amount列，补None，便于统一写入
+        if 'amount' not in data.columns:
+            data['amount'] = None
+
         # 归一化与过滤
-        rows = data[["symbol", "date", "open", "high", "low", "close", "volume"]].to_dict("records")
+        rows = data[["symbol", "date", "open", "high", "low", "close", "volume", "amount"]].to_dict("records")
         cleaned: List[Dict[str, Any]] = []
         skipped = 0
         for r in rows:
@@ -276,8 +309,11 @@ class DatabaseManager:
             cur = conn.cursor()
             cur.executemany(
                 """
-                INSERT OR IGNORE INTO prices_daily(symbol, date, open, high, low, close, volume, source)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO prices_daily(symbol, date, open, high, low, close, volume, amount, source)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, date) DO UPDATE SET
+                    amount = COALESCE(excluded.amount, prices_daily.amount),
+                    source = COALESCE(excluded.source, prices_daily.source)
                 """,
                 [
                     (
@@ -287,6 +323,7 @@ class DatabaseManager:
                         float(r["low"]) if pd.notna(r["low"]) else None,
                         float(r["close"]) if pd.notna(r["close"]) else None,
                         float(r["volume"]) if pd.notna(r["volume"]) else None,
+                        float(r["amount"]) if pd.notna(r["amount"]) else None,
                         source,
                     ) for r in cleaned
                 ]
@@ -294,7 +331,8 @@ class DatabaseManager:
             conn.commit()
             if skipped:
                 print(f"[upsert_prices_daily] 已写入 {len(cleaned)} 条，过滤无效 {skipped} 条。")
-            return cur.rowcount or 0
+            # sqlite3 的 executemany 在某些场景下 rowcount 可能为 -1 或不可用，统一回退为 len(cleaned)
+            return cur.rowcount if (getattr(cur, 'rowcount', None) is not None and cur.rowcount >= 0) else len(cleaned)
 
     def insert_quotes_realtime(self, df: pd.DataFrame, symbol_col: str = "symbol", ts: Optional[str] = None,
                                rename_map: Optional[Dict[str, str]] = None, source: str = "") -> int:
@@ -348,9 +386,21 @@ class DatabaseManager:
         """
         with self.get_conn() as conn:
             if symbols:
-                placeholders = ','.join(['?'] * len(symbols))
+                # 规范化查询用的符号后缀：将 .SS 统一映射为 .SH，以匹配prices_daily中的存储
+                symbols_norm: list[str] = []
+                for s in symbols:
+                    try:
+                        if isinstance(s, str) and s.upper().endswith('.SS'):
+                            symbols_norm.append(s[:-3] + '.SH')
+                        else:
+                            symbols_norm.append(s)
+                    except Exception:
+                        symbols_norm.append(s)
+                # 去重以避免IN子句重复
+                symbols_norm = list(dict.fromkeys(symbols_norm))
+                placeholders = ','.join(['?'] * len(symbols_norm))
                 sql = f"SELECT symbol, date, open, high, low, close, volume FROM prices_daily WHERE symbol IN ({placeholders})"
-                df = pd.read_sql_query(sql, conn, params=symbols)
+                df = pd.read_sql_query(sql, conn, params=symbols_norm)
             else:
                 df = pd.read_sql_query("SELECT symbol, date, open, high, low, close, volume FROM prices_daily", conn)
         if df.empty:

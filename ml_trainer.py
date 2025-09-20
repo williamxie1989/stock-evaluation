@@ -17,11 +17,15 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, Ridge
+# 新增导入
+from sklearn.linear_model import SGDClassifier, SGDRegressor
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, mean_squared_error, mean_absolute_error, r2_score
 from sklearn.pipeline import Pipeline
 import joblib
 
 from db import DatabaseManager
+from enhanced_features import EnhancedFeatureGenerator
+from features import FeatureGenerator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,10 +36,18 @@ class MLTrainer:
     支持逻辑回归模型训练、验证和持久化
     """
     
-    def __init__(self, db_manager: DatabaseManager, model_dir: str = "models"):
-        self.db_manager = db_manager
+    def __init__(self, db_manager: DatabaseManager = None, model_dir: str = "models", use_enhanced_features: bool = False):
+        self.db_manager = db_manager or DatabaseManager()
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(exist_ok=True)
+        
+        # 根据参数选择特征生成器
+        if use_enhanced_features:
+            self.feature_generator = EnhancedFeatureGenerator()
+            logger.info("使用增强特征生成器")
+        else:
+            self.feature_generator = FeatureGenerator()
+            logger.info("使用基础特征生成器")
         
         # 默认超参数
         self.default_params = {
@@ -48,7 +60,13 @@ class MLTrainer:
         self.default_regression_params = {
             'ridge__alpha': [0.1, 1.0, 10.0, 100.0]
         }
-        
+        # 在线学习相关成员
+        self.online_scaler_cls = None
+        self.online_cls_model = None
+        self.online_classes_ = None
+        self.online_scaler_reg = None
+        self.online_reg_model = None
+
     def load_samples_from_db(self, symbols: List[str] = None, 
                            period: str = '10d',
                            start_date: str = None,
@@ -156,13 +174,19 @@ class MLTrainer:
             sklearn Pipeline
         """
         if params is None:
-            params = {'C': 1.0, 'penalty': 'l2', 'solver': 'liblinear', 'max_iter': 1000}
+            # 优化后的默认参数：降低正则化强度，使用L1正则化进行特征选择
+            params = {
+                'C': 0.1,  # 降低正则化强度，允许模型更复杂
+                'penalty': 'l1',  # L1正则化进行特征选择
+                'solver': 'liblinear',  # 支持L1正则化
+                'max_iter': 1000,
+                'class_weight': 'balanced'  # 自动平衡类别权重
+            }
             
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
             ('logistic', LogisticRegression(
                 random_state=42,
-                class_weight='balanced',  # 处理类别不平衡
                 **params
             ))
         ])
@@ -182,7 +206,8 @@ class MLTrainer:
     def train_model(self, X: pd.DataFrame, y: pd.Series, 
                    test_size: float = 0.2,
                    use_grid_search: bool = True,
-                   cv_folds: int = 5) -> Dict[str, Any]:
+                   cv_folds: int = 5,
+                   pipeline_params: Dict | None = None) -> Dict[str, Any]:
         """
         训练模型
         
@@ -192,6 +217,7 @@ class MLTrainer:
             test_size: 测试集比例
             use_grid_search: 是否使用网格搜索
             cv_folds: 交叉验证折数
+            pipeline_params: 直接指定管线中LogisticRegression的参数（覆盖默认），当提供时通常应关闭网格搜索
             
         Returns:
             训练结果字典
@@ -207,10 +233,10 @@ class MLTrainer:
             
             logger.info(f"训练集: {len(X_train)} 样本, 测试集: {len(X_test)} 样本")
             
-            # 创建基础管线
-            base_pipeline = self.create_pipeline()
+            # 创建基础管线（支持外部参数覆盖）
+            base_pipeline = self.create_pipeline(params=pipeline_params)
             
-            if use_grid_search:
+            if use_grid_search and pipeline_params is None:
                 # 网格搜索最优参数
                 logger.info("开始网格搜索...")
                 
@@ -234,10 +260,10 @@ class MLTrainer:
                 logger.info(f"最优CV得分: {grid_search.best_score_:.4f}")
                 
             else:
-                # 使用默认参数训练
+                # 使用指定或默认参数训练
                 best_model = base_pipeline
                 best_model.fit(X_train, y_train)
-                best_params = {}
+                best_params = pipeline_params or {}
                 
             # 预测
             y_train_pred = best_model.predict(X_train)
@@ -283,6 +309,110 @@ class MLTrainer:
             logger.error(f"模型训练失败: {e}")
             raise
     
+    def train_regression_model(self, X: pd.DataFrame, y: pd.Series,
+                               test_size: float = 0.2,
+                               use_grid_search: bool = True,
+                               cv_folds: int = 5,
+                               scoring: str = 'neg_mean_squared_error') -> Dict[str, Any]:
+        """
+        训练回归模型（用于预测forward_return）
+
+        Args:
+            X: 特征矩阵
+            y: 连续目标
+            test_size: 测试集比例
+            use_grid_search: 是否使用网格搜索
+            cv_folds: 交叉验证折数（TimeSeriesSplit）
+            scoring: 网格搜索评分指标，默认neg_mean_squared_error
+
+        Returns:
+            训练结果字典
+        """
+        try:
+            if X.empty or len(y) == 0:
+                raise ValueError("特征或目标数据为空")
+
+            # 分割数据（回归不做分层抽样）
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=42
+            )
+            logger.info(f"[回归] 训练集: {len(X_train)} 样本, 测试集: {len(X_test)} 样本")
+
+            # 基础回归管线
+            base_pipeline = self.create_regression_pipeline()
+
+            if use_grid_search:
+                logger.info("[回归] 开始网格搜索...")
+                tscv = TimeSeriesSplit(n_splits=cv_folds)
+                grid_search = GridSearchCV(
+                    base_pipeline,
+                    self.default_regression_params,
+                    cv=tscv,
+                    scoring=scoring,
+                    n_jobs=-1,
+                    verbose=1
+                )
+                grid_search.fit(X_train, y_train)
+                best_model = grid_search.best_estimator_
+                best_params = grid_search.best_params_
+                logger.info(f"[回归] 最优参数: {best_params}")
+                logger.info(f"[回归] 最优CV得分({scoring}): {grid_search.best_score_:.6f}")
+            else:
+                best_model = base_pipeline
+                best_model.fit(X_train, y_train)
+                best_params = {}
+
+            # 预测
+            y_train_pred = best_model.predict(X_train)
+            y_test_pred = best_model.predict(X_test)
+
+            # 指标
+            train_mse = mean_squared_error(y_train, y_train_pred)
+            test_mse = mean_squared_error(y_test, y_test_pred)
+            train_mae = mean_absolute_error(y_train, y_train_pred)
+            test_mae = mean_absolute_error(y_test, y_test_pred)
+            train_r2 = r2_score(y_train, y_train_pred)
+            test_r2 = r2_score(y_test, y_test_pred)
+
+            logger.info(f"[回归] 训练集: MSE={train_mse:.6f}, MAE={train_mae:.6f}, R2={train_r2:.4f}")
+            logger.info(f"[回归] 测试集: MSE={test_mse:.6f}, MAE={test_mae:.6f}, R2={test_r2:.4f}")
+
+            # 特征重要性（Ridge系数绝对值）
+            try:
+                coefficients = best_model.named_steps['ridge'].coef_
+                feature_importance = {name: float(abs(coef)) for name, coef in zip(X.columns, coefficients)}
+                feature_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+            except Exception as e:
+                logger.warning(f"[回归] 计算特征重要性失败: {e}")
+                feature_importance = {}
+
+            result = {
+                'model': best_model,
+                'best_params': best_params,
+                'feature_names': X.columns.tolist(),
+                'feature_importance': feature_importance,
+                'metrics': {
+                    'train_mse': train_mse,
+                    'test_mse': test_mse,
+                    'train_mae': train_mae,
+                    'test_mae': test_mae,
+                    'train_r2': train_r2,
+                    'test_r2': test_r2
+                },
+                'predictions': {
+                    'X_test': X_test,
+                    'y_test': y_test,
+                    'y_test_pred': y_test_pred
+                },
+                # 为兼容save_model字段
+                'classification_report': None,
+                'confusion_matrix': None
+            }
+            return result
+        except Exception as e:
+            logger.error(f"[回归] 模型训练失败: {e}")
+            raise
+
     def _get_feature_importance(self, model: Pipeline, feature_names: List[str]) -> Dict[str, float]:
         """
         获取特征重要性
@@ -498,3 +628,86 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# =====================
+# 在线学习（分类）
+# =====================
+def init_online_classifier(self, X: pd.DataFrame, y: pd.Series, classes: List[int] | np.ndarray = None, params: Dict | None = None) -> None:
+    """初始化在线分类器（StandardScaler + SGDClassifier）并进行首次拟合"""
+    if classes is None:
+        classes = np.array(sorted(np.unique(y)))
+    self.online_classes_ = np.array(classes)
+    self.online_scaler_cls = StandardScaler()
+    X_filled = X.fillna(X.median())
+    self.online_scaler_cls.partial_fit(X_filled)
+    X_scaled = self.online_scaler_cls.transform(X_filled)
+    default_params = {
+        'loss': 'log_loss',
+        'penalty': 'l2',
+        'alpha': 0.0001,
+        'max_iter': 1000,
+        'random_state': 42,
+        'class_weight': 'balanced'
+    }
+    clf_params = {**default_params, **(params or {})}
+    self.online_cls_model = SGDClassifier(**clf_params)
+    self.online_cls_model.partial_fit(X_scaled, y, classes=self.online_classes_)
+    logger.info("在线分类器已初始化并完成首次拟合")
+
+def online_partial_fit_classifier(self, X: pd.DataFrame, y: pd.Series) -> None:
+    """对在线分类器进行增量训练"""
+    if self.online_cls_model is None or self.online_scaler_cls is None:
+        raise RuntimeError("在线分类器尚未初始化，请先调用 init_online_classifier")
+    X_filled = X.fillna(X.median())
+    self.online_scaler_cls.partial_fit(X_filled)
+    X_scaled = self.online_scaler_cls.transform(X_filled)
+    self.online_cls_model.partial_fit(X_scaled, y)
+    logger.info("在线分类器已完成增量训练")
+
+def online_predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    """使用在线分类器输出正类概率"""
+    if self.online_cls_model is None or self.online_scaler_cls is None:
+        raise RuntimeError("在线分类器尚未初始化")
+    X_filled = X.fillna(X.median())
+    X_scaled = self.online_scaler_cls.transform(X_filled)
+    # SGDClassifier 在 loss='log_loss' 时支持 predict_proba
+    return self.online_cls_model.predict_proba(X_scaled)[:, 1]
+
+# =====================
+# 在线学习（回归）
+# =====================
+def init_online_regressor(self, X: pd.DataFrame, y: pd.Series, params: Dict | None = None) -> None:
+    """初始化在线回归器（StandardScaler + SGDRegressor）并进行首次拟合"""
+    self.online_scaler_reg = StandardScaler()
+    X_filled = X.fillna(X.median())
+    self.online_scaler_reg.partial_fit(X_filled)
+    X_scaled = self.online_scaler_reg.transform(X_filled)
+    default_params = {
+        'loss': 'squared_error',
+        'penalty': 'l2',
+        'alpha': 0.0001,
+        'max_iter': 1000,
+        'random_state': 42
+    }
+    reg_params = {**default_params, **(params or {})}
+    self.online_reg_model = SGDRegressor(**reg_params)
+    self.online_reg_model.partial_fit(X_scaled, y)
+    logger.info("在线回归器已初始化并完成首次拟合")
+
+def online_partial_fit_regressor(self, X: pd.DataFrame, y: pd.Series) -> None:
+    """对在线回归器进行增量训练"""
+    if self.online_reg_model is None or self.online_scaler_reg is None:
+        raise RuntimeError("在线回归器尚未初始化，请先调用 init_online_regressor")
+    X_filled = X.fillna(X.median())
+    self.online_scaler_reg.partial_fit(X_filled)
+    X_scaled = self.online_scaler_reg.transform(X_filled)
+    self.online_reg_model.partial_fit(X_scaled, y)
+    logger.info("在线回归器已完成增量训练")
+
+def online_predict_regression(self, X: pd.DataFrame) -> np.ndarray:
+    """使用在线回归器进行预测"""
+    if self.online_reg_model is None or self.online_scaler_reg is None:
+        raise RuntimeError("在线回归器尚未初始化")
+    X_filled = X.fillna(X.median())
+    X_scaled = self.online_scaler_reg.transform(X_filled)
+    return self.online_reg_model.predict(X_scaled)

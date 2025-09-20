@@ -11,10 +11,16 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import joblib
 import os
+from sklearn.calibration import CalibratedClassifierCV
 from db import DatabaseManager
 from features import FeatureGenerator
+from enhanced_features import EnhancedFeatureGenerator
 from signal_generator import SignalGenerator
+from stock_status_filter import StockStatusFilter
 import logging
+
+# 导入增强预处理pipeline
+from enhanced_preprocessing import EnhancedPreprocessingPipeline, create_enhanced_preprocessing_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,18 +30,44 @@ class IntelligentStockSelector:
     智能选股服务
     """
     
-    def __init__(self, db_manager: DatabaseManager = None):
+    def __init__(self, db_manager: DatabaseManager = None, use_enhanced_features: bool = True, 
+                 use_enhanced_preprocessing: bool = True, preprocessing_complexity: str = 'medium'):
+        """
+        初始化智能选股器
+        """
         self.db = db_manager or DatabaseManager()
-        self.feature_generator = FeatureGenerator()
+        self.use_enhanced_features = use_enhanced_features
+        self.use_enhanced_preprocessing = use_enhanced_preprocessing
+        self.preprocessing_complexity = preprocessing_complexity
+        
+        # 根据参数选择特征生成器
+        if use_enhanced_features:
+            self.feature_generator = EnhancedFeatureGenerator()
+        else:
+            self.feature_generator = FeatureGenerator()
         self.signal_generator = SignalGenerator()
+        self.stock_filter = StockStatusFilter()
+        
+        # 模型相关
         self.model = None
         self.scaler = None
         self.feature_names = None
+        
         # 新增：分别持有分类与回归模型数据
         self.cls_model_data = None
         self.reg_model_data = None
         self.cls_feature_names = None
         self.reg_feature_names = None
+        
+        # 增强预处理pipeline
+        self.cls_preprocessor = None
+        self.reg_preprocessor = None
+        
+        if self.use_enhanced_preprocessing:
+            # 初始化预处理配置
+            self.cls_preprocessing_config = create_enhanced_preprocessing_config('classification', preprocessing_complexity)
+            self.reg_preprocessing_config = create_enhanced_preprocessing_config('regression', preprocessing_complexity)
+            logger.info(f"启用增强预处理pipeline，复杂度: {preprocessing_complexity}")
     
     def load_model(self, model_path: str = None, scaler_path: str = None):
         """
@@ -132,17 +164,31 @@ class IntelligentStockSelector:
                 try:
                     with open(fpath, 'rb') as f:
                         data = pickle.load(f)
-                    if not isinstance(data, dict):
-                        continue
-                    meta = data.get('metadata', {}) or {}
-                    task = meta.get('task') or meta.get('type')
-                    per = meta.get('period')
-                    if per != period:
-                        continue
-                    if task == 'classification':
-                        cls_candidates.append((fname, data))
-                    elif task == 'regression':
-                        reg_candidates.append((fname, data))
+                    if isinstance(data, dict):
+                        meta = data.get('metadata', {}) or {}
+                        task = meta.get('task') or meta.get('type')
+                        per = meta.get('period')
+                        if per != period:
+                            # 尝试从文件名推断周期
+                            fname_lower = fname.lower()
+                            inferred_period = '30d' if '30d' in fname_lower else ('10d' if '10d' in fname_lower else None)
+                            if inferred_period != period:
+                                continue
+                        if task == 'classification':
+                            cls_candidates.append((fname, data))
+                        elif task == 'regression':
+                            reg_candidates.append((fname, data))
+                    else:
+                        # 兼容旧格式：直接保存了Estimator/Pipeline
+                        fname_lower = fname.lower()
+                        inferred_task = 'classification' if ('logistic' in fname_lower or 'cls' in fname_lower) else ('regression' if 'reg' in fname_lower else None)
+                        inferred_period = '30d' if '30d' in fname_lower else ('10d' if '10d' in fname_lower else None)
+                        if inferred_task and (inferred_period == period or inferred_period is None):
+                            wrapper = {'model': data, 'feature_names': None, 'metadata': {'task': inferred_task, 'period': inferred_period}}
+                            if inferred_task == 'classification':
+                                cls_candidates.append((fname, wrapper))
+                            elif inferred_task == 'regression':
+                                reg_candidates.append((fname, wrapper))
                 except Exception as e:
                     logger.debug(f"读取模型失败 {fpath}: {e}")
                     continue
@@ -257,23 +303,45 @@ class IntelligentStockSelector:
                 model = self.cls_model_data['model']
                 expected_features = self.cls_feature_names or []
                 Xc = features_df.copy()
-                # 缺失列补0，多余列丢弃
+                
+                # 当未提供特征名时，回退为使用数值型特征（排除symbol）
+                if not expected_features:
+                    candidate_cols = [c for c in Xc.columns if c != 'symbol']
+                    # 仅选择数值列
+                    expected_features = [c for c in candidate_cols if np.issubdtype(Xc[c].dtype, np.number)]
+                
                 for col in expected_features:
                     if col not in Xc.columns:
                         Xc[col] = 0
                 Xc = Xc[expected_features].fillna(0)
-                use_pipeline_scaler = hasattr(model, 'named_steps') and 'scaler' in getattr(model, 'named_steps', {})
-                if use_pipeline_scaler:
-                    Xc_input = Xc
+                
+                # 应用增强预处理pipeline
+                if self.use_enhanced_preprocessing and self.cls_preprocessor is not None:
+                    logger.info("使用增强预处理pipeline处理分类特征")
+                    Xc_input = self.cls_preprocessor.transform(Xc)
                 else:
-                    scaler = self.cls_model_data.get('scaler')
-                    if scaler is None:
-                        logger.warning("分类模型未包含scaler，将直接使用原始特征")
+                    # 原有的预处理逻辑
+                    use_pipeline_scaler = hasattr(model, 'named_steps') and 'scaler' in getattr(model, 'named_steps', {})
+                    if use_pipeline_scaler:
                         Xc_input = Xc
                     else:
-                        Xc_input = scaler.transform(Xc)
+                        scaler = self.cls_model_data.get('scaler')
+                        if scaler is None:
+                            # 在线标准化，避免数值尺度造成的概率饱和
+                            try:
+                                col_std = Xc.std().replace(0, 1e-6)
+                                Xc_norm = (Xc - Xc.mean()) / col_std
+                                Xc_input = Xc_norm.clip(-5, 5).fillna(0)
+                                logger.info("未找到标准化器，已对特征进行在线标准化处理")
+                            except Exception:
+                                logger.warning("在线标准化失败，退回原始特征")
+                                Xc_input = Xc
+                        else:
+                            Xc_input = scaler.transform(Xc)
+                
                 probs = model.predict_proba(Xc_input)[:, 1]
                 preds_cls = model.predict(Xc_input)
+                
             elif self.model:
                 # 兼容旧逻辑
                 if self.feature_names:
@@ -286,8 +354,27 @@ class IntelligentStockSelector:
                     X_old = features_df[feature_cols].fillna(0)
                 use_pipeline_scaler = hasattr(self.model, 'named_steps') and 'scaler' in getattr(self.model, 'named_steps', {})
                 X_input = X_old if use_pipeline_scaler else (self.scaler.transform(X_old) if self.scaler else X_old)
-                probs = self.model.predict_proba(X_input)[:, 1]
+                
+                # 检查模型是否支持predict_proba
+                if hasattr(self.model, 'predict_proba'):
+                    probs = self.model.predict_proba(X_input)[:, 1]
+                else:
+                    # 对于Ridge等回归模型，使用decision_function或predict转换为概率
+                    if hasattr(self.model, 'decision_function'):
+                        scores = self.model.decision_function(X_input)
+                        # 使用sigmoid函数将分数转换为概率
+                        probs = 1 / (1 + np.exp(-scores))
+                    else:
+                        # 使用predict结果，假设是连续值，转换为概率
+                        predictions_raw = self.model.predict(X_input)
+                        # 使用tanh函数将预测值映射到概率空间
+                        probs = 0.5 + 0.4 * np.tanh(predictions_raw)
+                
                 preds_cls = self.model.predict(X_input)
+                # 对于回归模型，将连续预测转换为分类
+                if not hasattr(self.model, 'predict_proba'):
+                    preds_cls = (preds_cls > 0).astype(int)
+                    
         except Exception as e:
             logger.error(f"分类预测失败: {e}")
         
@@ -301,8 +388,16 @@ class IntelligentStockSelector:
                     if col not in Xr.columns:
                         Xr[col] = 0
                 Xr = Xr[expected_features_r].fillna(0)
-                use_pipeline_scaler_r = hasattr(model_r, 'named_steps') and 'scaler' in getattr(model_r, 'named_steps', {})
-                Xr_input = Xr if use_pipeline_scaler_r else (self.reg_model_data.get('scaler').transform(Xr) if self.reg_model_data.get('scaler') else Xr)
+                
+                # 应用增强预处理pipeline
+                if self.use_enhanced_preprocessing and self.reg_preprocessor is not None:
+                    logger.info("使用增强预处理pipeline处理回归特征")
+                    Xr_input = self.reg_preprocessor.transform(Xr)
+                else:
+                    # 原有的预处理逻辑
+                    use_pipeline_scaler_r = hasattr(model_r, 'named_steps') and 'scaler' in getattr(model_r, 'named_steps', {})
+                    Xr_input = Xr if use_pipeline_scaler_r else (self.reg_model_data.get('scaler').transform(Xr) if self.reg_model_data.get('scaler') else Xr)
+                
                 exp_returns = model_r.predict(Xr_input)
         except Exception as e:
             logger.error(f"回归预测失败: {e}")
@@ -312,8 +407,15 @@ class IntelligentStockSelector:
             prob_std = np.std(probs)
             prob_mean = np.mean(probs)
             logger.info(f"模型预测概率统计: 平均值={prob_mean:.3f}, 标准差={prob_std:.3f}")
-            if prob_std < 0.05 or prob_mean > 0.95 or prob_mean < 0.05:
-                logger.warning("模型预测结果过于极端，使用技术指标调整概率")
+            
+            # 应用改进的概率校准，传入预测结果和预期收益
+            probs = self._calibrate_probabilities(probs, preds_cls, exp_returns)
+            
+            # 如果校准后仍然极端，使用技术指标进一步调整
+            calibrated_std = np.std(probs)
+            calibrated_mean = np.mean(probs)
+            if calibrated_std < 0.05 or calibrated_mean > 0.9 or calibrated_mean < 0.1:
+                logger.warning("校准后概率仍过于极端，使用技术指标进一步调整")
                 adjusted_probabilities = self._adjust_probabilities_with_technical_indicators(
                     features_df['symbol'].tolist(), probs)
                 probs = adjusted_probabilities
@@ -323,7 +425,7 @@ class IntelligentStockSelector:
         # 组合结果
         results = []
         # 拉取一次全量symbol信息，减少循环内查询
-        symbols_data = {s['symbol']: s for s in self.db.list_symbols()}
+        symbols_data = {s['symbol']: s for s in self.db.list_symbols(markets=['SH','SZ'])}
         for i, symbol in enumerate(features_df['symbol']):
             stock_info = symbols_data.get(symbol, {})
             # 获取最新价格
@@ -360,14 +462,52 @@ class IntelligentStockSelector:
                                 # 依据概率进行温和加权（范围约0.5~1.2）
                                 weight = 0.8 + (prob - 0.5)
                                 weight = max(0.5, min(1.2, weight))
-                                fb_ret = expected_30 * weight
+                                # 引入基于波动的惩罚，波动越高惩罚越大，范围约0.6~1.0
+                                vol_daily = float(np.nanstd(daily_ret))
+                                vol_penalty = 1.0 / (1.0 + 3.0 * vol_daily)
+                                vol_penalty = max(0.6, min(1.0, vol_penalty))
+                                fb_ret = expected_30 * weight * vol_penalty
                 except Exception as _:
                     fb_ret = 0.0
+                    vol_daily = 0.03
                 # 若仍接近0，则用概率微调一个小幅度（±5%）
                 if abs(fb_ret) < 1e-6:
                     fb_ret = (prob - 0.5) * 0.1
-                # 限幅，避免极端值
-                exp_ret = max(-0.3, min(0.3, fb_ret))
+                # 软限幅，避免“顶格”扎堆；再叠加极小的确定性扰动降低并列概率
+                cap = 0.12
+                try:
+                    soft_ret = cap * np.tanh(fb_ret / max(1e-9, cap))
+                except Exception:
+                    soft_ret = max(-cap, min(cap, fb_ret))
+                # 使用概率与波动构造极小的tie-breaker（约±0.2%以内），保持可解释性
+                try:
+                    v = float(vol_daily) if 'vol_daily' in locals() and vol_daily is not None else 0.03
+                except Exception:
+                    v = 0.03
+                epsilon = 0.002 * (prob - 0.5) - 0.001 * v
+                exp_ret = max(-cap, min(cap, soft_ret + epsilon))
+
+            # 最终归一化与安全限幅，防止异常值（如1255.9%）
+            try:
+                r = float(exp_ret)
+            except Exception:
+                r = 0.0
+            if not np.isfinite(r):
+                r = 0.0
+            # 百分比单位纠偏：若预测在50%~500%之间，按百分数转小数；>500%视为异常，退回小幅估计
+            if abs(r) > 5:
+                # 极端异常，使用基于概率的小幅估计
+                r = (prob - 0.5) * 0.1
+            elif abs(r) > 0.5:
+                # 介于50%~500%，很可能是百分比单位
+                r = r / 100.0
+            # 二次软限幅与硬限幅
+            cap_final = 0.18
+            try:
+                r = cap_final * np.tanh(r / max(1e-9, cap_final))
+            except Exception:
+                r = max(-cap_final, min(cap_final, r))
+            exp_ret = max(-0.25, min(0.25, r))
 
             # 计算个性化的信心度
             base_confidence = abs(prob - 0.5) * 100
@@ -403,14 +543,121 @@ class IntelligentStockSelector:
                 'last_close': latest_price.get('close', 0) if latest_price else 0,
                 'score': round((prob * 100), 2),
                 'sentiment': sentiment,
-                'confidence': round(confidence, 1)
+                'confidence': round(confidence, 1),
+                # 添加signal字段
+                'signal': sentiment
             }
             results.append(result)
         
         # 优先按预期收益排序，其次按概率
         results.sort(key=lambda x: (x.get('expected_return_30d', 0), x.get('prob_up_30d', 0)), reverse=True)
         
-        return results[:top_n]
+        # 过滤无效股票（退市、ST、停牌等）
+        valid_results = []
+        for result in results:
+            filter_check = self.stock_filter.should_filter_stock(
+                result.get('name', ''), 
+                result.get('symbol', ''),
+                include_st=True,
+                include_suspended=True,
+                db_manager=self.db,
+                exclude_star_market=True,
+                last_n_days=30
+            )
+            
+            if not filter_check['should_filter']:
+                valid_results.append(result)
+            else:
+                logger.debug(f"过滤股票 {result['symbol']} - {result['name']} "
+                           f"({filter_check['reason']})")
+        
+        logger.info(f"股票过滤: 原始{len(results)}只 -> 有效{len(valid_results)}只")
+        
+        return valid_results[:top_n]
+    
+    def _calibrate_probabilities(self, probs: np.ndarray, predictions: np.ndarray = None, 
+                               expected_returns: np.ndarray = None) -> np.ndarray:
+        """
+        使用多种信息源进行概率校准，提高预测区分度
+        """
+        try:
+            # 检查概率分布
+            prob_std = np.std(probs)
+            prob_mean = np.mean(probs)
+            
+            logger.info(f"原始概率统计: 平均值={prob_mean:.4f}, 标准差={prob_std:.4f}")
+            
+            # 如果概率分布已经合理，只做轻微调整
+            if prob_std >= 0.08 and 0.15 <= prob_mean <= 0.85:
+                # 轻微扩展分布，增加区分度
+                calibrated_probs = 0.5 + (probs - prob_mean) * 1.2
+                calibrated_probs = np.clip(calibrated_probs, 0.05, 0.95)
+                return calibrated_probs
+            
+            calibrated_probs = np.copy(probs)
+            
+            # 方法1: 基于预期收益的概率调整
+            if expected_returns is not None and len(expected_returns) == len(probs):
+                # 将预期收益转换为概率信号
+                returns_normalized = np.tanh(expected_returns * 10)  # 压缩到[-1,1]
+                return_probs = 0.5 + returns_normalized * 0.3  # 转换到[0.2, 0.8]
+                
+                # 与原始概率加权融合
+                calibrated_probs = 0.6 * probs + 0.4 * return_probs
+            
+            # 方法2: 基于分类预测的概率调整
+            if predictions is not None and len(predictions) == len(probs):
+                # 根据分类结果调整概率
+                for i, pred in enumerate(predictions):
+                    if pred == 1:  # 看涨预测
+                        calibrated_probs[i] = max(calibrated_probs[i], 0.6)
+                    else:  # 看跌预测
+                        calibrated_probs[i] = min(calibrated_probs[i], 0.4)
+            
+            # 方法3: 增强概率分布的区分度
+            if prob_std < 0.05:
+                # 概率过于集中，增加分散度
+                prob_ranks = np.argsort(np.argsort(calibrated_probs))  # 获取排名
+                n = len(calibrated_probs)
+                
+                # 基于排名重新分配概率，保持相对顺序
+                enhanced_probs = np.zeros_like(calibrated_probs)
+                for i, rank in enumerate(prob_ranks):
+                    # 将排名映射到[0.2, 0.8]区间
+                    enhanced_probs[i] = 0.2 + (rank / (n - 1)) * 0.6
+                
+                # 与原始概率加权融合
+                calibrated_probs = 0.3 * calibrated_probs + 0.7 * enhanced_probs
+            
+            # 方法4: 处理极端均值
+            if prob_mean > 0.8:
+                # 整体过于乐观，向下调整
+                calibrated_probs = 0.4 + (calibrated_probs - prob_mean) * 0.8
+            elif prob_mean < 0.2:
+                # 整体过于悲观，向上调整
+                calibrated_probs = 0.6 + (calibrated_probs - prob_mean) * 0.8
+            
+            # 最终限制在合理范围
+            calibrated_probs = np.clip(calibrated_probs, 0.05, 0.95)
+            
+            # 确保有足够的区分度
+            final_std = np.std(calibrated_probs)
+            if final_std < 0.05:
+                # 强制增加区分度
+                prob_ranks = np.argsort(np.argsort(calibrated_probs))
+                n = len(calibrated_probs)
+                spread_probs = np.array([0.15 + (rank / (n - 1)) * 0.7 for rank in prob_ranks])
+                calibrated_probs = 0.5 * calibrated_probs + 0.5 * spread_probs
+                calibrated_probs = np.clip(calibrated_probs, 0.05, 0.95)
+            
+            logger.info(f"校准后概率统计: 平均值={np.mean(calibrated_probs):.4f}, "
+                       f"标准差={np.std(calibrated_probs):.4f}")
+            
+            return calibrated_probs
+            
+        except Exception as e:
+            logger.warning(f"概率校准失败: {e}")
+            return probs
     
     def _adjust_probabilities_with_technical_indicators(self, symbols: List[str], 
                                                       original_probs: np.ndarray) -> np.ndarray:
@@ -543,25 +790,102 @@ class IntelligentStockSelector:
         try:
             # 加载模型（优先加载30天的分类与回归模型）
             if not self.load_models(period='30d'):
-                # 回退到旧的单模型加载逻辑
-                if not self.load_model():
-                    return self._fallback_stock_picks(top_n)
-                else:
-                    logger.info("已使用旧模型接口")
-            
-            # 获取所有股票代码
-            symbols_data = self.db.list_symbols()
-            symbols = [s['symbol'] for s in symbols_data]
-            
+                # 优先回退到10d周期的新接口
+                if not self.load_models(period='10d'):
+                    # 回退到旧的单模型加载逻辑
+                    if not self.load_model():
+                        return self._fallback_stock_picks(top_n)
+                    else:
+                        logger.info("已使用旧模型接口")
+        
+            # 获取所有股票代码（仅A股主板/创业板，排除BJ）
+            symbols_data = self.db.list_symbols(markets=['SH','SZ'])
+            symbols = [s.get('symbol') for s in symbols_data if s.get('symbol')]
+        
             if not symbols:
                 return {
                     'success': False,
                     'message': '没有可用的股票数据',
                     'data': {'picks': []}
                 }
+            
+            # 在候选池阶段过滤无效股票（排除None.*、000000、格式不规范等），并记录统计
+            invalid_pattern_count = 0
+            filtered_by_status = 0
+            valid_symbols = []
+            for symbol_info in symbols_data:
+                symbol = symbol_info.get('symbol', '')
+                name = symbol_info.get('name', '')
+                # 额外的无效格式过滤
+                try:
+                    parts = symbol.split('.') if isinstance(symbol, str) else []
+                    code = parts[0] if len(parts) >= 1 else ''
+                    market = parts[1] if len(parts) >= 2 else ''
+                    if (not isinstance(symbol, str) or not symbol or
+                        symbol.startswith('None') or symbol.endswith('.None') or
+                        code == '000000' or
+                        len(parts) != 2 or len(code) != 6 or not code.isdigit() or market not in ('SH','SZ')):
+                        invalid_pattern_count += 1
+                        logger.debug(f"排除无效股票代码: {symbol} ({name})")
+                        continue
+                except Exception:
+                    invalid_pattern_count += 1
+                    logger.debug(f"排除无效股票代码: {symbol} ({name})")
+                    continue
+                filter_check = self.stock_filter.should_filter_stock(
+                    name, symbol,
+                    include_st=True,
+                    include_suspended=True,
+                    db_manager=self.db,
+                    exclude_star_market=True,
+                    last_n_days=30
+                )
                 
-            # 进行预测
-            picks = self.predict_stocks(symbols, top_n)
+                if not filter_check['should_filter']:
+                    valid_symbols.append(symbol)
+                else:
+                    filtered_by_status += 1
+            
+            logger.info(f"候选池过滤: 原始{len(symbols)}只 -> 无效格式{invalid_pattern_count}只 -> 状态过滤{filtered_by_status}只 -> 有效{len(valid_symbols)}只")
+            
+            if not valid_symbols:
+                return {
+                    'success': False,
+                    'message': '过滤后没有可用的股票',
+                    'data': {'picks': []}
+                }
+                
+            # 进行预测（带重试回退）
+            import time, random
+            sel_max_retries = int(os.getenv('SELECTOR_MAX_RETRIES', '2'))
+            sel_retry_delay = float(os.getenv('SELECTOR_RETRY_DELAY', '0.5'))
+            logger.info(f"预测阶段重试配置: max_retries={sel_max_retries}, retry_delay={sel_retry_delay:.2f}s")
+            attempt = 0
+            picks = []
+            last_err = None
+            while attempt <= sel_max_retries:
+                try:
+                    picks = self.predict_stocks(valid_symbols, top_n)
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"预测失败（第{attempt+1}次）: {e}")
+                    if attempt >= sel_max_retries:
+                        break
+                    jitter = 0.5 + random.random()
+                    delay = min(10.0, sel_retry_delay * (2 ** attempt) * jitter)
+                    logger.info(f"{delay:.2f}s 后重试预测...")
+                    time.sleep(delay)
+                    attempt += 1
+            used_fallback = False
+            if (not picks) and last_err is not None:
+                logger.warning("预测结果为空或失败，回退到备用技术指标选股")
+                fb = self._fallback_stock_picks(top_n)
+                if fb.get('success'):
+                    picks = fb['data'].get('picks', [])
+                    used_fallback = True
+                else:
+                    picks = []
             
             # 添加调试日志
             logger.info(f"预测结果数量: {len(picks)}")
@@ -573,7 +897,7 @@ class IntelligentStockSelector:
                 'success': True,
                 'data': {
                     'picks': picks,
-                    'model_type': 'ml_cls+reg' if self.reg_model_data and self.cls_model_data else ('machine_learning' if self.model else 'technical_indicators'),
+                    'model_type': ('technical_indicators' if used_fallback else ('ml_cls+reg' if self.reg_model_data and self.cls_model_data else ('machine_learning' if self.model else 'technical_indicators'))),
                     'generated_at': datetime.now().isoformat()
                 }
             }
@@ -585,7 +909,7 @@ class IntelligentStockSelector:
                 'message': f'选股服务出错: {str(e)}',
                 'data': {'picks': []}
             }
-    
+
     def _fallback_stock_picks(self, top_n: int = 10) -> Dict[str, Any]:
         """
         备用选股方法：基于技术指标评分
@@ -593,7 +917,7 @@ class IntelligentStockSelector:
         logger.info("使用备用选股方法（技术指标评分）")
         
         try:
-            symbols_data = self.db.list_symbols()
+            symbols_data = self.db.list_symbols(markets=['SH','SZ'])
             results = []
             
             for stock in symbols_data:

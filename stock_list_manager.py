@@ -3,6 +3,7 @@ import pandas as pd
 from typing import List, Dict, Any
 from akshare_data_provider import AkshareDataProvider
 from db import DatabaseManager
+from stock_status_filter import StockStatusFilter
 from datetime import datetime
 
 class StockListManager:
@@ -11,6 +12,7 @@ class StockListManager:
     def __init__(self):
         self.data_provider = AkshareDataProvider()
         self.db_manager = DatabaseManager()
+        self.stock_filter = StockStatusFilter()
         self.logger = logging.getLogger(__name__)
     
     def update_all_stocks(self) -> Dict[str, Any]:
@@ -37,17 +39,38 @@ class StockListManager:
                     'ah_pair': row.get('ah_pair', None)
                 })
             
-            # 批量插入数据库
-            self.db_manager.upsert_stocks(stock_records)
+            # 应用股票过滤器，过滤不需要的股票
+            filter_result = self.stock_filter.filter_stock_list(
+                stock_records,
+                include_st=True,
+                include_suspended=True,
+                db_manager=self.db_manager,
+                exclude_b_share=True,
+                exclude_star_market=True,
+                exclude_bse_stock=True
+            )
+            
+            filtered_stocks = filter_result['filtered_stocks']
+            
+            self.logger.info(f"股票过滤结果: 原始{filter_result['statistics']['total']}只, "
+                           f"保留{filter_result['statistics']['filtered']}只, "
+                           f"移除{filter_result['statistics']['removed']}只")
+            if filter_result['statistics']['removal_reasons']:
+                self.logger.info(f"移除原因: {filter_result['statistics']['removal_reasons']}")
+            
+            # 批量插入数据库（只插入过滤后的股票）
+            self.db_manager.upsert_stocks(filtered_stocks)
             
             # 统计信息
             stats = self._get_market_statistics(stocks_df)
             
-            self.logger.info(f"成功更新 {len(stock_records)} 只股票信息")
+            self.logger.info(f"成功更新 {len(filtered_stocks)} 只股票信息")
             return {
                 'success': True,
-                'message': f'成功更新 {len(stock_records)} 只股票',
-                'count': len(stock_records),
+                'message': f'成功更新 {len(filtered_stocks)} 只股票（原始{len(stock_records)}只，过滤后{len(filtered_stocks)}只）',
+                'count': len(filtered_stocks),
+                'original_count': len(stock_records),
+                'filter_statistics': filter_result['statistics'],
                 'statistics': stats,
                 'update_time': datetime.now().isoformat()
             }
@@ -56,7 +79,8 @@ class StockListManager:
             self.logger.error(f"更新股票列表失败: {e}")
             return {'success': False, 'message': f'更新失败: {str(e)}', 'count': 0}
     
-    def get_stocks_by_market(self, market: str = None, board_type: str = None) -> List[Dict[str, Any]]:
+    def get_stocks_by_market(self, market: str = None, board_type: str = None, 
+                           apply_filter: bool = True) -> List[Dict[str, Any]]:
         """根据市场和板块获取股票列表"""
         try:
             with self.db_manager.get_conn() as conn:
@@ -74,7 +98,22 @@ class StockListManager:
                 query += " ORDER BY symbol"
                 
                 df = pd.read_sql_query(query, conn, params=params)
-                return df.to_dict('records')
+                stocks = df.to_dict('records')
+                
+                # 应用股票过滤器（可选）
+                if apply_filter and stocks:
+                    filter_result = self.stock_filter.filter_stock_list(
+                        stocks,
+                        include_st=True,
+                        include_suspended=True,
+                        db_manager=self.db_manager,
+                        exclude_b_share=True,
+                        exclude_star_market=True,
+                        exclude_bse_stock=True
+                    )
+                    return filter_result['filtered_stocks']
+                
+                return stocks
                 
         except Exception as e:
             self.logger.error(f"查询股票列表失败: {e}")
@@ -150,11 +189,12 @@ class StockListManager:
     
     def get_candidate_stocks(self, market_filter: List[str] = None, 
                            board_filter: List[str] = None, 
-                           limit: int = None) -> List[str]:
+                           limit: int = None,
+                           apply_filter: bool = True) -> List[str]:
         """获取候选股票代码列表（用于替换原有的种子股票机制）"""
         try:
             with self.db_manager.get_conn() as conn:
-                query = "SELECT symbol FROM stocks WHERE 1=1"
+                query = "SELECT symbol, name, market, board_type, exchange FROM stocks WHERE 1=1"
                 params = []
     
                 # 默认过滤：排除行业板块/指数（如88开头）及常见指数/基金类别
@@ -177,7 +217,22 @@ class StockListManager:
                     query += f" LIMIT {limit}"
                 
                 df = pd.read_sql_query(query, conn, params=params)
-                return df['symbol'].tolist()
+                stocks = df.to_dict('records')
+                
+                # 应用股票过滤器（可选）
+                if apply_filter and stocks:
+                    filter_result = self.stock_filter.filter_stock_list(
+                        stocks,
+                        include_st=True,
+                        include_suspended=True,
+                        db_manager=self.db_manager,
+                        exclude_b_share=True,
+                        exclude_star_market=True,
+                        exclude_bse_stock=True
+                    )
+                    return [stock['symbol'] for stock in filter_result['filtered_stocks']]
+                
+                return [stock['symbol'] for stock in stocks]
                 
         except Exception as e:
             self.logger.error(f"获取候选股票失败: {e}")

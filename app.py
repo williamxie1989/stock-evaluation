@@ -8,6 +8,7 @@ import json
 import os
 from db import DatabaseManager
 from akshare_data_provider import AkshareDataProvider
+from enhanced_data_provider import EnhancedDataProvider
 import pandas as pd
 import re
 from signal_generator import SignalGenerator
@@ -15,13 +16,35 @@ from selector_service import IntelligentStockSelector
 from stock_list_manager import StockListManager
 from market_selector_service import MarketSelectorService
 from data_sync_service import DataSyncService
-from datetime import datetime
+from concurrent_data_sync_service import ConcurrentDataSyncService
+from concurrent_enhanced_data_provider import ConcurrentEnhancedDataProvider
+from optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
+from datetime import datetime, timedelta
 import logging
+import time
+import asyncio
+from contextlib import asynccontextmanager
 
 # 配置日志
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="股票分析系统", description="基于大模型的股票分析系统")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用程序生命周期处理"""
+    # 启动时逻辑
+    await startup_event()
+    
+    # yield 控制权给应用
+    yield
+    
+    # 可选择在此加入关闭时的清理逻辑
+    pass
+
+app = FastAPI(
+    title="股票分析系统", 
+    description="基于大模型的股票分析系统",
+    lifespan=lifespan
+)
 
 # 允许跨域
 app.add_middleware(
@@ -41,21 +64,48 @@ class StockRequest(BaseModel):
 analyzer = StockAnalyzer()
 # 初始化数据库与数据提供器
 _db = DatabaseManager()
-_provider = AkshareDataProvider()
+_provider = EnhancedDataProvider()  # 使用增强数据提供者，支持过滤逻辑
+_optimized_provider = OptimizedEnhancedDataProvider()  # 优化版数据提供者，减少重试延迟
 # 初始化服务
 data_sync_service = DataSyncService()
+concurrent_data_sync_service = ConcurrentDataSyncService(max_workers=8, db_batch_size=50)
+concurrent_data_provider = ConcurrentEnhancedDataProvider(max_workers=6)
 market_selector_service = MarketSelectorService()
 
-@app.on_event("startup")
+# 选股结果内存缓存（按参数维度缓存）
+PICKS_CACHE: dict = {}
+PICKS_CACHE_TTL_SECONDS: int = int(os.environ.get("PICKS_CACHE_TTL", "900"))  # 默认15分钟
+
 async def startup_event():
     """
     应用启动时智能初始化数据
     """
     global selector_service, signal_generator, stock_list_manager
     
-    selector_service = IntelligentStockSelector()
+    # 复用全局实例并在启动时预加载模型
+    selector_service = IntelligentStockSelector(_db)
+    try:
+        loaded = selector_service.load_models(period='30d') or selector_service.load_model()
+        if loaded:
+            logger.info("[startup] 模型预加载完成")
+        else:
+            logger.warning("[startup] 未找到可用模型，将在首次请求时回退到原有逻辑")
+    except Exception as e:
+        logger.error(f"[startup] 模型预加载失败: {e}")
+    
     signal_generator = SignalGenerator()
     stock_list_manager = StockListManager()
+    
+    # 后台预热 stock-picks 缓存（不阻塞启动）
+    if os.environ.get("SKIP_PREWARM", "0") not in ("1", "true", "True"):
+        async def _prewarm_stock_picks():
+            try:
+                logger.info("[startup] 开始后台预热 /api/stock-picks 缓存 (limit_symbols=500, top_n=10)")
+                await get_stock_picks(top_n=10, limit_symbols=500, force_refresh=True, debug=1)
+                logger.info("[startup] 预热完成")
+            except Exception as e:
+                logger.warning(f"[startup] 预热失败: {e}")
+        asyncio.create_task(_prewarm_stock_picks())
     
     print("应用启动，检查数据状态...")
     # 支持通过环境变量跳过启动时的数据同步，以便快速启动服务进行接口联调
@@ -216,21 +266,38 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                 name = row.get('name')
                 market = row.get('market', 'UNKNOWN')
                 board_type = row.get('board_type', '')
-                
-                # 根据市场类型生成symbol
+
+                # 基础有效性校验
+                if code is None:
+                    continue
+                code_str = str(code).strip()
+                if not code_str.isdigit():
+                    continue
+
+                # 根据市场类型生成symbol（并进行长度规范与补零）
+                symbol = None
                 if market == 'SH':
-                    symbol = f"{code}.SH"
+                    if len(code_str) != 6:
+                        continue
+                    symbol = f"{code_str}.SH"
                 elif market == 'SZ':
-                    symbol = f"{code}.SZ"
+                    if len(code_str) != 6:
+                        continue
+                    symbol = f"{code_str}.SZ"
                 elif market == 'BJ':
-                    symbol = f"{code}.BJ"
+                    if len(code_str) != 6:
+                        continue
+                    symbol = f"{code_str}.BJ"
                 elif market == 'HK':
                     if not include_hk:
                         continue  # 跳过港股
-                    symbol = f"{code}.HK"
+                    # 港股常见为 4-5 位，统一补零到 5 位
+                    if len(code_str) not in (4, 5):
+                        continue
+                    symbol = f"{code_str.zfill(5)}.HK"
                 else:
                     continue  # 跳过未知市场
-                
+
                 stock_rows.append({
                     "symbol": symbol,
                     "name": name,
@@ -329,40 +396,215 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
         return {"success": False, "error": str(e)}
 
 @app.get("/api/stock-picks")
-async def get_stock_picks(top_n: int = 10, limit_symbols: int | None = None):
+async def get_stock_picks(top_n: int = 10, limit_symbols: int | None = 500, force_refresh: bool = False, debug: int = 0):
     """
     获取智能选股推荐
     可选 limit_symbols 用于限制参与预测的股票数量，以便快速联调与验证。
+    新增：内存缓存与耗时统计（debug=1 返回详细耗时）。
     """
     try:
-        from selector_service import IntelligentStockSelector
-        
-        # 使用全局的数据库管理器实例
-        selector = IntelligentStockSelector(_db)
-        
+        # 复用全局 selector 实例
+        selector = selector_service
+
+        # 缓存键与TTL检查
+        cache_key = f"{limit_symbols or 0}:{top_n}"
+        now = datetime.now()
+        if not force_refresh:
+            cached = PICKS_CACHE.get(cache_key)
+            if cached and cached.get('expires_at') and cached['expires_at'] > now:
+                resp = cached['response']
+                # 标记缓存命中
+                if isinstance(resp, dict):
+                    resp = {**resp, 'cached': True}
+                return resp
+
+        t0 = time.monotonic()
+
         # 快速路径：限制参与预测的股票数量
         if limit_symbols and limit_symbols > 0:
             # 优先加载新模型，失败回退旧模型；若均失败则回退到原逻辑
-            if not (selector.load_models(period='30d') or selector.load_model()):
-                # 无模型可用，回退到原有逻辑（可能采用技术指标）
+            try:
+                _ = selector.load_models(period='30d') or selector.load_model()
+            except Exception as e:
+                logger.warning(f"加载模型失败，将回退原逻辑: {e}")
                 return selector.get_stock_picks(top_n)
             
-            symbols_data = _db.list_symbols()
-            symbols = [s['symbol'] for s in symbols_data][:int(limit_symbols)]
-            picks = selector.predict_stocks(symbols, top_n)
+            t_fetch0 = time.monotonic()
+            symbols_data = _db.list_symbols(markets=['SH','SZ'])
+            t_fetch1 = time.monotonic()
             
-            return {
+            # 在快速路径中也应用股票过滤
+            from stock_status_filter import StockStatusFilter
+            stock_filter = StockStatusFilter()
+            
+            valid_symbols = []
+            for symbol_info in symbols_data:
+                filter_check = stock_filter.should_filter_stock(
+                    symbol_info.get('name', ''), 
+                    symbol_info.get('symbol', ''),
+                    include_st=True,
+                    include_suspended=True,
+                    db_manager=_db,
+                    exclude_star_market=True,
+                    last_n_days=30
+                )
+                
+                if not filter_check['should_filter']:
+                    valid_symbols.append(symbol_info['symbol'])
+            t_filter1 = time.monotonic()
+            
+            # 近30日换手率优先排序后再截取
+            t_rank0 = time.monotonic()
+            try:
+                lookback_days = 30
+                date_threshold = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+
+                def _chunk(lst, n):
+                    for i in range(0, len(lst), n):
+                        yield lst[i:i+n]
+
+                # 聚合近30日成交额（缺失时用量价乘积近似）
+                frames = []
+                mkt_caps_frames = []
+                with _db.get_conn() as conn:
+                    # prices_daily
+                    for chunk in _chunk(valid_symbols, 800):
+                        placeholders = ','.join(['?'] * len(chunk))
+                        sql = f"SELECT symbol, date, volume, amount, close FROM prices_daily WHERE symbol IN ({placeholders}) AND date >= ?"
+                        params = list(chunk) + [date_threshold]
+                        df_chunk = pd.read_sql_query(sql, conn, params=params)
+                        if df_chunk is not None and not df_chunk.empty:
+                            frames.append(df_chunk)
+                    # stocks 市值
+                    for chunk in _chunk(valid_symbols, 800):
+                        placeholders = ','.join(['?'] * len(chunk))
+                        sql = f"SELECT symbol, market_cap FROM stocks WHERE symbol IN ({placeholders})"
+                        params = list(chunk)
+                        df_caps = pd.read_sql_query(sql, conn, params=params)
+                        if df_caps is not None and not df_caps.empty:
+                            mkt_caps_frames.append(df_caps)
+                if frames:
+                    df = pd.concat(frames, ignore_index=True)
+                    if 'amount' not in df.columns or df['amount'].isna().all():
+                        df['amount_fill'] = df['volume'].fillna(0) * df['close'].fillna(0)
+                    else:
+                        df['amount_fill'] = df['amount'].fillna(df['volume'].fillna(0) * df['close'].fillna(0))
+                    agg = df.groupby('symbol', as_index=False)['amount_fill'].sum().rename(columns={'amount_fill': 'sum_amount_30'})
+                else:
+                    agg = pd.DataFrame({'symbol': valid_symbols, 'sum_amount_30': [0.0] * len(valid_symbols)})
+
+                # 合并市值并计算换手率（以成交额/总市值作为近似）
+                if mkt_caps_frames:
+                    caps = pd.concat(mkt_caps_frames, ignore_index=True).drop_duplicates(subset=['symbol'])
+                    df_rank = pd.merge(agg, caps, on='symbol', how='left')
+                else:
+                    df_rank = agg.copy()
+                    df_rank['market_cap'] = None
+
+                # 计算 rate（可能缺失）
+                def _calc_rate(row):
+                    try:
+                        mc = row.get('market_cap')
+                        if mc is not None and pd.notna(mc) and float(mc) > 0:
+                            return float(row['sum_amount_30']) / float(mc)
+                        return None
+                    except Exception:
+                        return None
+
+                df_rank['rate'] = df_rank.apply(_calc_rate, axis=1)
+                df_rank['has_rate'] = df_rank['rate'].apply(lambda x: 1 if pd.notna(x) else 0)
+                df_rank.sort_values(by=['has_rate', 'rate', 'sum_amount_30'], ascending=[False, False, False], inplace=True)
+                sorted_symbols = df_rank['symbol'].tolist()
+                # 追加未参与排序的剩余标的，保持兼容性
+                remaining = [s for s in valid_symbols if s not in set(sorted_symbols)]
+                sorted_symbols.extend(remaining)
+                symbols = sorted_symbols[:int(limit_symbols)]
+            except Exception as e:
+                logger.warning(f"按近30日换手率排序失败，回退为原始顺序: {e}")
+                symbols = valid_symbols[:int(limit_symbols)]
+            t_rank1 = time.monotonic()
+            
+            picks = selector.predict_stocks(symbols, top_n)
+            t_pred1 = time.monotonic()
+            
+            response = {
                 'success': True,
                 'data': {
-                    'picks': picks,
+                    'picks': picks or [],
                     'model_type': 'ml_cls+reg' if getattr(selector, 'reg_model_data', None) and getattr(selector, 'cls_model_data', None) else ('machine_learning' if getattr(selector, 'model', None) else 'technical_indicators'),
-                    'generated_at': datetime.now().isoformat()
-                }
+                    'generated_at': datetime.now().isoformat(),
+                    'timings': {
+                        'total_sec': round(t_pred1 - t0, 3),
+                        'fetch_symbols_sec': round(t_fetch1 - t_fetch0, 3),
+                        'filter_sec': round(t_filter1 - t_fetch1, 3),
+                        'rank_sec': round(t_rank1 - t_rank0, 3),
+                        'predict_sec': round(t_pred1 - t_rank1, 3)
+                    } if debug else None
+                },
+                'cached': False
             }
+            
+            # 写入缓存
+            PICKS_CACHE[cache_key] = {
+                'response': response,
+                'expires_at': now + timedelta(seconds=PICKS_CACHE_TTL_SECONDS)
+            }
+            
+            return response
         
         # 原有完整路径
-        result = selector.get_stock_picks(top_n)
-        return result
+        t_full0 = time.monotonic()
+        raw_result = selector.get_stock_picks(top_n)
+        t_full1 = time.monotonic()
+        
+        # 统一响应结构：始终返回 {'success': bool, 'data': {'picks': [...], 'model_type': str?, 'generated_at': str, 'timings': {...}?}, 'cached': bool}
+        def _normalize_response(res):
+            success = True
+            data = {}
+            # dict 类型
+            if isinstance(res, dict):
+                success = res.get('success', True)
+                # 已是标准结构
+                if isinstance(res.get('data'), dict) and 'picks' in res['data']:
+                    data = dict(res['data'])
+                # 顶层带 picks
+                elif 'picks' in res:
+                    data = {
+                        'picks': res.get('picks') or []
+                    }
+                    if 'model_type' in res:
+                        data['model_type'] = res.get('model_type')
+                else:
+                    data = {'picks': []}
+            # list/tuple 直接视为 picks 列表
+            elif isinstance(res, (list, tuple)):
+                data = {'picks': list(res)}
+            else:
+                data = {'picks': []}
+
+            # 补充字段
+            if 'generated_at' not in data:
+                data['generated_at'] = datetime.now().isoformat()
+            # 添加耗时
+            data['timings'] = {
+                'total_sec': round(t_full1 - t0, 3),
+                'full_path_sec': round(t_full1 - t_full0, 3)
+            } if debug else None
+            return {
+                'success': success,
+                'data': data,
+                'cached': False
+            }
+
+        response = _normalize_response(raw_result)
+
+        # 写入缓存并返回
+        PICKS_CACHE[cache_key] = {
+            'response': response,
+            'expires_at': now + timedelta(seconds=PICKS_CACHE_TTL_SECONDS)
+        }
+        
+        return response
         
     except Exception as e:
         return {
@@ -495,6 +737,157 @@ async def get_market_statistics(selected_markets: str = None):
             "error": str(e)
         }
 
+@app.post("/api/sync_data_optimized")
+async def sync_market_data_optimized(request: dict = None):
+    """
+    优化版数据同步API - 使用改进的重试机制和熔断器
+    """
+    try:
+        # 解析请求参数
+        if request is None:
+            request = {}
+        
+        sync_type = request.get("sync_type", "incremental")
+        markets = request.get("markets", ["A股主板", "创业板", "科创板"])
+        batch_size = min(int(request.get("batch_size", 50)), 100)
+        delay_seconds = max(0.1, min(float(request.get("delay_seconds", 0.2)), 2.0))
+        
+        # 推导同步类型
+        if sync_type == "incremental":
+            period = "30d"
+        elif sync_type == "full":
+            period = "1y"
+        else:
+            period = sync_type
+        
+        logger.info(f"开始优化版数据同步: type={sync_type}, markets={markets}, "
+                   f"batch_size={batch_size}, delay={delay_seconds}s")
+        
+        start_time = time.time()
+        
+        # 获取股票列表
+        stock_symbols = market_selector_service.get_stocks_by_markets(markets)
+        if not stock_symbols:
+            return {"success": False, "message": "未找到符合条件的股票"}
+        
+        total_stocks = len(stock_symbols)
+        logger.info(f"获取到 {total_stocks} 只股票，开始同步...")
+        
+        # 使用优化版数据提供者进行同步
+        success_count = 0
+        error_count = 0
+        skipped_count = 0
+        errors = []
+        
+        for i, symbol in enumerate(stock_symbols):
+            try:
+                # 获取历史数据
+                data = _optimized_provider.get_stock_historical_data(symbol, period)
+                
+                if data is not None and not data.empty:
+                    # 保存到数据库
+                    with _db.get_conn() as conn:
+                        data.to_sql('stock_data', conn, if_exists='append', index=False)
+                    success_count += 1
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"优化版同步进度: {i + 1}/{total_stocks} "
+                                   f"(成功: {success_count}, 错误: {error_count})")
+                else:
+                    skipped_count += 1
+                    
+            except Exception as e:
+                error_count += 1
+                error_msg = f"{symbol}: {str(e)}"
+                errors.append(error_msg)
+                logger.warning(f"优化版同步失败: {error_msg}")
+            
+            # 批次间延迟
+            if (i + 1) % batch_size == 0 and i < total_stocks - 1:
+                time.sleep(delay_seconds)
+        
+        elapsed_time = time.time() - start_time
+        
+        # 获取数据源统计信息
+        source_stats = _optimized_provider.get_source_statistics()
+        
+        result = {
+            "success": True,
+            "message": f"优化版数据同步完成",
+            "statistics": {
+                "total_stocks": total_stocks,
+                "success_count": success_count,
+                "error_count": error_count,
+                "skipped_count": skipped_count,
+                "success_rate": f"{success_count/total_stocks*100:.1f}%",
+                "elapsed_time": f"{elapsed_time:.2f}s",
+                "avg_time_per_stock": f"{elapsed_time/total_stocks:.2f}s"
+            },
+            "source_statistics": source_stats,
+            "errors": errors[:10] if errors else []  # 只返回前10个错误
+        }
+        
+        logger.info(f"优化版数据同步完成: 成功 {success_count}/{total_stocks} "
+                   f"({success_count/total_stocks*100:.1f}%), 耗时 {elapsed_time:.2f}s")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"优化版数据同步异常: {e}")
+        return {
+            "success": False,
+            "message": f"优化版数据同步失败: {str(e)}",
+            "statistics": {},
+            "source_statistics": {},
+            "errors": [str(e)]
+        }
+
+
+@app.post("/api/sync_data_concurrent")
+async def sync_market_data_concurrent(request: dict = None):
+    """并发数据同步API - 高性能版本"""
+    try:
+        if request is None:
+            request = {}
+            
+        sync_type = request.get('sync_type', 'incremental')  # auto, full, incremental
+        markets = request.get('markets', ['SH', 'SZ'])  # 默认同步沪深市场
+        force_full = request.get('force_full', False)
+        preferred_sources = request.get('preferred_sources')  # e.g. ["eastmoney","sina","tencent","xueqiu","akshare"]
+        max_workers = request.get('max_workers', 8)  # 并发线程数
+        db_batch_size = request.get('db_batch_size', 50)  # 数据库批量操作大小
+        req_max_symbols = request.get('max_symbols', 0)
+        # TopN筛选参数
+        top_n_by = request.get('top_n_by')  # 'market_cap' 或 'amount'
+        top_n = request.get('top_n', 0)
+        amount_window_days = request.get('amount_window_days', 5)
+        
+        # auto 模式：根据force_full推导；明确full则全量
+        effective_sync_type = 'full' if force_full or sync_type == 'full' else 'incremental'
+        
+        logger.info(f"开始并发数据同步: sync_type={effective_sync_type}, markets={markets}, max_workers={max_workers}, max_symbols={req_max_symbols}")
+        
+        result = concurrent_data_sync_service.sync_market_data(
+            sync_type=effective_sync_type,
+            markets=markets,
+            max_symbols=req_max_symbols,
+            max_workers=max_workers,
+            db_batch_size=db_batch_size,
+            preferred_sources=preferred_sources,
+            top_n_by=top_n_by,
+            top_n=top_n,
+            amount_window_days=amount_window_days
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"并发数据同步失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 @app.post("/api/sync_data")
 async def sync_market_data(request: dict = None):
     """手动触发行情数据同步"""
@@ -505,19 +898,91 @@ async def sync_market_data(request: dict = None):
         sync_type = request.get('sync_type', 'auto')  # auto, full, incremental
         markets = request.get('markets', ['SH', 'SZ'])  # 默认同步沪深市场
         force_full = request.get('force_full', False)
+        preferred_sources = request.get('preferred_sources')  # e.g. ["eastmoney","sina","tencent","xueqiu","akshare"]
+        batch_size = request.get('batch_size', 10)
+        delay_seconds = request.get('delay_seconds', 1.0)
+        # 默认增量也跑全市场（不限制数量），若需要限制可在请求中传入具体数值
+        req_max_symbols = request.get('max_symbols', 0)
+        # 新增：TopN筛选参数
+        top_n_by = request.get('top_n_by')  # 'market_cap' 或 'amount'
+        top_n = request.get('top_n', 0)
+        amount_window_days = request.get('amount_window_days', 5)
         
-        logger.info(f"开始数据同步: sync_type={sync_type}, markets={markets}, force_full={force_full}")
+        # auto 模式：根据force_full推导；明确full则全量
+        effective_sync_type = 'full' if force_full or sync_type == 'full' else 'incremental'
+        
+        logger.info(f"开始数据同步: sync_type={effective_sync_type}, markets={markets}, force_full={force_full}, preferred_sources={preferred_sources}, max_symbols={req_max_symbols}, top_n_by={top_n_by}, top_n={top_n}, amount_window_days={amount_window_days}")
         
         result = data_sync_service.sync_market_data(
-            sync_type=sync_type,
+            sync_type=effective_sync_type,
             markets=markets,
-            max_symbols=0 if force_full else 100  # 全量同步时不限制，增量同步限制数量
+            max_symbols=req_max_symbols,  # 0 表示不限制（全市场）
+            batch_size=batch_size,
+            delay_seconds=delay_seconds,
+            preferred_sources=preferred_sources,
+            top_n_by=top_n_by,
+            top_n=top_n,
+            amount_window_days=amount_window_days
         )
         
         return result
         
     except Exception as e:
         logger.error(f"数据同步失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.post("/api/data/sync")
+async def sync_data(request: dict):
+    """同步市场数据"""
+    try:
+        sync_type = request.get('sync_type', 'incremental')
+        markets = request.get('markets', ['SH', 'SZ'])
+        max_symbols = request.get('max_symbols', 0)  # 默认不限制
+        batch_size = request.get('batch_size', 10)
+        delay_seconds = request.get('delay_seconds', 1.0)
+        preferred_sources = request.get('preferred_sources')
+        # 新增：TopN筛选参数
+        top_n_by = request.get('top_n_by')  # 'market_cap' 或 'amount'
+        top_n = request.get('top_n', 0)
+        amount_window_days = request.get('amount_window_days', 5)
+        
+        # 如果显式要求full或max_symbols为0，执行全量；否则增量
+        effective_sync_type = 'full' if sync_type == 'full' or max_symbols == 0 and sync_type != 'incremental' else 'incremental'
+        
+        result = data_sync_service.sync_market_data(
+            sync_type=effective_sync_type,
+            markets=markets,
+            max_symbols=max_symbols,
+            batch_size=batch_size,
+            delay_seconds=delay_seconds,
+            preferred_sources=preferred_sources,
+            top_n_by=top_n_by,
+            top_n=top_n,
+            amount_window_days=amount_window_days
+        )
+        
+        return result
+    except Exception as e:
+        logger.error(f"数据同步失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# 新增：覆盖率与新鲜度报表 API
+@app.get("/api/coverage_report")
+async def coverage_report(markets: str = None, window_days: int = 5):
+    """覆盖率与新鲜度简报"""
+    try:
+        market_list = markets.split(',') if markets else None
+        result = data_sync_service.coverage_and_freshness_report(market_list, window_days)
+        return result
+    except Exception as e:
+        logger.error(f"生成覆盖率与新鲜度报表失败: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -550,30 +1015,6 @@ async def check_data_freshness(markets: str = None):
         
     except Exception as e:
         logger.error(f"检查数据新鲜度失败: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@app.post("/api/data/sync")
-async def sync_data(request: dict):
-    """同步市场数据"""
-    try:
-        sync_type = request.get('sync_type', 'incremental')
-        markets = request.get('markets', ['SH', 'SZ'])
-        max_symbols = request.get('max_symbols', 100)
-        batch_size = request.get('batch_size', 10)
-        
-        result = data_sync_service.sync_market_data(
-            sync_type=sync_type,
-            markets=markets,
-            max_symbols=max_symbols,
-            batch_size=batch_size
-        )
-        
-        return result
-    except Exception as e:
-        logger.error(f"数据同步失败: {e}")
         return {
             "success": False,
             "error": str(e)

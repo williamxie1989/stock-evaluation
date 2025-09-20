@@ -32,7 +32,12 @@ class FeatureEngineer:
         self.feature_config = {
             'trend_windows': [5, 10, 20, 60, 120],
             'volatility_windows': [20, 60, 120],
-            'volume_windows': [5, 20, 60, 120]
+            'volume_windows': [5, 20, 60, 120],
+            # 技术指标配置（新增，避免KeyError）
+            'rsi_windows': [6, 14],
+            'bb_windows': [20],
+            # (fast, slow, signal)
+            'macd_params': [(12, 26, 9)]
         }
     
     def calculate_features(self, symbol: str, start_date: str = None, 

@@ -75,11 +75,52 @@
                         <option value="default">默认</option>
                     </select>
                     <button onclick="loadStockPicks()" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">刷新榜单</button>
-                    <button onclick="refreshDataAndReloadPicks()" class="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm">增量刷新数据</button>
+                    <!-- 新增：同步类型选择 -->
+                    <label for="syncType" class="text-sm text-gray-600">同步类型</label>
+                    <select id="syncType" class="px-2 py-1 border border-gray-300 rounded text-sm">
+                        <option value="incremental" selected>增量</option>
+                        <option value="full">全量</option>
+                    </select>
+                    <!-- 新增：数据源选择（多选） -->
+                    <div class="flex items-center gap-2 text-sm">
+                        <span class="text-sm text-gray-600">数据源</span>
+                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="eastmoney" class="rounded" checked>东财</label>
+                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="sina" class="rounded" checked>新浪</label>
+                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="tencent" class="rounded" checked>腾讯</label>
+                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="xueqiu" class="rounded" checked>雪球</label>
+                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="akshare" class="rounded" checked>Akshare</label>
+                    </div>
+                    <button id="refresh-button" onclick="refreshDataAndReloadPicks()" class="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm">同步数据</button>
+                    <button id="optimized-refresh-button" onclick="refreshDataOptimizedAndReloadPicks()" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 text-sm">优化同步</button>
                 </div>
             </div>
             <div id="stockPicksLoading" class="hidden mb-3"><div class="loading"></div></div>
             <div id="stockPicks" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+        </div>
+
+        <!-- 同步状态与数据新鲜度 -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            <!-- 同步状态卡片 -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-semibold text-gray-800">同步状态</h2>
+                    <button onclick="loadSyncStatus()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">刷新</button>
+                </div>
+                <div id="syncStatusContainer" class="text-sm text-gray-700">
+                    <p class="text-gray-500">加载中...</p>
+                </div>
+            </div>
+
+            <!-- 数据新鲜度卡片 -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-semibold text-gray-800">数据新鲜度</h2>
+                    <button onclick="loadDataFreshness()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">刷新</button>
+                </div>
+                <div id="dataFreshnessContainer" class="text-sm text-gray-700">
+                    <p class="text-gray-500">加载中...</p>
+                </div>
+            </div>
         </div>
 
         <!-- 结果显示区域 -->
@@ -561,20 +602,201 @@
             }).join('');
         }
 
-        async function refreshDataAndReloadPicks() {
-            try {
-                document.getElementById('stockPicksLoading').classList.remove('hidden');
-                await fetch('/api/refresh-data?max_symbols=50', { method: 'POST' });
-            } catch (e) {
-                // ignore
-            } finally {
-                document.getElementById('stockPicksLoading').classList.add('hidden');
+        async function refreshDataOptimizedAndReloadPicks(maxSymbols = 50) {
+            const refreshButton = document.getElementById('optimized-refresh-button');
+            
+            // Disable button and show loading state
+            if (refreshButton) {
+                refreshButton.disabled = true;
+                refreshButton.textContent = '优化同步中...';
             }
-            loadStockPicks();
+            
+            // 读取同步类型与数据源选择
+            const syncTypeEl = document.getElementById('syncType');
+            const syncType = syncTypeEl ? syncTypeEl.value : 'incremental';
+            const selectedSources = Array.from(document.querySelectorAll('input[name="source"]:checked')).map(el => el.value);
+            
+            const requestBody = {
+                sync_type: syncType,
+                markets: ['A股主板', '创业板', '科创板'],
+                batch_size: 50,
+                delay_seconds: 0.2
+            };
+            
+            // Make API call to refresh data using optimized endpoint
+            fetch('/api/sync_data_optimized', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestBody)
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('优化版数据刷新结果:', data);
+                
+                if (data.success) {
+                    console.log('优化版数据刷新成功，重新加载股票推荐...');
+                    
+                    // 显示优化统计信息
+                    if (data.statistics && data.source_statistics) {
+                        const stats = data.statistics;
+                        const sourceStats = data.source_statistics;
+                        alert(`优化同步完成！\n` +
+                              `成功率: ${stats.success_rate}\n` +
+                              `耗时: ${stats.elapsed_time}\n` +
+                              `平均每股: ${stats.avg_time_per_stock}\n` +
+                              `重试次数: ${sourceStats.total_retries || 0}\n` +
+                              `熔断触发: ${sourceStats.circuit_breaker_triggers || 0}次`);
+                    }
+                    
+                    loadStockPicks(); // 重新加载股票推荐
+                    loadSyncStatus(); // 刷新同步状态
+                    loadDataFreshness(); // 刷新数据新鲜度
+                } else {
+                    console.error('优化版数据刷新失败:', data.message);
+                    alert('优化版数据刷新失败: ' + (data.message || '未知错误'));
+                }
+            })
+            .catch(error => {
+                console.error('优化版请求失败:', error);
+                alert('优化版请求失败: ' + error.message);
+            })
+            .finally(() => {
+                // Re-enable button
+                if (refreshButton) {
+                    refreshButton.disabled = false;
+                    refreshButton.textContent = '优化同步';
+                }
+            });
         }
 
-        // 页面加载时获取智能选股榜单
+        async function refreshDataAndReloadPicks(maxSymbols = 50) {
+            const refreshButton = document.getElementById('refresh-button');
+            
+            // Disable button and show loading state
+            if (refreshButton) {
+                refreshButton.disabled = true;
+                refreshButton.textContent = '更新中...';
+            }
+            
+            // 读取同步类型与数据源选择
+            const syncTypeEl = document.getElementById('syncType');
+            const syncType = syncTypeEl ? syncTypeEl.value : 'incremental';
+            const selectedSources = Array.from(document.querySelectorAll('input[name="source"]:checked')).map(el => el.value);
+            
+            const requestBody = {
+                sync_type: syncType,
+                markets: ['SH', 'SZ'],
+                force_full: syncType === 'full',
+                preferred_sources: selectedSources.length ? selectedSources : undefined
+            };
+            
+            // Make API call to refresh data
+            fetch('/api/sync_data', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestBody)
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('数据刷新结果:', data);
+                
+                if (data.success) {
+                    console.log('数据刷新成功，重新加载股票推荐...');
+                    loadStockPicks(); // 重新加载股票推荐
+                    loadSyncStatus(); // 刷新同步状态
+                    loadDataFreshness(); // 刷新数据新鲜度
+                } else {
+                    console.error('数据刷新失败:', data.error);
+                    alert('数据刷新失败: ' + (data.error || '未知错误'));
+                }
+            })
+            .catch(error => {
+                console.error('请求失败:', error);
+                alert('请求失败: ' + error.message);
+            })
+            .finally(() => {
+                // Re-enable button
+                if (refreshButton) {
+                    refreshButton.disabled = false;
+                    refreshButton.textContent = '同步数据';
+                }
+            });
+        }
+
+        // 加载同步状态
+        async function loadSyncStatus() {
+            const container = document.getElementById('syncStatusContainer');
+            if (!container) return;
+            container.innerHTML = '<div class="flex items-center gap-2 text-gray-500"><div class="loading"></div><span>加载中...</span></div>';
+            try {
+                const response = await fetch('/api/sync_status');
+                const data = await response.json();
+                if (!data.success) {
+                    container.innerHTML = `<p class="text-red-600">获取失败: ${data.error || '未知错误'}</p>`;
+                    return;
+                }
+                const info = data.data;
+                if (!info || info.message) {
+                    container.innerHTML = `<p class="text-gray-500">${info && info.message ? info.message : '暂无同步记录'}</p>`;
+                    return;
+                }
+                const rows = Object.keys(info).map(k => {
+                    const v = info[k];
+                    return `<div class=\"flex justify-between border-b border-gray-100 py-1\"><span class=\"text-gray-500\">${k}</span><span class=\"font-medium\">${v == null ? '-' : v}</span></div>`;
+                }).join('');
+                container.innerHTML = rows || '<p class="text-gray-500">暂无同步记录</p>';
+            } catch (e) {
+                container.innerHTML = `<p class="text-red-600">请求失败: ${e.message}</p>`;
+            }
+        }
+
+        // 加载数据新鲜度
+        async function loadDataFreshness(markets = null) {
+            const container = document.getElementById('dataFreshnessContainer');
+            if (!container) return;
+            container.innerHTML = '<div class="flex items-center gap-2 text-gray-500"><div class="loading"></div><span>加载中...</span></div>';
+            try {
+                const url = markets ? `/api/data_freshness?markets=${encodeURIComponent(markets.join(','))}` : '/api/data_freshness';
+                const response = await fetch(url);
+                const data = await response.json();
+                if (!data.success) {
+                    container.innerHTML = `<p class="text-red-600">获取失败: ${data.error || '未知错误'}</p>`;
+                    return;
+                }
+                const list = data.markets || [];
+                if (!list.length) {
+                    container.innerHTML = '<p class="text-gray-500">暂无数据</p>';
+                    return;
+                }
+                const html = list.map(m => {
+                    const badge = m.is_fresh ? '<span class="ml-2 px-2 py-0.5 text-xs rounded bg-green-100 text-green-700">新鲜</span>' : '<span class="ml-2 px-2 py-0.5 text-xs rounded bg-yellow-100 text-yellow-700">滞后</span>';
+                    const days = m.days_behind == null ? '-' : `${m.days_behind}天`;
+                    return `
+                        <div class=\"border border-gray-200 rounded p-3 mb-2\">
+                            <div class=\"flex justify-between items-center\">
+                                <div class=\"font-semibold text-gray-800\">${m.market || '-'}</div>
+                                <div class=\"text-sm text-gray-600\">最新日期: <span class=\"font-medium\">${m.latest_date || '-'}</span>${badge}</div>
+                            </div>
+                            <div class=\"mt-2 text-sm text-gray-700\">
+                                <span>股票数: <span class=\"font-medium\">${m.stock_count ?? '-'}</span></span>
+                                <span class=\"ml-4\">滞后: <span class=\"font-medium ${m.is_fresh ? 'text-green-700' : 'text-yellow-700'}\">${days}</span></span>
+                            </div>
+                        </div>`;
+                }).join('');
+                container.innerHTML = html;
+            } catch (e) {
+                container.innerHTML = `<p class="text-red-600">请求失败: ${e.message}</p>`;
+            }
+        }
+
+        // 页面加载时初始化
         loadStockPicks();
+        loadSyncStatus();
+        loadDataFreshness();
     </script>
 </body>
 </html>

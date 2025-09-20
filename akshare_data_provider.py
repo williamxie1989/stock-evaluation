@@ -4,19 +4,35 @@ from datetime import datetime, timedelta
 import re
 import time
 import logging
+import os
+import random
 
 
 class AkshareDataProvider:
     def __init__(self):
-        self.max_retries = 3
-        self.retry_delay = 2.0
+        # 从环境变量读取重试参数，提供安全的默认值
+        try:
+            self.max_retries = max(1, int(os.getenv("AK_MAX_RETRIES", "3")))
+        except Exception:
+            self.max_retries = 3
+        try:
+            self.retry_delay = max(0.1, float(os.getenv("AK_RETRY_DELAY", "2.0")))
+        except Exception:
+            self.retry_delay = 2.0
         self.logger = logging.getLogger(__name__)
+        try:
+            self.logger.info(f"AkshareDataProvider retries configured: max_retries={self.max_retries}, retry_delay={self.retry_delay}s")
+        except Exception:
+            pass
     
     def get_all_stock_list(self):
         """获取全市场股票列表，包含板块分类信息"""
         all_stocks = []
         
         try:
+            from stock_status_filter import StockStatusFilter
+            stock_filter = StockStatusFilter()
+            
             # 1. 获取沪深A股所有股票
             self.logger.info("正在获取沪深A股股票列表...")
             a_stocks = self._retry_with_backoff(ak.stock_info_a_code_name)
@@ -24,6 +40,12 @@ class AkshareDataProvider:
                 for _, row in a_stocks.iterrows():
                     code = row['code']
                     name = row['name']
+                    
+                    # 过滤无效股票
+                    filter_check = stock_filter.should_filter_stock(name, code, exclude_star_market=True)
+                    if filter_check['should_filter']:
+                        self.logger.debug(f"跳过无效股票: {code} - {name} ({filter_check['reason']})")
+                        continue
                     
                     # 根据代码判断板块
                     market_type = self._classify_stock_market(code)
@@ -46,6 +68,13 @@ class AkshareDataProvider:
                     for _, row in sh_main.iterrows():
                         code = row['证券代码']
                         name = row['证券简称']
+                        
+                        # 过滤无效股票
+                        filter_check = stock_filter.should_filter_stock(name, code, exclude_star_market=True)
+                        if filter_check['should_filter']:
+                            self.logger.debug(f"跳过无效股票: {code} - {name} ({filter_check['reason']})")
+                            continue
+                        
                         if not any(s['symbol'] == code for s in all_stocks):
                             all_stocks.append({
                                 'symbol': code,
@@ -55,8 +84,6 @@ class AkshareDataProvider:
                                 'exchange': '上海证券交易所',
                                 'ah_pair': None
                             })
-                
-
             except Exception as e:
                 self.logger.warning(f"获取上海证券交易所股票列表失败: {e}")
             
@@ -66,9 +93,22 @@ class AkshareDataProvider:
                 # A股列表（包含主板和创业板）
                 sz_stocks = self._retry_with_backoff(ak.stock_info_sz_name_code, symbol="A股列表")
                 if sz_stocks is not None and not sz_stocks.empty:
+                    # 兼容不同版本列名
+                    cols = list(sz_stocks.columns)
+                    code_col = '证券代码' if '证券代码' in cols else ('A股代码' if 'A股代码' in cols else None)
+                    name_col = '证券简称' if '证券简称' in cols else ('A股简称' if 'A股简称' in cols else None)
+                    if code_col is None or name_col is None:
+                        raise KeyError(f"意外的深交所列名: {cols}")
                     for _, row in sz_stocks.iterrows():
-                        code = row['证券代码']
-                        name = row['证券简称']
+                        code = row[code_col]
+                        name = row[name_col]
+                        
+                        # 过滤无效股票
+                        filter_check = stock_filter.should_filter_stock(name, code, exclude_star_market=True)
+                        if filter_check['should_filter']:
+                            self.logger.debug(f"跳过无效股票: {code} - {name} ({filter_check['reason']})")
+                            continue
+                        
                         if not any(s['symbol'] == code for s in all_stocks):
                             market_type = self._classify_stock_market(code)
                             all_stocks.append({
@@ -90,6 +130,13 @@ class AkshareDataProvider:
                     for _, row in bj_stocks.iterrows():
                         code = row['证券代码']
                         name = row['证券简称']
+                        
+                        # 过滤无效股票
+                        filter_check = stock_filter.should_filter_stock(name, code, exclude_star_market=True)
+                        if filter_check['should_filter']:
+                            self.logger.debug(f"跳过无效股票: {code} - {name} ({filter_check['reason']})")
+                            continue
+                        
                         if not any(s['symbol'] == code for s in all_stocks):
                             all_stocks.append({
                                 'symbol': code,
@@ -126,29 +173,39 @@ class AkshareDataProvider:
                                 if '+H' not in all_stocks[existing_stock]['board_type']:
                                     all_stocks[existing_stock]['board_type'] += '+H'
                             else:
-                                # 添加新的A股记录
-                                market_type = self._classify_stock_market(code_a)
-                                all_stocks.append({
-                                    'symbol': code_a,
-                                    'name': row.get('name', ''),
-                                    'market': market_type['market'],
-                                    'board_type': market_type['board_type'] + '+H',
-                                    'exchange': market_type['exchange'],
-                                    'ah_pair': ah_pair_value
-                                })
+                                # 过滤无效股票
+                                filter_check = stock_filter.should_filter_stock(row.get('name', ''), code_a)
+                                if not filter_check['should_filter']:
+                                    # 添加新的A股记录
+                                    market_type = self._classify_stock_market(code_a)
+                                    all_stocks.append({
+                                        'symbol': code_a,
+                                        'name': row.get('name', ''),
+                                        'market': market_type['market'],
+                                        'board_type': market_type['board_type'] + '+H',
+                                        'exchange': market_type['exchange'],
+                                        'ah_pair': ah_pair_value
+                                    })
+                                else:
+                                    self.logger.debug(f"跳过无效A+H股票: {code_a} - {row.get('name', '')} ({filter_check['reason']})")
                         
                         # 处理H股代码
                         if 'code_h' in row and pd.notna(row['code_h']):
                             code_h = str(row['code_h']).zfill(5)
                             if not any(s['symbol'] == code_h for s in all_stocks):
-                                all_stocks.append({
-                                    'symbol': code_h,
-                                    'name': row.get('name', ''),
-                                    'market': 'HK',
-                                    'board_type': 'H股',
-                                    'exchange': '香港证券交易所',
-                                    'ah_pair': code_a if 'code_a' in row and pd.notna(row['code_a']) else None
-                                })
+                                # 过滤无效股票
+                                filter_check = stock_filter.should_filter_stock(row.get('name', ''), code_h, exclude_star_market=True)
+                                if not filter_check['should_filter']:
+                                    all_stocks.append({
+                                        'symbol': code_h,
+                                        'name': row.get('name', ''),
+                                        'market': 'HK',
+                                        'board_type': 'H股',
+                                        'exchange': '香港证券交易所',
+                                        'ah_pair': code_a if 'code_a' in row and pd.notna(row['code_a']) else None
+                                    })
+                                else:
+                                    self.logger.debug(f"跳过无效H股: {code_h} - {row.get('name', '')} ({filter_check['reason']})")
                     self.logger.info(f"成功整合 {len(ah_stocks)} 只A+H股")
             except Exception as e:
                 self.logger.warning(f"获取A+H股列表失败: {e}")
@@ -156,9 +213,41 @@ class AkshareDataProvider:
             self.logger.info(f"成功获取 {len(all_stocks)} 只股票信息")
             return pd.DataFrame(all_stocks)
             
+        except ImportError as e:
+            self.logger.warning(f"无法导入股票过滤器，将不进行股票过滤: {e}")
+            # 如果无法导入过滤器，返回原始逻辑的结果
+            return self._get_all_stock_list_without_filter()
         except Exception as e:
             self.logger.error(f"获取全市场股票列表失败: {e}")
             return pd.DataFrame(columns=['symbol', 'name', 'market', 'board_type', 'exchange', 'ah_pair'])
+    
+    def _get_all_stock_list_without_filter(self):
+        """获取全市场股票列表（不进行过滤的原始版本）"""
+        try:
+            all_stocks = []
+            
+            # A股列表
+            a_stocks = self._retry_with_backoff(ak.stock_info_a_code_name)
+            if a_stocks is not None and not a_stocks.empty:
+                for _, row in a_stocks.iterrows():
+                    code = str(row['code']).zfill(6)
+                    name = str(row['name']).strip()
+                    market_type = self._classify_stock_market(code)
+                    
+                    all_stocks.append({
+                        'symbol': f"{code}.{market_type['exchange']}",
+                        'name': name,
+                        'market': market_type['market'],
+                        'board_type': market_type['board_type'],
+                        'exchange': market_type['exchange']
+                    })
+            
+            self.logger.info(f"成功获取 {len(all_stocks)} 只股票信息")
+            return pd.DataFrame(all_stocks)
+            
+        except Exception as e:
+            self.logger.error(f"获取全市场股票列表失败: {e}")
+            return pd.DataFrame()
     
     def _classify_stock_market(self, code):
         """根据股票代码分类市场和板块"""
@@ -311,22 +400,30 @@ class AkshareDataProvider:
         return stock_info
 
     def _retry_with_backoff(self, func, *args, **kwargs):
-        """带退避策略的重试机制"""
+        """带退避策略的重试机制（带抖动）"""
+        last_err = None
         for attempt in range(self.max_retries):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
+                last_err = e
                 error_msg = str(e).lower()
                 # 检查是否为API限流或网络错误
-                if any(keyword in error_msg for keyword in ['rate limit', 'too many requests', 'timeout', 'connection']):
+                if any(keyword in error_msg for keyword in ['rate limit', 'too many requests', 'timeout', 'connection', 'timed out', 'reset', 'proxy']):
                     if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (2 ** attempt)  # 指数退避
-                        self.logger.warning(f"API调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}, {delay}秒后重试")
+                        base_delay = self.retry_delay * (2 ** attempt)  # 指数退避
+                        # 抖动系数：0.8x ~ 1.2x，避免雪崩
+                        delay = base_delay * (0.8 + 0.4 * random.random())
+                        self.logger.warning(f"API调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}, {delay:.2f}秒后重试")
                         time.sleep(delay)
                         continue
+                # 非可重试错误或已无剩余重试
                 raise e
+        # 理论上不会到达这里
+        if last_err:
+            raise last_err
         return None
-    
+
     def get_stock_data(self, stock_symbol, period="3y"):
         """使用akshare获取股票数据"""
         try:
@@ -651,9 +748,9 @@ class AkshareDataProvider:
             print(f"获取{market}市场股票{symbol}的历史数据")
             # 回退逻辑
             if market.upper() == 'A':
-                # A 股历史：使用统一 A 股日线接口
+                # A 股历史：使用统一 A 股日线接口（增加重试机制）
                 try:
-                    df_a = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+                    df_a = self._retry_with_backoff(ak.stock_zh_a_hist, symbol=symbol, period="daily", adjust="qfq")
                     std = _standardize(df_a)
                     return _apply_date_filter(std)
                 except Exception as e:
@@ -662,9 +759,9 @@ class AkshareDataProvider:
                     print(f"详细错误信息: {traceback.format_exc()}")
                     return pd.DataFrame(columns=['date','open','high','low','close','volume'])
             else:
-                # H 股历史：港股日线
+                # H 股历史：港股日线（增加重试机制）
                 try:
-                    df_h = ak.stock_hk_daily(symbol=symbol)
+                    df_h = self._retry_with_backoff(ak.stock_hk_daily, symbol=symbol)
                     std = _standardize(df_h)
                     return _apply_date_filter(std)
                 except Exception as e:

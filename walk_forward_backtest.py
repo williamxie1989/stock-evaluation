@@ -10,9 +10,12 @@ import numpy as np
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 import pickle
+from collections import deque
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
 
 from db import DatabaseManager
 from ml_trainer import MLTrainer
@@ -29,6 +32,10 @@ class WalkForwardBacktest:
     def __init__(self, db_manager: DatabaseManager = None):
         self.db_manager = db_manager or DatabaseManager()
         self.ml_trainer = MLTrainer(db_manager=self.db_manager)
+        # 参数历史表现统计：key为参数组合字符串，value为该参数在过往fold上的优化指标列表
+        self.param_stats: Dict[str, List[float]] = {}
+        # 在线学习状态（分类）：包含scaler、model、classes
+        self._online_state: Optional[Dict[str, Any]] = None
         
     def run_backtest(self, 
                     symbol: str,
@@ -36,7 +43,19 @@ class WalkForwardBacktest:
                     train_window: int = 60,  # 训练窗口天数
                     test_window: int = 20,   # 测试窗口天数
                     step_size: int = 10,     # 步长天数
-                    min_samples: int = 50) -> Dict:
+                    min_samples: int = 50,
+                    # 实时模型优化新增参数
+                    auto_optimize: bool = False,
+                    param_candidates: Optional[List[Dict]] = None,
+                    optimize_metric: str = 'total_return',  # 可选: 'total_return' | 'avg_period_return' | 'sharpe'
+                    online_learning: bool = False,
+                    online_params: Optional[Dict] = None,
+                    adaptive_selection: bool = False,
+                    selection_min_pct: float = 0.1,
+                    selection_max_pct: float = 0.3,
+                    selection_window: int = 3,
+                    selection_step: float = 0.05
+                    ) -> Dict:
         """
         运行Walk-Forward回测
         
@@ -47,6 +66,15 @@ class WalkForwardBacktest:
             test_window: 测试窗口天数
             step_size: 步长天数
             min_samples: 最小样本数
+            auto_optimize: 是否开启基于回测结果的自动参数优化
+            param_candidates: 候选pipeline参数（传递给MLTrainer.create_pipeline的LogisticRegression参数）
+            optimize_metric: 用于比较候选参数表现的指标
+            online_learning: 是否开启在线学习（SGDClassifier增量训练）
+            online_params: 在线学习模型的参数（如alpha、penalty等）
+            adaptive_selection: 是否启用自适应选股比例调整
+            selection_min_pct/selection_max_pct: 选股比例的上下限
+            selection_window: 用于滚动评估自适应调整的窗口大小（folds）
+            selection_step: 每次调整幅度
             
         Returns:
             回测结果字典
@@ -65,7 +93,17 @@ class WalkForwardBacktest:
         
         # 执行时间切片回测
         results = self._time_series_split_backtest(
-            samples_df, train_window, test_window, step_size, min_samples
+            samples_df, train_window, test_window, step_size, min_samples,
+            auto_optimize=auto_optimize,
+            param_candidates=param_candidates,
+            optimize_metric=optimize_metric,
+            online_learning=online_learning,
+            online_params=online_params,
+            adaptive_selection=adaptive_selection,
+            selection_min_pct=selection_min_pct,
+            selection_max_pct=selection_max_pct,
+            selection_window=selection_window,
+            selection_step=selection_step
         )
         
         # 计算回测指标
@@ -111,7 +149,17 @@ class WalkForwardBacktest:
                                    train_window: int,
                                    test_window: int,
                                    step_size: int,
-                                   min_samples: int) -> List[Dict]:
+                                   min_samples: int,
+                                   auto_optimize: bool = False,
+                                   param_candidates: Optional[List[Dict]] = None,
+                                   optimize_metric: str = 'total_return',
+                                   online_learning: bool = False,
+                                   online_params: Optional[Dict] = None,
+                                   adaptive_selection: bool = False,
+                                   selection_min_pct: float = 0.1,
+                                   selection_max_pct: float = 0.3,
+                                   selection_window: int = 3,
+                                   selection_step: float = 0.05) -> List[Dict]:
         """
         时间序列切片回测
         """
@@ -120,6 +168,10 @@ class WalkForwardBacktest:
         dates = sorted(dates)
         
         logger.info(f"数据日期范围: {dates[0]} 到 {dates[-1]}, 共 {len(dates)} 个交易日")
+        # 自适应选股比例
+        top_pct = 0.2
+        top_pct = max(selection_min_pct, min(selection_max_pct, top_pct))
+        performance_window = deque(maxlen=max(1, selection_window))
         
         # 滑动窗口回测
         for i in range(train_window, len(dates) - test_window + 1, step_size):
@@ -146,79 +198,164 @@ class WalkForwardBacktest:
                 continue
                 
             # 训练模型并预测
-            fold_result = self._train_and_predict(train_data, test_data, i)
+            fold_result = self._train_and_predict(
+                train_data, test_data, i,
+                auto_optimize=auto_optimize,
+                param_candidates=param_candidates,
+                optimize_metric=optimize_metric,
+                online_learning=online_learning,
+                online_params=online_params,
+                top_pct=top_pct
+            )
             if fold_result:
                 fold_result.update({
                     'train_start': str(train_start_date),
                     'train_end': str(train_end_date),
                     'test_start': str(test_start_date),
-                    'test_end': str(test_end_date)
+                    'test_end': str(test_end_date),
+                    'top_pct': top_pct
                 })
                 results.append(fold_result)
-                
+               
+                # 自适应策略：根据最近窗口表现调整top_pct
+                if adaptive_selection and fold_result.get('returns'):
+                    perf_value = fold_result['returns'].get('mean_return', 0.0)
+                    performance_window.append(perf_value)
+                    avg_perf = np.mean(performance_window) if len(performance_window) > 0 else 0.0
+                    hit_rate = fold_result['returns'].get('hit_rate', 0.0)
+                    # 简单规则：正收益且命中率较好 -> 略增；负收益 -> 略减
+                    if avg_perf > 0 and hit_rate >= 0.55:
+                        top_pct = min(selection_max_pct, top_pct + selection_step)
+                    elif avg_perf < 0:
+                        top_pct = max(selection_min_pct, top_pct - selection_step)
+        
         logger.info(f"完成 {len(results)} 个回测窗口")
         return results
         
-    def _train_and_predict(self, train_data: pd.DataFrame, test_data: pd.DataFrame, fold_idx: int) -> Optional[Dict]:
-        """
-        训练模型并进行预测
-        """
-        try:
-            # 准备训练数据
-            X_train, y_train = self._prepare_features_labels(train_data)
-            X_test, y_test = self._prepare_features_labels(test_data)
-            
-            if X_train.empty or X_test.empty:
-                return None
+    def _train_and_predict(self, train_data: pd.DataFrame, test_data: pd.DataFrame, fold_idx: int,
+                           auto_optimize: bool = False,
+                           param_candidates: Optional[List[Dict]] = None,
+                           optimize_metric: str = 'total_return',
+                           online_learning: bool = False,
+                           online_params: Optional[Dict] = None,
+                           top_pct: float = 0.2) -> Optional[Dict]:
+         """
+         训练模型并进行预测
+         """
+         try:
+             # 准备训练数据
+             X_train, y_train = self._prepare_features_labels(train_data)
+             X_test, y_test = self._prepare_features_labels(test_data)
+             
+             if X_train.empty or X_test.empty:
+                 return None
+                 
+             # 确保训练和测试集特征一致
+             common_features = list(set(X_train.columns) & set(X_test.columns))
+             if not common_features:
+                 logger.error(f"训练和测试集没有共同特征")
+                 return None
+                 
+             X_train = X_train[common_features]
+             X_test = X_test[common_features]
+                 
+             # 训练与预测
+             if online_learning:
+                 # 初始化在线学习状态
+                 if self._online_state is None:
+                     scaler = StandardScaler()
+                     X0 = X_train.fillna(X_train.median())
+                     scaler.partial_fit(X0)
+                     X0s = scaler.transform(X0)
+                     default_params = {
+                         'loss': 'log_loss',
+                         'penalty': 'l2',
+                         'alpha': 0.0001,
+                         'max_iter': 1000,
+                         'random_state': 42
+                     }
+                     clf_params = {**default_params, **(online_params or {})}
+                     model = SGDClassifier(**clf_params)
+                     classes = np.array(sorted(np.unique(y_train)))
+                     model.partial_fit(X0s, y_train, classes=classes)
+                     self._online_state = {'scaler': scaler, 'model': model, 'classes': classes}
+                 else:
+                     scaler = self._online_state['scaler']
+                     model = self._online_state['model']
+                     # 使用最新训练集进行增量拟合
+                     X0 = X_train.fillna(X_train.median())
+                     scaler.partial_fit(X0)
+                     X0s = scaler.transform(X0)
+                     model.partial_fit(X0s, y_train)
                 
-            # 确保训练和测试集特征一致
-            common_features = list(set(X_train.columns) & set(X_test.columns))
-            if not common_features:
-                logger.error(f"训练和测试集没有共同特征")
-                return None
-                
-            X_train = X_train[common_features]
-            X_test = X_test[common_features]
-                
-            # 训练模型
-            train_result = self.ml_trainer.train_model(X_train, y_train, test_size=0.2, use_grid_search=False)
-            model = train_result['model']
-            
-            # 预测
-            y_pred_proba = model.predict_proba(X_test)[:, 1]
-            y_pred = model.predict(X_test)
-            
-            # 计算指标
-            from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score
-            
-            accuracy = accuracy_score(y_test, y_pred)
-            try:
-                auc = roc_auc_score(y_test, y_pred_proba)
-            except:
-                auc = 0.5
-                
-            precision = precision_score(y_test, y_pred, zero_division=0)
-            recall = recall_score(y_test, y_pred, zero_division=0)
-            
-            # 计算收益指标
-            returns = self._calculate_returns(test_data, y_pred_proba)
-            
-            return {
-                'fold': fold_idx,
-                'train_samples': len(train_data),
-                'test_samples': len(test_data),
-                'accuracy': accuracy,
-                'auc': auc,
-                'precision': precision,
-                'recall': recall,
-                'predictions': y_pred_proba.tolist(),
-                'actual_labels': y_test.tolist(),
-                'returns': returns
-            }
-            
-        except Exception as e:
-            logger.error(f"训练预测失败 fold {fold_idx}: {e}")
-            return None
+                 # 预测
+                 Xts = self._online_state['scaler'].transform(X_test.fillna(X_test.median()))
+                 # predict_proba 仅在loss='log_loss'时可用
+                 if hasattr(self._online_state['model'], 'predict_proba'):
+                     y_pred_proba = self._online_state['model'].predict_proba(Xts)[:, 1]
+                 else:
+                     # 回退到decision_function经sigmoid近似
+                     scores = self._online_state['model'].decision_function(Xts)
+                     y_pred_proba = 1 / (1 + np.exp(-scores))
+                 y_pred = (y_pred_proba >= 0.5).astype(int)
+             else:
+                 # 自动参数选择
+                 pipeline_params = None
+                 if auto_optimize and param_candidates:
+                     pipeline_params = self._select_best_params(param_candidates, optimize_metric)
+                 # 训练模型
+                 train_result = self.ml_trainer.train_model(
+                     X_train, y_train, test_size=0.2, use_grid_search=False,
+                     pipeline_params=pipeline_params
+                 )
+                 model = train_result['model']
+                 # 预测
+                 y_pred_proba = model.predict_proba(X_test)[:, 1]
+                 y_pred = model.predict(X_test)
+             
+             # 计算指标
+             from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score
+             
+             accuracy = accuracy_score(y_test, y_pred)
+             try:
+                 auc = roc_auc_score(y_test, y_pred_proba)
+             except:
+                 auc = 0.5
+                 
+             precision = precision_score(y_test, y_pred, zero_division=0)
+             recall = recall_score(y_test, y_pred, zero_division=0)
+             
+             # 计算收益指标
+             returns = self._calculate_returns(test_data, y_pred_proba, top_pct=top_pct)
+             
+             # 记录参数表现并进行在线学习后续更新
+             if not online_learning and auto_optimize and param_candidates:
+                 self._record_param_performance(pipeline_params or {}, returns, optimize_metric)
+             
+             if online_learning:
+                 # 使用测试集真实标签进行增量学习（模拟在线反馈）
+                 Xts_full = X_test.fillna(X_test.median())
+                 self._online_state['scaler'].partial_fit(Xts_full)
+                 self._online_state['model'].partial_fit(
+                     self._online_state['scaler'].transform(Xts_full), y_test
+                 )
+             
+             return {
+                 'fold': fold_idx,
+                 'train_samples': len(train_data),
+                 'test_samples': len(test_data),
+                 'accuracy': accuracy,
+                 'auc': auc,
+                 'precision': precision,
+                 'recall': recall,
+                 'predictions': y_pred_proba.tolist(),
+                 'actual_labels': y_test.tolist(),
+                 'returns': returns
+             }
+             
+         except Exception as e:
+             logger.error(f"训练预测失败 fold {fold_idx}: {e}")
+             return None
             
     def _prepare_features_labels(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         """
@@ -251,7 +388,7 @@ class WalkForwardBacktest:
             logger.error(f"准备特征标签失败: {e}")
             return pd.DataFrame(), pd.Series()
             
-    def _calculate_returns(self, test_data: pd.DataFrame, predictions: np.ndarray) -> Dict:
+    def _calculate_returns(self, test_data: pd.DataFrame, predictions: np.ndarray, top_pct: float = 0.2) -> Dict:
         """
         计算收益指标
         """
@@ -259,8 +396,8 @@ class WalkForwardBacktest:
             # 获取前瞻收益率
             forward_returns = test_data['forward_return'].values
             
-            # 按预测概率排序，选择Top 20%
-            n_top = max(1, len(predictions) // 5)
+            # 按预测概率排序，选择Top百分比
+            n_top = max(1, int(len(predictions) * top_pct))
             top_indices = np.argsort(predictions)[-n_top:]
             
             # 计算策略收益
@@ -329,6 +466,59 @@ class WalkForwardBacktest:
             logger.error(f"计算回测指标失败: {e}")
             return {}
             
+    # ====== Auto parameter optimization helpers ======
+    def _params_to_key(self, params: Optional[Dict]) -> str:
+        """将参数字典转为稳定的键字符串"""
+        try:
+            return json.dumps(params or {}, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            try:
+                return str(sorted((params or {}).items()))
+            except Exception:
+                return "{}"
+    
+    def _select_best_params(self, param_candidates: Optional[List[Dict]], optimize_metric: str) -> Optional[Dict]:
+        """
+        基于历史表现选择最优参数；若无历史数据，返回第一个候选
+        """
+        if not param_candidates:
+            return None
+        # 若没有历史记录，优先使用第一个候选
+        if not self.param_stats:
+            return param_candidates[0]
+        best_params = param_candidates[0]
+        best_score = -float('inf')
+        for cand in param_candidates:
+            key = self._params_to_key(cand)
+            scores = self.param_stats.get(key, [])
+            avg_score = float(np.mean(scores)) if scores else -1e9  # 未见过的参数赋低优先级
+            if avg_score > best_score:
+                best_score = avg_score
+                best_params = cand
+        return best_params
+    
+    def _record_param_performance(self, pipeline_params: Dict, returns: Dict, optimize_metric: str):
+        """
+        记录当前参数在本fold的表现分值，用于后续参数选择
+        """
+        if not isinstance(pipeline_params, dict) or not returns:
+            return
+        key = self._params_to_key(pipeline_params)
+        metric = (optimize_metric or 'total_return').lower()
+        # 根据优化目标计算分值；不支持的指标回退到total_return/mean_return
+        if metric in ('total_return', 'return', 'sum_return'):
+            score = float(returns.get('total_return', 0.0))
+        elif metric in ('avg_period_return', 'mean_return', 'avg_return'):
+            score = float(returns.get('mean_return', 0.0))
+        elif metric == 'sharpe':
+            # 单个窗口难以稳定估计夏普，这里采用均值近似
+            score = float(returns.get('mean_return', 0.0))
+        elif metric == 'hit_rate':
+            score = float(returns.get('hit_rate', 0.0))
+        else:
+            score = float(returns.get('total_return', 0.0))
+        self.param_stats.setdefault(key, []).append(score)
+    
     def _calculate_max_drawdown(self, cumulative_returns: List[float]) -> float:
         """
         计算最大回撤

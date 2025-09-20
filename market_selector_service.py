@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from db import DatabaseManager
 from selector_service import IntelligentStockSelector
+from stock_status_filter import StockStatusFilter
 from enum import Enum
 
 class MarketType(Enum):
@@ -25,6 +26,7 @@ class MarketSelectorService:
     def __init__(self):
         self.db_manager = DatabaseManager()
         self.stock_selector = IntelligentStockSelector()
+        self.stock_filter = StockStatusFilter()
         self.logger = logging.getLogger(__name__)
         
         # 市场映射配置 - 修复后使用exchange字段匹配
@@ -73,7 +75,49 @@ class MarketSelectorService:
                 'success': False,
                 'error': str(e)
             }
-    
+
+    def get_stocks_by_markets(self, selected_markets: List[str]) -> List[str]:
+        """
+        根据选定市场获取股票列表
+        
+        Args:
+            selected_markets: 选定的市场列表，如 ["A股主板", "创业板", "科创板"]
+            
+        Returns:
+            List[str]: 股票代码列表
+        """
+        try:
+            # 市场名称映射
+            market_mapping = {
+                "A股主板": ["沪市主板", "深市主板"],
+                "创业板": ["创业板"],
+                "科创板": ["科创板"],
+                "北交所": ["北交所"],
+                "沪市主板": ["沪市主板"],
+                "深市主板": ["深市主板"]
+            }
+            
+            # 展开市场名称
+            expanded_markets = []
+            for market in selected_markets:
+                if market in market_mapping:
+                    expanded_markets.extend(market_mapping[market])
+                else:
+                    expanded_markets.append(market)
+            
+            # 去重
+            expanded_markets = list(set(expanded_markets))
+            
+            # 调用现有的私有方法获取候选股票
+            stock_symbols = self._get_candidate_stocks_by_markets(expanded_markets)
+            
+            self.logger.info(f"从市场 {selected_markets} 获取到 {len(stock_symbols)} 只股票")
+            return stock_symbols
+            
+        except Exception as e:
+            self.logger.error(f"获取市场股票列表失败: {e}")
+            return []
+
     def select_stocks_by_markets(self, 
                                selected_markets: List[str],
                                selection_criteria: Dict[str, Any] = None,
@@ -215,7 +259,7 @@ class MarketSelectorService:
                 # 查询该市场有历史数据的股票
                 with self.db_manager.get_conn() as conn:
                     query = """
-                    SELECT DISTINCT s.symbol 
+                    SELECT DISTINCT s.symbol, s.name, s.market, s.board_type, s.exchange
                     FROM stocks s 
                     INNER JOIN prices_daily p ON (
                         CASE 
@@ -236,17 +280,30 @@ class MarketSelectorService:
                     
                     # 确保有足够的历史数据（至少5条记录，适应数据覆盖率较低的情况）
                     query += """
-                    GROUP BY s.symbol 
+                    GROUP BY s.symbol, s.name, s.market, s.board_type, s.exchange
                     HAVING COUNT(p.date) >= 5
                     ORDER BY s.symbol
                     """
                     
                     df = pd.read_sql_query(query, conn, params=params)
-                    market_stocks = df['symbol'].tolist()
-                    candidate_stocks.extend(market_stocks)
+                    market_stocks = df.to_dict('records')
                     
-                    self.logger.info(f"市场 {market_name} 找到 {len(market_stocks)} 只有足够历史数据的股票")
-            
+                    # 应用股票过滤器
+                    if market_stocks:
+                        filter_result = self.stock_filter.filter_stock_list(
+                            market_stocks,
+                            include_st=True,
+                            include_suspended=True,
+                            db_manager=self.db_manager,
+                            exclude_b_share=True,
+                            exclude_star_market=True,
+                            exclude_bse_stock=True
+                        )
+                        filtered_stocks = [stock['symbol'] for stock in filter_result['filtered_stocks']]
+                        candidate_stocks.extend(filtered_stocks)
+                        
+                        self.logger.info(f"市场 {market_name} 原始股票 {len(market_stocks)} 只，过滤后 {len(filtered_stocks)} 只")
+                    
             # 去重并排序
             candidate_stocks = sorted(list(set(candidate_stocks)))
             
