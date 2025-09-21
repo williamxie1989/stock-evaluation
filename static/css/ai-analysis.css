@@ -1,0 +1,229 @@
+/* ======================
+   Markdown专业排版系统
+   ====================== */
+
+.markdown-body-ai {
+  --base-font-size: 16px;
+  --line-height: 1.75;
+  --heading-scale: 1.25;
+  --spacing-unit: 1.5rem;
+}
+
+/* ======================
+   Markdown专业排版系统
+   ====================== */
+
+.markdown-body-ai {
+  /* 容器系统 */
+  width: 100%;
+  padding: 2rem 1rem;
+  @apply bg-white rounded-xl shadow-lg;
+
+  /* 排版系统变量 */
+  --base-font: 18px;
+  --scale-ratio: 1.25;
+  --spacing-unit: 1.6rem;
+  --line-height: 1.8;
+  --container-width: min(90%, 72ch);
+  --color-primary: #2563eb;
+  --color-secondary: #3b82f6;
+  --color-border: #e5e7eb;
+  --scale-ratio: 1.333;
+  --spacing-unit: 1.5rem;
+  --line-height: 1.8;
+  --text-color: #24292f;
+  --heading-color: #1a1f36;
+  
+  font-family: 'Inter', system-ui;
+  color: var(--text-color);
+  line-height: var(--line-height);
+}
+
+/* 响应式排版系统 */
+@media (min-width: 768px) {
+  .markdown-body-ai {
+    --base-font: 20px;
+    --spacing-unit: 2rem;
+    --container-width: min(90%, 80ch);
+  }
+}
+/* 标题系统 */
+.markdown-body-ai h1,
+.markdown-body-ai h2,
+.markdown-body-ai h3 {
+  font-weight: 700;
+  color: var(--heading-color);
+  margin: calc(var(--spacing-unit)*2) 0 var(--spacing-unit);
+}
+
+.markdown-body-ai h1 {
+  font-size: calc(var(--base-font) * pow(var(--scale-ratio), 3)); /* 2.488rem */
+  border-bottom: 3px solid #e5e7eb;
+  padding-bottom: 0.6em;
+} {
+  font-size: calc(var(--base-font-size) * pow(var(--heading-scale), 3));
+  margin: calc(var(--spacing-unit)*2) 0 var(--spacing-unit);
+  font-weight: 800;
+  border-bottom: 3px solid #e5e7eb;
+  padding-bottom: 0.8em;
+This appears to be a dangling closing brace without a matching opening one. Given the context, it seems like this is an error. Without more information about which @-rule or selector this should belong to, it's hard to provide a definite fix. If this was meant to close the `.markdown-body-ai h1` selector block, we should ensure proper structure. But as the selection only contains `}`, and based on the instructions to make it an @-rule or selector, I'll assume it's a malformed block end. Please check the surrounding code to ensure proper CSS structure.
+
+However, if we assume this is meant to close the `.markdown-body-ai h1` block, here's the corrected form:
+
+.markdown-body-ai h2 {
+  font-size: calc(var(--base-font-size) * pow(var(--heading-scale), 2.5));
+  margin: calc(var(--spacing-unit)*1.8) 0;
+  position: relative;
+  padding-left: 1.2em;
+}
+
+.markdown-body-ai h2:before {
+  content: '#';
+  position: absolute;
+  left: 0;
+  color: #3b82f6;
+} {
+  @apply text-4xl font-extrabold mb-8;
+  letter-spacing: -0.025em;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  color: #1e3a8a;
+  padding-bottom: 1rem;
+  border-bottom: 3px solid #3b82f6;
+  background: linear-gradient(90deg, rgba(59,130,246,0.1), transparent);
+}
+
+#aiAnalysis h2 {
+  @apply text-3xl font-bold mt-12 mb-6;
+  position: relative;
+  padding-left: 2rem;
+  &::before {
+    content: '';
+    @apply absolute left-0 top-1/2 w-4 h-1 bg-blue-500 transform -translate-y-1/2;
+  }
+  color: #2563eb;
+  padding-left: 1.5rem;
+  border-left: 4px solid #60a5fa;
+}
+
+.ai-analysis-section h3 {
+  @apply text-xl font-medium mt-6 mb-3;
+  color: #3b82f6;
+}
+
+.ai-analysis-section h2 {
+  @apply text-xl font-semibold mt-6 mb-3;
+  background: linear-gradient(90deg, #bfdbfe 0.5rem, transparent 0);
+  padding-left: 1rem;
+}
+
+.ai-analysis-section h3 {
+  @apply text-lg font-medium mt-4 mb-2;
+  color: #3b82f6;
+}
+
+#aiAnalysis .prose p {
+  @apply text-gray-900 text-lg leading-loose mb-8;
+  font-family: 'Noto Serif SC', system-ui;
+  max-width: 65ch;
+  background-color: rgba(255,255,255,0.9);
+  padding: 1rem;
+  border-radius: 0.375rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+/* 特殊内容块样式 */
+.trend-analysis {
+  @apply border-l-4 border-blue-200 pl-4;
+  background-color: #f0f4ff;
+}
+
+.technical-indicator {
+  @apply border-l-4 border-green-200 pl-4;
+  background-color: #f0fdf4;
+}
+
+.risk-warning {
+  @apply border-l-4 border-red-200 pl-4;
+  background-color: #fef2f2;
+}
+
+/* 段落系统 */
+.markdown-body-ai p {
+  font-size: calc(var(--base-font) * 1);
+  margin: var(--spacing-unit) 0;
+  hyphens: auto;
+  text-align: justify;
+  max-width: 65ch;
+}
+
+/* 增强型列表 */
+.markdown-body-ai ul,
+.markdown-body-ai ol {
+  margin: var(--spacing-unit) 0;
+  padding-left: 2.5em;
+}
+
+.markdown-body-ai li {
+  position: relative;
+  margin: 0.8em 0;
+  padding-left: 1.5em;
+}
+
+.markdown-body-ai ul li::before {
+  content: '▪';
+  position: absolute;
+  left: 0;
+  color: #3b82f6;
+}
+
+.markdown-body-ai ol {
+  counter-reset: section;
+}
+
+.markdown-body-ai ol li::before {
+  counter-increment: section;
+  content: counters(section, ".") ". ";
+  position: absolute;
+  left: 0;
+  color: #64748b;
+} {
+  font-size: var(--base-font-size);
+  line-height: var(--line-height);
+  margin: var(--spacing-unit) 0;
+  hyphens: auto;
+  text-align: justify;
+}
+
+/* 列表系统 */
+.markdown-body-ai ul {
+  margin: var(--spacing-unit) 0;
+  padding-left: 2em;
+}
+
+.markdown-body-ai li {
+  margin: 0.5em 0;
+  position: relative;
+}
+
+.markdown-body-ai li:before {
+  content: '•';
+  color: #3b82f6;
+  position: absolute;
+  left: -1em;
+}
+
+/* 代码块 */
+.markdown-body-ai pre {
+  background: #f8fafc;
+  padding: 1.5em;
+  border-radius: 8px;
+  overflow-x: auto;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.05);
+} {
+  @apply text-gray-800 leading-relaxed mb-6;
+  background: rgba(255,255,255,0.95);
+  padding: 1.5rem;
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  line-height: 1.75;
+}

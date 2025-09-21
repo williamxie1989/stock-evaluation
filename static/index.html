@@ -24,6 +24,33 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        
+        /* 标签页样式优化 */
+        .tab-active {
+            color: #2563eb !important;
+            border-bottom-color: #2563eb !important;
+            background-color: #f8fafc;
+        }
+        
+        .tab-inactive {
+            color: #6b7280;
+            border-bottom: 2px solid transparent;
+        }
+        
+        .tab-inactive:hover {
+            color: #2563eb;
+            background-color: #f1f5f9;
+        }
+        
+        /* 内容区域过渡动画 */
+        .content-section {
+            transition: opacity 0.3s ease-in-out;
+        }
+        
+        .content-section.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen">
@@ -34,96 +61,129 @@
             <p class="text-gray-600">基于大模型的股票技术分析与投资建议</p>
         </div>
 
-        <!-- 搜索区域 -->
-        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
-            <div class="flex flex-col md:flex-row gap-4 items-center">
-                <input 
-                    type="text" 
-                    id="stockInput" 
-                    placeholder="输入股票代码（如：600036.SH）" 
-                    class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                <button 
-                    onclick="analyzeStock()" 
-                    class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                    分析股票
+        <!-- 导航菜单 -->
+        <div class="bg-white rounded-lg shadow-md mb-8">
+            <nav class="flex border-b">
+                <button id="tab-stock-picks" class="px-6 py-4 tab-active font-medium transition-all duration-200" onclick="switchTab('stock-picks')">
+                    智能选股
                 </button>
-                <div id="loading" class="hidden">
-                    <div class="loading"></div>
-                </div>
-            </div>
-            
-            <!-- 热门股票 -->
-            <div class="mt-4">
-                <p class="text-sm text-gray-600 mb-2">热门股票：</p>
-                <div id="popularStocks" class="flex flex-wrap gap-2">
-                    <!-- 动态加载 -->
-                </div>
-            </div>
+                <button id="tab-stock-analysis" class="px-6 py-4 tab-inactive font-medium transition-all duration-200" onclick="switchTab('stock-analysis')">
+                    个股分析
+                </button>
+                <button id="tab-system-status" class="px-6 py-4 tab-inactive font-medium transition-all duration-200" onclick="switchTab('system-status')">
+                    系统状态
+                </button>
+            </nav>
         </div>
 
-        <!-- 智能选股榜单 -->
-        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
-            <div class="flex justify-between items-center mb-3">
-                <h2 class="text-xl font-semibold text-gray-800">智能选股榜单</h2>
-                <div class="flex items-center gap-2">
-                    <label for="sortMode" class="text-sm text-gray-600">排序</label>
-                    <select id="sortMode" class="px-2 py-1 border border-gray-300 rounded text-sm" onchange="onSortModeChange()">
-                        <option value="expected_return_desc">按预期收益</option>
-                        <option value="prob_up_desc">按30天上涨概率</option>
-                        <option value="default">默认</option>
-                    </select>
-                    <button onclick="loadStockPicks()" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">刷新榜单</button>
-                    <!-- 新增：同步类型选择 -->
-                    <label for="syncType" class="text-sm text-gray-600">同步类型</label>
-                    <select id="syncType" class="px-2 py-1 border border-gray-300 rounded text-sm">
-                        <option value="incremental" selected>增量</option>
-                        <option value="full">全量</option>
-                    </select>
-                    <!-- 新增：数据源选择（多选） -->
-                    <div class="flex items-center gap-2 text-sm">
-                        <span class="text-sm text-gray-600">数据源</span>
-                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="eastmoney" class="rounded" checked>东财</label>
-                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="sina" class="rounded" checked>新浪</label>
-                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="tencent" class="rounded" checked>腾讯</label>
-                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="xueqiu" class="rounded" checked>雪球</label>
-                        <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="akshare" class="rounded" checked>Akshare</label>
+        <!-- 个股分析模块 -->
+        <div id="content-stock-analysis" class="content-section hidden">
+            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">个股分析</h2>
+                <div class="flex flex-col md:flex-row gap-4 items-center">
+                    <input 
+                        type="text" 
+                        id="stockInput" 
+                        placeholder="输入股票代码（如：600036.SH）" 
+                        class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                    <button 
+                        onclick="analyzeStock()" 
+                        class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors duration-200"
+                    >
+                        分析股票
+                    </button>
+                    <div id="loading" class="hidden">
+                        <div class="loading"></div>
                     </div>
-                    <button id="refresh-button" onclick="refreshDataAndReloadPicks()" class="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm">同步数据</button>
-                    <button id="optimized-refresh-button" onclick="refreshDataOptimizedAndReloadPicks()" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 text-sm">优化同步</button>
+                </div>
+                
+                <!-- 热门股票 -->
+                <div class="mt-4">
+                    <p class="text-sm text-gray-600 mb-2">热门股票：</p>
+                    <div id="popularStocks" class="flex flex-wrap gap-2">
+                        <!-- 动态加载 -->
+                    </div>
                 </div>
             </div>
-            <div id="stockPicksLoading" class="hidden mb-3"><div class="loading"></div></div>
-            <div id="stockPicks" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
         </div>
 
-        <!-- 同步状态与数据新鲜度 -->
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-            <!-- 同步状态卡片 -->
-            <div class="bg-white rounded-lg shadow-md p-6">
+        <!-- 智能选股模块 -->
+        <div id="content-stock-picks" class="content-section block">
+            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
                 <div class="flex justify-between items-center mb-3">
-                    <h2 class="text-lg font-semibold text-gray-800">同步状态</h2>
-                    <button onclick="loadSyncStatus()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">刷新</button>
+                    <h2 class="text-xl font-semibold text-gray-800">智能选股榜单</h2>
+                    <div class="flex items-center gap-2">
+                        <label for="sortMode" class="text-sm text-gray-600">排序</label>
+                        <select id="sortMode" class="px-2 py-1 border border-gray-300 rounded text-sm" onchange="onSortModeChange()">
+                            <option value="expected_return_desc">按预期收益</option>
+                            <option value="prob_up_desc">按30天上涨概率</option>
+                            <option value="default">默认</option>
+                        </select>
+                        <button onclick="loadStockPicks()" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm transition-colors duration-200">刷新榜单</button>
+                        <!-- 新增：同步类型选择 -->
+                        <label for="syncType" class="text-sm text-gray-600">同步类型</label>
+                        <select id="syncType" class="px-2 py-1 border border-gray-300 rounded text-sm">
+                            <option value="incremental" selected>增量</option>
+                            <option value="full">全量</option>
+                        </select>
+                        <!-- 新增：数据源选择（多选） -->
+                        <div class="flex items-center gap-2 text-sm">
+                            <span class="text-sm text-gray-600">数据源</span>
+                            <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="eastmoney" class="rounded" checked>东财</label>
+                            <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="sina" class="rounded" checked>新浪</label>
+                            <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="tencent" class="rounded" checked>腾讯</label>
+                            <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="xueqiu" class="rounded" checked>雪球</label>
+                            <label class="inline-flex items-center gap-1"><input type="checkbox" name="source" value="akshare" class="rounded" checked>Akshare</label>
+                        </div>
+                        <button id="refresh-button" onclick="refreshDataAndReloadPicks()" class="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm transition-colors duration-200">同步数据</button>
+                        <button id="optimized-refresh-button" onclick="refreshDataOptimizedAndReloadPicks()" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 text-sm transition-colors duration-200">优化同步</button>
+                    </div>
                 </div>
-                <div id="syncStatusContainer" class="text-sm text-gray-700">
-                    <p class="text-gray-500">加载中...</p>
-                </div>
+                <div id="stockPicksLoading" class="hidden mb-3"><div class="loading"></div></div>
+                <div id="stockPicks" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
             </div>
+        </div>
 
-            <!-- 数据新鲜度卡片 -->
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <div class="flex justify-between items-center mb-3">
-                    <h2 class="text-lg font-semibold text-gray-800">数据新鲜度</h2>
-                    <button onclick="loadDataFreshness()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">刷新</button>
+        <!-- 系统状态模块 -->
+        <div id="content-system-status" class="content-section hidden">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                <!-- 同步状态卡片 -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="flex justify-between items-center mb-3">
+                        <h2 class="text-lg font-semibold text-gray-800">同步状态</h2>
+                        <button onclick="loadSyncStatus()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm transition-colors duration-200">刷新</button>
+                    </div>
+                    <div id="syncStatusContainer" class="text-sm text-gray-700">
+                        <p class="text-gray-500">加载中...</p>
+                    </div>
                 </div>
-                <div id="dataFreshnessContainer" class="text-sm text-gray-700">
-                    <p class="text-gray-500">加载中...</p>
+
+                <!-- 数据新鲜度卡片 -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="flex justify-between items-center mb-3">
+                        <h2 class="text-lg font-semibold text-gray-800">数据新鲜度</h2>
+                        <button onclick="loadDataFreshness()" class="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm transition-colors duration-200">刷新</button>
+                    </div>
+                    <div id="dataFreshnessContainer" class="text-sm text-gray-700">
+                        <p class="text-gray-500">加载中...</p>
+                    </div>
                 </div>
             </div>
         </div>
 
         <!-- 结果显示区域 -->
+        <div id="loading" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+            <div class="flex items-center gap-2">
+                <div class="loading"></div>
+                <span class="text-blue-800">正在分析股票...</span>
+            </div>
+        </div>
+
+        <div id="error" class="hidden bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+            <div class="text-red-800" id="errorMessage"></div>
+        </div>
+
         <div id="result" class="hidden bg-white rounded-lg shadow-md p-6">
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <!-- 基本信息 -->
@@ -172,17 +232,14 @@
             </div>
         </div>
 
-        <!-- 错误信息 -->
-        <div id="error" class="hidden bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
-            <div class="text-red-800" id="errorMessage"></div>
-        </div>
+
     </div>
 
     <script>
         // 加载热门股票
         async function loadPopularStocks() {
             try {
-                const response = await fetch('/api/popular-stocks');
+                const response = await fetch('http://localhost:8003/api/popular-stocks');
                 const data = await response.json();
                 
                 const container = document.getElementById('popularStocks');
@@ -203,133 +260,6 @@
             }
         }
 
-        // 分析股票
-        async function analyzeStock() {
-            let symbol = document.getElementById('stockInput').value.trim();
-            if (!symbol) {
-                showError('请输入股票代码');
-                return;
-            }
-            
-            // 自动添加股票代码后缀
-            if (/^\d{6}$/.test(symbol)) {
-                // 6位数字：6 开头默认为上交所，其余默认为深交所
-                symbol = symbol.startsWith('6') ? symbol + '.SH' : symbol + '.SZ';
-            }
-
-            // 显示加载中
-            document.getElementById('loading').classList.remove('hidden');
-            document.getElementById('result').classList.add('hidden');
-            document.getElementById('error').classList.add('hidden');
-
-            try {
-                const response = await fetch('/api/analyze', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ symbol: symbol })
-                });
-
-                const data = await response.json();
-
-                if (!response.ok) {
-                    throw new Error(data.detail || '分析失败');
-                }
-
-                if (!data.data.success) {
-                    throw new Error(data.data.error);
-                }
-
-                displayResults(data.data);
-                
-            } catch (error) {
-                showError(error.message);
-            } finally {
-                document.getElementById('loading').classList.add('hidden');
-            }
-        }
-
-        // 显示结果
-        function displayResults(data) {
-            // 基本信息
-            document.getElementById('basicInfo').innerHTML = `
-                <p><strong>股票名称：</strong>${data.stock_info.longName || data.stock_info.symbol}</p>
-                <p><strong>当前价格：</strong>${data.latest_price.toFixed(2)}</p>
-                <p><strong>行业：</strong>${data.stock_info.industry || 'N/A'}</p>
-                <p><strong>市值：</strong>${data.stock_info.marketCap ? (data.stock_info.marketCap / 1e8).toFixed(2) + '亿元' : 'N/A'}</p>
-            `;
-
-            // 技术指标
-            const techData = data.technical_data;
-            document.getElementById('technicalInfo').innerHTML = `
-                <p><strong>5日均线：</strong>${techData.MA5[Object.keys(techData.MA5)[0]].toFixed(2)}</p>
-                <p><strong>20日均线：</strong>${techData.MA20[Object.keys(techData.MA20)[0]].toFixed(2)}</p>
-                <p><strong>RSI：</strong>${techData.RSI[Object.keys(techData.RSI)[0]].toFixed(2)}</p>
-                <p><strong>MACD：</strong>${techData.MACD[Object.keys(techData.MACD)[0]].toFixed(4)}</p>
-            `;
-
-            // AI分析 - 使用marked.js解析markdown格式
-            const aiAnalysisElement = document.getElementById('aiAnalysis');
-            // 使用marked解析markdown为HTML
-            try {
-                // 确保marked已正确加载
-                if (typeof marked === 'function') {
-                    aiAnalysisElement.innerHTML = marked(data.ai_analysis);
-                } else if (marked && typeof marked.parse === 'function') {
-                    aiAnalysisElement.innerHTML = marked.parse(data.ai_analysis);
-                } else {
-                    // 如果marked不可用，回退到简单的换行处理
-                    aiAnalysisElement.innerHTML = data.ai_analysis.replace(/\n/g, '<br>');
-                }
-            } catch (error) {
-                console.error('Markdown解析错误:', error);
-                // 出错时回退到简单的换行处理
-                aiAnalysisElement.innerHTML = data.ai_analysis.replace(/\n/g, '<br>');
-            }
-            // 移除之前的CSS类，使用Tailwind Typography插件的prose类
-            aiAnalysisElement.classList.remove('whitespace-pre-line', 'leading-relaxed');
-
-            // 交易信号
-            const signalsHtml = data.signals.length > 0 ? 
-                data.signals.map(signal => `
-                    <div class="p-2 mb-2 rounded ${signal.type === 'BUY' ? 'bg-green-100' : (signal.type === 'SELL' ? 'bg-red-100' : 'bg-yellow-100')}">
-                        <strong>${signal.date}</strong> - 
-                        <span class="${signal.type === 'BUY' ? 'text-green-800' : (signal.type === 'SELL' ? 'text-red-800' : 'text-yellow-800')}">
-                            ${signal.type} @ ${signal.price.toFixed(2)}
-                        </span>
-                        <br><small>${signal.reason}</small>
-                    </div>
-                `).join('') :
-                '<p>近期无交易信号</p>';
-            
-            document.getElementById('signals').innerHTML = signalsHtml;
-
-            // 先显示结果容器，再渲染图表，避免在隐藏容器中初始化 ECharts 导致尺寸为 0
-            document.getElementById('result').classList.remove('hidden');
-
-            // 显示K线图（在容器可见后渲染）
-            if (data.chart_data && data.chart_data.kline) {
-                renderStockChart(data.chart_data);
-            }
-
-            // 显示回测结果
-            if (data.backtest) {
-                displayBacktestResults(data.backtest);
-            }
-
-            // 显示风险报告
-            if (data.risk_report) {
-                displayRiskReport(data.risk_report);
-            }
-        }
-
-        // 显示错误
-        function showError(message) {
-            document.getElementById('errorMessage').textContent = message;
-            document.getElementById('error').classList.remove('hidden');
-        }
-
         // 渲染K线图
         // ECharts 实例
         let echartsInstance = null;
@@ -346,12 +276,12 @@
             echartsInstance = echarts.init(container);
 
             // 准备 K 线数据：使用 category x 轴（显式的日期数组）和 values 数组
-            const dates = (chartData.kline || []).map(item => item.date);
+            const dates = (chartData.kline || []).map(item => item[0]);
             // ECharts K 线值顺序为 [open, close, low, high]
-            const kValues = (chartData.kline || []).map(item => [item.open, item.close, item.low, item.high]);
+            const kValues = (chartData.kline || []).map(item => [item[1], item[2], item[3], item[4]]);
 
             // 收盘价线：使用与 dates 索引对齐的纯数值数组（便于 dataZoom 基于索引工作）
-            const closeLineData = (chartData.kline || []).map(item => item.close);
+            const closeLineData = (chartData.kline || []).map(item => item[2]);
 
             // 组合净值：先构建日期->净值映射，再按 dates 顺序生成对齐数组（缺失用 null 填充）
             const portfolioMap = {};
@@ -459,40 +389,156 @@
         }
         
         // 显示回测结果
-        function displayBacktestResults(backtest) {
-            let html = '<p>暂无回测数据</p>';
-            if (backtest && backtest.performance_metrics) {
-                const metrics = backtest.performance_metrics;
-                html = `
-                    <p><strong>总收益率：</strong>${(metrics.total_return * 100).toFixed(2)}%</p>
-                    <p><strong>年化收益率：</strong>${(metrics.annualized_return * 100).toFixed(2)}%</p>
-                    <p><strong>最大回撤：</strong>${(metrics.max_drawdown * 100).toFixed(2)}%</p>
-                    <p><strong>夏普比率：</strong>${metrics.sharpe_ratio.toFixed(2)}</p>
-                    <p><strong>胜率：</strong>${(metrics.win_rate * 100).toFixed(2)}%</p>
-                    <p><strong>总交易次数：</strong>${metrics.total_trades}</p>
-                    <p><strong>盈亏因子：</strong>${metrics.profit_factor.toFixed(2)}</p>
-                `;
+        function displayBacktestResults(backtestData) {
+            const backtestDiv = document.getElementById('backtestResults');
+            
+            if (!backtestDiv) {
+                console.warn('回测结果容器未找到');
+                return;
             }
-            document.getElementById('backtestResults').innerHTML = html;
+            
+            if (!backtestData) {
+                backtestDiv.innerHTML = '<p class="text-gray-500">暂无回测数据</p>';
+                return;
+            }
+            
+            const totalReturn = backtestData.total_return ? (backtestData.total_return * 100).toFixed(2) : '0.00';
+            const annualizedReturn = backtestData.annualized_return ? (backtestData.annualized_return * 100).toFixed(2) : '0.00';
+            const maxDrawdown = backtestData.max_drawdown ? (backtestData.max_drawdown * 100).toFixed(2) : '0.00';
+            const sharpeRatio = backtestData.sharpe_ratio ? backtestData.sharpe_ratio.toFixed(2) : '0.00';
+            const winRate = backtestData.win_rate ? (backtestData.win_rate * 100).toFixed(2) : '0.00';
+            
+            const returnColor = totalReturn >= 0 ? 'text-red-500' : 'text-green-500';
+            
+            backtestDiv.innerHTML = `
+                <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                    <div class="bg-gray-50 p-3 rounded text-center">
+                        <div class="text-sm text-gray-600">总收益率</div>
+                        <div class="text-lg font-bold ${returnColor}">${totalReturn}%</div>
+                    </div>
+                    <div class="bg-gray-50 p-3 rounded text-center">
+                        <div class="text-sm text-gray-600">年化收益率</div>
+                        <div class="text-lg font-bold">${annualizedReturn}%</div>
+                    </div>
+                    <div class="bg-gray-50 p-3 rounded text-center">
+                        <div class="text-sm text-gray-600">最大回撤</div>
+                        <div class="text-lg font-bold text-orange-500">${maxDrawdown}%</div>
+                    </div>
+                    <div class="bg-gray-50 p-3 rounded text-center">
+                        <div class="text-sm text-gray-600">夏普比率</div>
+                        <div class="text-lg font-bold">${sharpeRatio}</div>
+                    </div>
+                    <div class="bg-gray-50 p-3 rounded text-center">
+                        <div class="text-sm text-gray-600">胜率</div>
+                        <div class="text-lg font-bold">${winRate}%</div>
+                    </div>
+                </div>
+                
+                ${backtestData.trades && backtestData.trades.length > 0 ? `
+                    <div class="mt-4">
+                        <h4 class="text-lg font-semibold mb-2">最近交易记录</h4>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full bg-white border border-gray-200">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">日期</th>
+                                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">价格</th>
+                                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">数量</th>
+                                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">收益</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-200">
+                                    ${backtestData.trades.slice(-5).map(trade => {
+                                        const profitColor = trade.profit >= 0 ? 'text-red-500' : 'text-green-500';
+                                        return `
+                                            <tr>
+                                                <td class="px-4 py-2 text-sm">${trade.date || '-'}</td>
+                                                <td class="px-4 py-2 text-sm">${trade.action || '-'}</td>
+                                                <td class="px-4 py-2 text-sm">¥${trade.price ? trade.price.toFixed(2) : '-'}</td>
+                                                <td class="px-4 py-2 text-sm">${trade.quantity || '-'}</td>
+                                                <td class="px-4 py-2 text-sm ${profitColor}">¥${trade.profit ? trade.profit.toFixed(2) : '-'}</td>
+                                            </tr>
+                                        `;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                ` : ''}
+            `;
         }
         
         // 显示风险报告
         function displayRiskReport(riskReport) {
+            const riskDiv = document.getElementById('riskReport');
+            
+            if (!riskDiv) {
+                console.warn('风险报告容器未找到');
+                return;
+            }
+            
+            if (!riskReport) {
+                riskDiv.innerHTML = '<p class="text-gray-500">暂无风险报告</p>';
+                return;
+            }
+            
             let html = '';
             if (typeof riskReport === 'string') {
                 html = `<p>${riskReport}</p>`;
             } else if (riskReport.risk_level) {
+                const volatility = riskReport.volatility ? (riskReport.volatility * 100).toFixed(2) : '0.00';
+                const beta = riskReport.beta ? riskReport.beta.toFixed(2) : '0.00';
+                const var95 = riskReport.var_95 ? (riskReport.var_95 * 100).toFixed(2) : '0.00';
+                const maxLoss = riskReport.max_single_loss ? (riskReport.max_single_loss * 100).toFixed(2) : '0.00';
+                
                 html = `
-                    <p><strong>风险等级：</strong><span class="font-bold ${getRiskColor(riskReport.risk_level)}">${riskReport.risk_level}</span></p>
-                    <p><strong>风险评分：</strong>${riskReport.risk_score.toFixed(1)} / 10</p>
-                    <p><strong>建议仓位：</strong>${(riskReport.position_size * 100).toFixed(1)}%</p>
-                    <p><strong>止损位：</strong>${riskReport.stop_loss.toFixed(2)}</p>
-                    <p><strong>止盈位：</strong>${riskReport.take_profit.toFixed(2)}</p>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                        <div class="bg-gray-50 p-3 rounded text-center">
+                            <div class="text-sm text-gray-600">波动率</div>
+                            <div class="text-lg font-bold text-orange-500">${volatility}%</div>
+                        </div>
+                        <div class="bg-gray-50 p-3 rounded text-center">
+                            <div class="text-sm text-gray-600">Beta系数</div>
+                            <div class="text-lg font-bold">${beta}</div>
+                        </div>
+                        <div class="bg-gray-50 p-3 rounded text-center">
+                            <div class="text-sm text-gray-600">VaR (95%)</div>
+                            <div class="text-lg font-bold text-red-500">${var95}%</div>
+                        </div>
+                        <div class="bg-gray-50 p-3 rounded text-center">
+                            <div class="text-sm text-gray-600">最大单损</div>
+                            <div class="text-lg font-bold text-red-600">${maxLoss}%</div>
+                        </div>
+                    </div>
+                    
+                    <div class="p-3 bg-blue-50 rounded mb-4">
+                        <div class="flex items-center mb-2">
+                            <span class="text-blue-700 font-semibold">风险等级：</span>
+                            <span class="ml-2 px-2 py-1 rounded text-sm ${getRiskColor(riskReport.risk_level)}">${riskReport.risk_level}</span>
+                        </div>
+                        <p><strong>风险评分：</strong>${riskReport.risk_score.toFixed(1)} / 10</p>
+                        <p><strong>建议仓位：</strong>${(riskReport.position_size * 100).toFixed(1)}%</p>
+                        <p><strong>止损位：</strong>${riskReport.stop_loss.toFixed(2)}</p>
+                        <p><strong>止盈位：</strong>${riskReport.take_profit.toFixed(2)}</p>
+                        ${riskReport.risk_description ? `<p class="text-sm text-blue-600 mt-2">${riskReport.risk_description}</p>` : ''}
+                    </div>
+                    
+                    ${riskReport.recommendations && riskReport.recommendations.length > 0 ? `
+                        <div class="mt-4">
+                            <h4 class="text-lg font-semibold mb-2">风险建议</h4>
+                            <ul class="list-disc list-inside space-y-1">
+                                ${riskReport.recommendations.map(rec => `
+                                    <li class="text-sm text-gray-700">${rec}</li>
+                                `).join('')}
+                            </ul>
+                        </div>
+                    ` : ''}
                 `;
             } else {
-                html = '<p>暂无风险数据</p>';
+                html = '<p class="text-gray-500">暂无风险数据</p>';
             }
-            document.getElementById('riskReport').innerHTML = html;
+            riskDiv.innerHTML = html;
         }
 
         function getRiskColor(level) {
@@ -522,9 +568,9 @@
             try {
                 console.log('开始加载智能选股榜单...');
                 document.getElementById('stockPicksLoading').classList.remove('hidden');
-                const resp = await fetch('/api/stock-picks');
-                console.log('API响应状态:', resp.status);
-                const data = await resp.json();
+                const response = await fetch('http://localhost:8003/api/stock-picks');
+                console.log('API响应状态:', response.status);
+                const data = await response.json();
                 console.log('API响应数据:', data);
                 const picks = (data && data.data && data.data.picks) ? data.data.picks : [];
                 const msg = (data && data.data && data.data.message) ? data.data.message : '';
@@ -598,7 +644,7 @@
                             </div>
                             <!-- 分析按钮移到股票名字旁边 -->
                             <button class="ml-3 w-7 h-7 bg-blue-500 hover:bg-blue-600 text-white rounded-full flex items-center justify-center text-sm transition-colors" 
-                                    onclick="event.stopPropagation(); document.getElementById('stockInput').value='${p.symbol}'; analyzeStock();" 
+                                    onclick="event.stopPropagation(); analyzeStockFromCard('${p.symbol}');" 
                                     title="分析股票">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
@@ -644,7 +690,7 @@
             };
             
             // Make API call to refresh data using optimized endpoint
-            fetch('/api/sync_data_optimized', {
+            fetch('http://localhost:8003/api/sync_data_optimized', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -713,7 +759,7 @@
             };
             
             // Make API call to refresh data
-            fetch('/api/sync_data', {
+            fetch('http://localhost:8003/api/sync_data', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -753,7 +799,7 @@
             if (!container) return;
             container.innerHTML = '<div class="flex items-center gap-2 text-gray-500"><div class="loading"></div><span>加载中...</span></div>';
             try {
-                const response = await fetch('/api/sync_status');
+                const response = await fetch('http://localhost:8003/api/sync_status');
                 const data = await response.json();
                 if (!data.success) {
                     container.innerHTML = `<p class="text-red-600">获取失败: ${data.error || '未知错误'}</p>`;
@@ -780,7 +826,7 @@
             if (!container) return;
             container.innerHTML = '<div class="flex items-center gap-2 text-gray-500"><div class="loading"></div><span>加载中...</span></div>';
             try {
-                const url = markets ? `/api/data_freshness?markets=${encodeURIComponent(markets.join(','))}` : '/api/data_freshness';
+                const url = markets ? `http://localhost:8003/api/data_freshness?markets=${encodeURIComponent(markets.join(','))}` : 'http://localhost:8003/api/data_freshness';
                 const response = await fetch(url);
                 const data = await response.json();
                 if (!data.success) {
@@ -813,10 +859,238 @@
             }
         }
 
+        // 标签页切换功能
+        function switchTab(tabName) {
+            // 隐藏所有内容区域
+            document.getElementById('content-stock-picks').classList.add('hidden');
+            document.getElementById('content-stock-analysis').classList.add('hidden');
+            document.getElementById('content-system-status').classList.add('hidden');
+            
+            // 重置所有标签按钮样式
+            document.getElementById('tab-stock-picks').className = 'px-6 py-4 text-gray-600 hover:text-blue-600 font-medium';
+            document.getElementById('tab-stock-analysis').className = 'px-6 py-4 text-gray-600 hover:text-blue-600 font-medium';
+            document.getElementById('tab-system-status').className = 'px-6 py-4 text-gray-600 hover:text-blue-600 font-medium';
+            
+            // 显示对应内容区域并激活标签
+            if (tabName === 'stock-picks') {
+                document.getElementById('content-stock-picks').classList.remove('hidden');
+                document.getElementById('tab-stock-picks').className = 'px-6 py-4 text-blue-600 border-b-2 border-blue-600 font-medium';
+            } else if (tabName === 'stock-analysis') {
+                document.getElementById('content-stock-analysis').classList.remove('hidden');
+                document.getElementById('tab-stock-analysis').className = 'px-6 py-4 text-blue-600 border-b-2 border-blue-600 font-medium';
+                loadPopularStocks(); // 加载热门股票
+            } else if (tabName === 'system-status') {
+                document.getElementById('content-system-status').classList.remove('hidden');
+                document.getElementById('tab-system-status').className = 'px-6 py-4 text-blue-600 border-b-2 border-blue-600 font-medium';
+                loadSyncStatus(); // 刷新同步状态
+                loadDataFreshness(); // 刷新数据新鲜度
+            }
+        }
+
+        // 在新标签页中分析股票
+        function analyzeStockInNewTab() {
+            const stockInput = document.getElementById('stockInput');
+            const symbol = stockInput.value.trim();
+            
+            if (!symbol) {
+                alert('请输入股票代码');
+                return;
+            }
+            
+            // 构建分析页面URL
+            const analysisUrl = `/analysis?symbol=${encodeURIComponent(symbol)}`;
+            
+            // 在新标签页中打开
+            window.open(analysisUrl, '_blank');
+        }
+
+        // 智能选股卡片分析按钮在新标签页打开
+        function analyzeStockCardInNewTab(symbol) {
+            const analysisUrl = `/analysis?symbol=${encodeURIComponent(symbol)}`;
+            window.open(analysisUrl, '_blank');
+        }
+
+        // 从股票卡片分析股票（在新标签页打开分析结果）
+        function analyzeStockFromCard(symbol) {
+            window.open(`/static/analysis.html?symbol=${encodeURIComponent(symbol)}`, '_blank');
+        }
+
+        // 分析股票（在当前页面显示结果）
+        async function analyzeStock() {
+            const stockInput = document.getElementById('stockInput');
+            let symbol = stockInput.value.trim();
+            
+            if (!symbol) {
+                alert('请输入股票代码');
+                return;
+            }
+            
+            // 自动添加股票代码后缀
+            if (/^\d{6}$/.test(symbol)) {
+                // 6位数字：6 开头默认为上交所，其余默认为深交所
+                symbol = symbol.startsWith('6') ? symbol + '.SH' : symbol + '.SZ';
+            }
+            
+            // 显示加载状态
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('error').classList.add('hidden');
+            document.getElementById('result').classList.add('hidden');
+            
+            try {
+                const response = await fetch('http://localhost:8003/api/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ symbol: symbol })
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || '分析失败');
+                }
+
+                if (!data.data.success) {
+                    throw new Error(data.data.error);
+                }
+
+                displayResults(data.data);
+                
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                document.getElementById('loading').classList.add('hidden');
+            }
+        }
+
+        // 显示分析结果
+        function displayResults(data) {
+            // 先显示结果容器，再渲染图表，避免在隐藏容器中初始化 ECharts 导致尺寸为 0
+            document.getElementById('result').classList.remove('hidden');
+            
+            // 基本信息
+            document.getElementById('basicInfo').innerHTML = `
+                <p><strong>股票名称：</strong>${data.stock_info.longName || data.stock_info.symbol}</p>
+                <p><strong>当前价格：</strong>${data.latest_price.toFixed(2)}</p>
+                <p><strong>行业：</strong>${data.stock_info.industry || 'N/A'}</p>
+                <p><strong>市值：</strong>${data.stock_info.marketCap ? (data.stock_info.marketCap / 1e8).toFixed(2) + '亿元' : 'N/A'}</p>
+            `;
+
+            // 技术指标
+            const techData = data.technical_data;
+            document.getElementById('technicalInfo').innerHTML = `
+                <p><strong>5日均线：</strong>${techData.MA5[Object.keys(techData.MA5)[0]].toFixed(2)}</p>
+                <p><strong>20日均线：</strong>${techData.MA20[Object.keys(techData.MA20)[0]].toFixed(2)}</p>
+                <p><strong>RSI：</strong>${techData.RSI[Object.keys(techData.RSI)[0]].toFixed(2)}</p>
+                <p><strong>MACD：</strong>${techData.MACD[Object.keys(techData.MACD)[0]].toFixed(4)}</p>
+            `;
+
+            // AI分析 - 使用marked.js解析markdown格式
+            const aiAnalysisElement = document.getElementById('aiAnalysis');
+            // 使用marked解析markdown为HTML
+            try {
+                // 确保marked已正确加载
+                if (typeof marked === 'function') {
+                    aiAnalysisElement.innerHTML = marked(data.ai_analysis);
+                } else if (marked && typeof marked.parse === 'function') {
+                    aiAnalysisElement.innerHTML = marked.parse(data.ai_analysis);
+                } else {
+                    // 如果marked不可用，回退到简单的换行处理
+                    aiAnalysisElement.innerHTML = data.ai_analysis.replace(/\n/g, '<br>');
+                }
+            } catch (error) {
+                console.error('Markdown解析错误:', error);
+                // 出错时回退到简单的换行处理
+                aiAnalysisElement.innerHTML = data.ai_analysis.replace(/\n/g, '<br>');
+            }
+            // 移除之前的CSS类，使用Tailwind Typography插件的prose类
+            aiAnalysisElement.classList.remove('whitespace-pre-line', 'leading-relaxed');
+
+            // 交易信号
+            const signalsHtml = data.signals.length > 0 ? 
+                data.signals.map(signal => `
+                    <div class="p-2 mb-2 rounded ${signal.type === 'BUY' ? 'bg-green-100' : (signal.type === 'SELL' ? 'bg-red-100' : 'bg-yellow-100')}">
+                        <strong>${signal.date}</strong> - 
+                        <span class="${signal.type === 'BUY' ? 'text-green-800' : (signal.type === 'SELL' ? 'text-red-800' : 'text-yellow-800')}">
+                            ${signal.type} @ ${signal.price.toFixed(2)}
+                        </span>
+                        <br><small>${signal.reason}</small>
+                    </div>
+                `).join('') :
+                '<p>近期无交易信号</p>';
+            
+            document.getElementById('signals').innerHTML = signalsHtml;
+
+            // 显示K线图（在容器可见后渲染）
+            if (data.chart_data && data.chart_data.kline) {
+                renderStockChart(data.chart_data);
+            }
+
+            // 显示回测结果
+            if (data.backtest) {
+                displayBacktestResults(data.backtest);
+            }
+
+            // 显示风险报告
+            if (data.risk_report) {
+                displayRiskReport(data.risk_report);
+            }
+        }
+
+        // 加载热门股票
+        async function loadPopularStocks() {
+            const container = document.getElementById('popularStocks');
+            if (!container) return;
+            
+            try {
+                const response = await fetch('http://localhost:8003/api/popular-stocks');
+                const data = await response.json();
+                
+                if (data.success && data.stocks) {
+                    const stockButtons = data.stocks.map(stock => 
+                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                                class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
+                            ${stock}
+                        </button>`
+                    ).join('');
+                    container.innerHTML = stockButtons;
+                } else {
+                    // 如果API不存在，显示默认热门股票
+                    const defaultStocks = ['000001.SZ', '000002.SZ', '600036.SH', '600519.SH', '000858.SZ'];
+                    const stockButtons = defaultStocks.map(stock => 
+                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                                class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
+                            ${stock}
+                        </button>`
+                    ).join('');
+                    container.innerHTML = stockButtons;
+                }
+            } catch (error) {
+                console.error('加载热门股票失败:', error);
+                // 显示默认热门股票
+                const defaultStocks = ['000001.SZ', '000002.SZ', '600036.SH', '600519.SH', '000858.SZ'];
+                const stockButtons = defaultStocks.map(stock => 
+                    `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                                class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
+                            ${stock}
+                        </button>`
+                ).join('');
+                container.innerHTML = stockButtons;
+            }
+        }
+
         // 页面加载时初始化
         loadStockPicks();
         loadSyncStatus();
         loadDataFreshness();
+
+        // 监听Enter键触发分析
+        document.getElementById('stockInput').addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                analyzeStock();
+            }
+        });
     </script>
 </body>
 </html>
