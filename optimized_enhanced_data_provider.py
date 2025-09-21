@@ -100,7 +100,7 @@ class DataSourceStats:
     def get_avg_response_time(self) -> float:
         """获取平均响应时间"""
         if not self.response_times:
-            return float('inf')
+            return 0.0  # 返回0.0而不是inf，避免JSON序列化问题
         return sum(self.response_times) / len(self.response_times)
     
     def get_priority_score(self) -> float:

@@ -405,7 +405,7 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
         return {"success": False, "error": str(e)}
 
 @app.get("/api/stock-picks")
-async def get_stock_picks(top_n: int = 10, limit_symbols: int | None = 500, force_refresh: bool = False, debug: int = 0):
+async def get_stock_picks(top_n: int = 60, limit_symbols: int | None = 500, force_refresh: bool = False, debug: int = 0):
     """
     获取智能选股推荐
     可选 limit_symbols 用于限制参与预测的股票数量，以便快速联调与验证。
@@ -794,9 +794,45 @@ async def sync_market_data_optimized(request: dict = None):
                 data = _optimized_provider.get_stock_historical_data(symbol, period)
                 
                 if data is not None and not data.empty:
-                    # 保存到数据库
+                    # 保存到数据库 - 使用正确的表名 prices_daily
                     with _db.get_conn() as conn:
-                        data.to_sql('stock_data', conn, if_exists='append', index=False)
+                        # 确保数据包含symbol列
+                        if 'symbol' not in data.columns:
+                            data['symbol'] = symbol
+                        # 标准化列名以匹配数据库schema
+                        data = data.rename(columns={
+                            '日期': 'date', 'Date': 'date', 'DATE': 'date',
+                            '开盘': 'open', 'Open': 'open', 'OPEN': 'open',
+                            '最高': 'high', 'High': 'high', 'HIGH': 'high',
+                            '最低': 'low', 'Low': 'low', 'LOW': 'low',
+                            '收盘': 'close', 'Close': 'close', 'CLOSE': 'close',
+                            '成交量': 'volume', 'Volume': 'volume', 'VOLUME': 'volume',
+                            '成交额': 'amount', 'Amount': 'amount', 'AMOUNT': 'amount'
+                        })
+                        # 只保留数据库中存在的列
+                        valid_columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'source']
+                        data = data[[col for col in data.columns if col in valid_columns]]
+                        
+                        # 确保date列是字符串格式，避免SQLite绑定错误
+                        if 'date' in data.columns:
+                            data['date'] = pd.to_datetime(data['date']).dt.strftime('%Y-%m-%d')
+                        
+                        # 对于增量同步，先删除已存在的数据，然后插入新数据
+                        if sync_type == 'incremental':
+                            # 获取这批数据的日期范围
+                            min_date = data['date'].min()
+                            max_date = data['date'].max()
+                            
+                            # 删除已存在的数据
+                            delete_sql = """
+                            DELETE FROM prices_daily 
+                            WHERE symbol = ? AND date >= ? AND date <= ?
+                            """
+                            conn.execute(delete_sql, (symbol, min_date, max_date))
+                            conn.commit()
+                        
+                        # 添加到prices_daily表
+                        data.to_sql('prices_daily', conn, if_exists='append', index=False)
                     success_count += 1
                     
                     if (i + 1) % 10 == 0:

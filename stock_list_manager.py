@@ -27,16 +27,38 @@ class StockListManager:
                 self.logger.warning("未获取到股票数据")
                 return {'success': False, 'message': '未获取到股票数据', 'count': 0}
             
-            # 转换为数据库格式
+            # 转换为数据库格式，并获取行业和市值信息
             stock_records = []
             for _, row in stocks_df.iterrows():
+                stock_symbol = row['symbol']
+                
+                # 获取行业和市值信息
+                try:
+                    # 转换股票代码格式以适应数据提供商的方法
+                    if stock_symbol.endswith('.SS') or stock_symbol.endswith('.SH'):
+                        ak_symbol = stock_symbol.replace('.SS', '').replace('.SH', '')
+                    elif stock_symbol.endswith('.SZ'):
+                        ak_symbol = stock_symbol.replace('.SZ', '')
+                    else:
+                        ak_symbol = stock_symbol
+                    
+                    stock_info = self.data_provider._get_stock_industry_and_market_cap(ak_symbol, stock_symbol)
+                    industry = stock_info.get('industry', 'N/A')
+                    market_cap = stock_info.get('marketCap', None)
+                except Exception as e:
+                    self.logger.warning(f"获取股票 {stock_symbol} 的行业和市值信息失败: {e}")
+                    industry = 'N/A'
+                    market_cap = None
+                
                 stock_records.append({
-                    'symbol': row['symbol'],
+                    'symbol': stock_symbol,
                     'name': row['name'],
                     'market': row['market'],
                     'board_type': row['board_type'],
                     'exchange': row['exchange'],
-                    'ah_pair': row.get('ah_pair', None)
+                    'ah_pair': row.get('ah_pair', None),
+                    'industry': industry,
+                    'market_cap': market_cap
                 })
             
             # 应用股票过滤器，过滤不需要的股票
@@ -47,7 +69,8 @@ class StockListManager:
                 db_manager=self.db_manager,
                 exclude_b_share=True,
                 exclude_star_market=True,
-                exclude_bse_stock=True
+                exclude_bse_stock=True,
+                include_no_trades_last_n_days=False  # 暂时禁用成交量检查，因为价格数据不完整
             )
             
             filtered_stocks = filter_result['filtered_stocks']
@@ -109,7 +132,8 @@ class StockListManager:
                         db_manager=self.db_manager,
                         exclude_b_share=True,
                         exclude_star_market=True,
-                        exclude_bse_stock=True
+                        exclude_bse_stock=True,
+                        include_no_trades_last_n_days=False  # 暂时禁用成交量检查
                     )
                     return filter_result['filtered_stocks']
                 
@@ -228,7 +252,8 @@ class StockListManager:
                         db_manager=self.db_manager,
                         exclude_b_share=True,
                         exclude_star_market=True,
-                        exclude_bse_stock=True
+                        exclude_bse_stock=True,
+                        include_no_trades_last_n_days=False  # 暂时禁用成交量检查
                     )
                     return [stock['symbol'] for stock in filter_result['filtered_stocks']]
                 

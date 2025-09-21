@@ -158,12 +158,13 @@ class DataSyncService:
                         df = pd.read_sql_query(query, conn, params=params)
                         stocks = df.to_dict('records')
                         
-                        # 应用股票过滤器
+                        # 应用股票过滤器 (禁用无成交过滤，因为同步的目标就是补充缺失的数据)
                         filter_result = self.stock_filter.filter_stock_list(
                             stocks,
                             include_st=True,
                             include_suspended=True,
                             db_manager=self.db_manager,
+                            include_no_trades_last_n_days=False,  # 禁用无成交过滤，允许同步无数据的股票
                             exclude_b_share=True,
                             exclude_star_market=True,
                             exclude_bse_stock=True
@@ -218,12 +219,13 @@ class DataSyncService:
                 df = pd.read_sql_query(query, conn, params=params)
                 stocks = df.to_dict('records')
                 
-                # 应用股票过滤器
+                # 应用股票过滤器 (禁用无成交过滤，因为同步的目标就是补充缺失的数据)
                 filter_result = self.stock_filter.filter_stock_list(
                     stocks,
                     include_st=True,
                     include_suspended=True,
                     db_manager=self.db_manager,
+                    include_no_trades_last_n_days=False,  # 禁用无成交过滤，允许同步无数据的股票
                     exclude_b_share=True,
                     exclude_star_market=True,
                     exclude_bse_stock=True

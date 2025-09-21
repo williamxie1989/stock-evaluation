@@ -121,3 +121,4 @@ fix_*.py
 import_*.py
 comprehensive_*.py
 detailed_*.py
+stock_data.db

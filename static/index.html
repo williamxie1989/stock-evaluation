@@ -572,7 +572,7 @@
             try {
                 console.log('开始加载智能选股榜单...');
                 document.getElementById('stockPicksLoading').classList.remove('hidden');
-                const response = await fetch('http://localhost:8003/api/stock-picks');
+                const response = await fetch('http://localhost:8003/api/stock-picks?top_n=60');
                 console.log('API响应状态:', response.status);
                 const data = await response.json();
                 console.log('API响应数据:', data);

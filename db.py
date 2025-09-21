@@ -153,6 +153,11 @@ class DatabaseManager:
             if 'amount' not in pd_columns:
                 cur.execute("ALTER TABLE prices_daily ADD COLUMN amount REAL")
                 print("已添加amount字段到prices_daily表")
+            
+            # 新增：prices_daily表添加source字段
+            if 'source' not in pd_columns:
+                cur.execute("ALTER TABLE prices_daily ADD COLUMN source TEXT")
+                print("已添加source字段到prices_daily表")
                 
         except Exception as e:
             print(f"数据库迁移失败: {e}")
@@ -312,6 +317,11 @@ class DatabaseManager:
                 INSERT INTO prices_daily(symbol, date, open, high, low, close, volume, amount, source)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, date) DO UPDATE SET
+                    open = COALESCE(excluded.open, prices_daily.open),
+                    high = COALESCE(excluded.high, prices_daily.high),
+                    low = COALESCE(excluded.low, prices_daily.low),
+                    close = COALESCE(excluded.close, prices_daily.close),
+                    volume = COALESCE(excluded.volume, prices_daily.volume),
                     amount = COALESCE(excluded.amount, prices_daily.amount),
                     source = COALESCE(excluded.source, prices_daily.source)
                 """,

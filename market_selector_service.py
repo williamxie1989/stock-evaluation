@@ -121,7 +121,7 @@ class MarketSelectorService:
     def select_stocks_by_markets(self, 
                                selected_markets: List[str],
                                selection_criteria: Dict[str, Any] = None,
-                               top_n: int = 20) -> Dict[str, Any]:
+                               top_n: int = 60) -> Dict[str, Any]:
         """
         基于选定市场进行智能选股
         
@@ -261,12 +261,7 @@ class MarketSelectorService:
                     query = """
                     SELECT DISTINCT s.symbol, s.name, s.market, s.board_type, s.exchange
                     FROM stocks s 
-                    INNER JOIN prices_daily p ON (
-                        CASE 
-                            WHEN s.symbol LIKE '%.SH' THEN REPLACE(s.symbol, '.SH', '.SS')
-                            ELSE s.symbol
-                        END = p.symbol
-                    )
+                    INNER JOIN prices_daily p ON s.symbol = p.symbol
                     WHERE s.exchange = ? AND s.market = ?
                     AND s.symbol NOT LIKE '88%'
                     AND (s.board_type IS NULL OR s.board_type NOT IN ('指数','行业指数','板块','基金','ETF'))
