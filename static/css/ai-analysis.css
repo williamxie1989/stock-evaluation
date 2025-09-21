@@ -309,27 +309,30 @@ table td:nth-child(4) {
   counter-reset: section;
 }
 
+.markdown-body-ai ol {
+  counter-reset: section;
+}
+
 .markdown-body-ai ol li::before {
   counter-increment: section;
-  content: counters(section, ".") ". ";
+  content: counter(section) ". ";
   position: absolute;
   left: 0;
   color: #64748b;
 }
 
-
-/* 列表系统 */
+/* 列表系统 - 修复序号重叠问题 */
 .markdown-body-ai ul {
   margin: var(--spacing-unit) 0;
   padding-left: 2em;
 }
 
-.markdown-body-ai li {
+.markdown-body-ai ul li {
   margin: 0.5em 0;
   position: relative;
 }
 
-.markdown-body-ai li::before {
+.markdown-body-ai ul li::before {
   content: '•';
   color: #3b82f6;
   position: absolute;
