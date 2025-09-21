@@ -1098,8 +1098,8 @@ class StockAnalyzer:
             return {"kline": [], "indicators": {}, "signals": []}
         
         try:
-            # 获取最近60天的数据用于图表显示
-            chart_data = technical_data.tail(60).copy()
+            # 使用所有可用数据生成图表，不再限制为60天
+            chart_data = technical_data.copy()
             
             # 准备K线数据
             kline_data = []
