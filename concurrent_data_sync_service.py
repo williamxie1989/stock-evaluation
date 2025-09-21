@@ -153,7 +153,7 @@ class ConcurrentDataSyncService:
     def _update_stock_list(self, markets: List[str] = None) -> Dict[str, Any]:
         """更新股票列表（复用原有逻辑）"""
         try:
-            return self.stock_manager.update_stock_list(markets or ["SH", "SZ", "BJ"])
+            return self.stock_manager.update_stock_list(markets or ["SH", "SZ"])  # BJ股票已移除
         except Exception as e:
             self.logger.error(f"更新股票列表失败: {e}")
             return {'success': False, 'error': str(e)}
@@ -170,9 +170,9 @@ class ConcurrentDataSyncService:
                 SELECT symbol, name, market, list_date 
                 FROM stocks 
                 WHERE market IN ({})
-                """.format(','.join(['?' for _ in (markets or ['SH', 'SZ', 'BJ'])]))
+                """.format(','.join(['?' for _ in (markets or ['SH', 'SZ'])]))  # BJ股票已移除
                 
-                df = pd.read_sql_query(query, conn, params=markets or ['SH', 'SZ', 'BJ'])
+                df = pd.read_sql_query(query, conn, params=markets or ['SH', 'SZ'])
                 
                 if max_symbols > 0:
                     df = df.head(max_symbols)

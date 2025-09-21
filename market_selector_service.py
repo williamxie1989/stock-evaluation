@@ -12,7 +12,7 @@ class MarketType(Enum):
     SH_MAIN = "沪市主板"  # 上海主板
     SZ_MAIN = "深市主板"  # 深圳主板  
     CHINEXT = "创业板"    # 创业板
-    BEIJING = "北交所"   # 北京证券交易所
+    # BEIJING = "北交所"   # 北京证券交易所 - BJ股票已移除
     HK = "H股"          # 港股（暂不同步）
 
 class MarketSelectorService:
@@ -34,7 +34,7 @@ class MarketSelectorService:
             MarketType.SH_MAIN: {'exchange': '上海证券交易所', 'market': 'SH', 'board_types': ['主板']},
             MarketType.SZ_MAIN: {'exchange': '深圳证券交易所', 'market': 'SZ', 'board_types': ['主板']},
             MarketType.CHINEXT: {'exchange': '深圳证券交易所', 'market': 'SZ', 'board_types': ['创业板']},
-            MarketType.BEIJING: {'exchange': '北京证券交易所', 'market': 'BJ', 'board_types': ['北交所']},
+            # MarketType.BEIJING: {'exchange': '北京证券交易所', 'market': 'BJ', 'board_types': ['北交所']},  # BJ股票已移除
             MarketType.HK: {'exchange': '香港证券交易所', 'market': 'HK', 'board_types': ['主板', '创业板']}
         }
     
@@ -92,7 +92,7 @@ class MarketSelectorService:
                 "A股主板": ["沪市主板", "深市主板"],
                 "创业板": ["创业板"],
                 "科创板": ["科创板"],
-                "北交所": ["北交所"],
+                "北交所": ["北交所"],  # BJ股票已移除
                 "沪市主板": ["沪市主板"],
                 "深市主板": ["深市主板"]
             }
@@ -136,8 +136,8 @@ class MarketSelectorService:
         try:
             self.logger.info(f"开始基于市场 {selected_markets} 进行选股")
             
-            # 1. 验证选定的市场
-            valid_markets = [m.value for m in MarketType if m != MarketType.HK]  # 排除H股
+            # 验证选定的市场
+            valid_markets = [m.value for m in MarketType if m != MarketType.HK]  # 排除H股和已移除的BJ股
             invalid_markets = [m for m in selected_markets if m not in valid_markets]
             
             if invalid_markets:

@@ -309,7 +309,7 @@ class ConcurrentStockListProvider:
         并发获取多个市场的股票列表
         
         Args:
-            markets: 市场代码列表 (如 ['SH', 'SZ', 'BJ'])
+            markets: 市场代码列表 (如 ['SH', 'SZ'])
             
         Returns:
             Dict[market, DataFrame]: 各市场股票列表

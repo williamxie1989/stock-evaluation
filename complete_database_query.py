@@ -105,7 +105,7 @@ def analyze_stocks_table(conn):
             CASE 
                 WHEN symbol LIKE '%.SZ' THEN '深交所格式(.SZ)'
                 WHEN symbol LIKE '%.SS' THEN '上交所格式(.SS)'
-                WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)'
+                WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)(已移除)'
                 WHEN symbol LIKE '%%%%%' THEN '港股格式(5位数字)'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '6位数字格式'
                 ELSE '其他格式'
@@ -169,7 +169,7 @@ def analyze_prices_daily_table(conn):
             CASE 
                 WHEN symbol LIKE '%.SZ' THEN '深交所格式(.SZ)'
                 WHEN symbol LIKE '%.SS' THEN '上交所格式(.SS)'
-                WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)'
+                WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)(已移除)'
                 WHEN symbol LIKE '%%%%%' THEN '港股格式(5位数字)'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '6位数字格式'
                 ELSE '其他格式'

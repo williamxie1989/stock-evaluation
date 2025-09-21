@@ -179,7 +179,7 @@ class DatabaseManager:
             # 如果无法归一化，尝试保持原值但阻止88开头进入，并兼容 .SS
             if ns is None:
                 # 容错：若是标准格式则做快速校验
-                if isinstance(sym, str) and sym.upper().endswith((".SH", ".SZ", ".BJ", ".SS")):
+                if isinstance(sym, str) and sym.upper().endswith((".SH", ".SZ", ".SS")):  # BJ已移除，不再支持
                     num = sym.split(".")[0]
                     suf = sym.split(".")[-1].upper()
                     if suf == 'SS':
@@ -187,7 +187,7 @@ class DatabaseManager:
                     if num.startswith("88"):
                         skipped += 1
                         continue
-                    if suf == 'BJ' and not num.startswith(("43", "83", "87")):
+                    if suf == 'BJ':  # BJ股票已移除，跳过处理
                         skipped += 1
                         continue
                     if suf == 'SH' and not (num.startswith("60") or num.startswith("688") or num.startswith("689") or num.startswith("900")):
@@ -277,7 +277,7 @@ class DatabaseManager:
                 except Exception:
                     ns = None
             if ns is None:
-                if isinstance(sym, str) and sym.upper().endswith((".SH", ".SZ", ".BJ", ".SS")):
+                if isinstance(sym, str) and sym.upper().endswith((".SH", ".SZ", ".SS")):  # BJ已移除
                     num = sym.split(".")[0]
                     suf = sym.split(".")[-1].upper()
                     if suf == 'SS':
@@ -285,7 +285,7 @@ class DatabaseManager:
                     if num.startswith("88"):
                         skipped += 1
                         continue
-                    if suf == 'BJ' and not num.startswith(("43", "83", "87")):
+                    if suf == 'BJ':  # BJ股票已移除
                         skipped += 1
                         continue
                     if suf == 'SH' and not (num.startswith("60") or num.startswith("688") or num.startswith("689") or num.startswith("900")):

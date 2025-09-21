@@ -45,7 +45,7 @@ class DataSyncService:
         
         Args:
             sync_type: 同步类型 ("full" | "incremental" | 其他值按增量处理)
-            markets: 要同步的市场列表 ["SH", "SZ", "BJ"] (None表示所有A股市场)
+            markets: 要同步的市场列表 ["SH", "SZ"] (None表示所有A股市场，BJ股票已移除)
             max_symbols: 最大处理股票数量 (0表示不限制)
             batch_size: 批量处理大小
             delay_seconds: 批次间延时
@@ -111,7 +111,7 @@ class DataSyncService:
     def _update_stock_list(self, markets: List[str] = None) -> Dict[str, Any]:
         """更新股票列表（使用StockListManager）"""
         try:
-            # 默认更新所有市场（SH、SZ、BJ），根据参数过滤
+            # 默认更新所有市场（SH、SZ），BJ股票已移除
             result = self.stock_manager.update_all_stocks()
             if not result or not result.get('success'):
                 return result or {"success": False, "error": "未知错误"}
@@ -142,7 +142,7 @@ class DataSyncService:
                     market_filter_sql = f" AND s.market IN ({placeholders})"
                     params.extend(markets)
                 else:
-                    market_filter_sql = " AND s.market IN ('SH', 'SZ', 'BJ')"
+                    market_filter_sql = " AND s.market IN ('SH', 'SZ')"  # BJ股票已移除
                 
                 if top_n_by and top_n and top_n > 0:
                     by = top_n_by.lower().strip()
@@ -392,7 +392,7 @@ class DataSyncService:
                     query += f" AND s.market IN ({placeholders})"
                     params.extend(markets)
                 else:
-                    query += " AND s.market IN ('SH', 'SZ', 'BJ')"
+                    query += " AND s.market IN ('SH', 'SZ')"  # BJ股票已移除
                 
                 query += " GROUP BY s.market ORDER BY s.market"
                 
@@ -439,7 +439,7 @@ class DataSyncService:
                     market_filter.append(f"s.market IN ({placeholders})")
                     params.extend(markets)
                 else:
-                    market_filter.append("s.market IN ('SH','SZ','BJ')")
+                    market_filter.append("s.market IN ('SH','SZ')")  # BJ股票已移除
                 where_sql = " AND ".join(["1=1"] + market_filter)
                 
                 # 计算最近的交易日（以库内最大日期为准）

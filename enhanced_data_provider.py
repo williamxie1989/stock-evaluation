@@ -432,3 +432,11 @@ class EnhancedDataProvider:
                 df_local[c] = pd.to_numeric(df_local[c], errors="coerce")
 
         return df_local.sort_values("date").reset_index(drop=True)
+
+    def get_ah_stock_list(self):
+        """获取A+H股配对列表，返回包含['name', 'code_a', 'code_h']的DataFrame"""
+        return self.base_provider.get_ah_stock_list()
+
+    def get_ah_daily(self, symbol: str, market: str = "A", start_date: str = None, end_date: str = None):
+        """获取A/H股日频历史行情，参数包括symbol、market、start_date和end_date，返回标准化列['date','open','high','low','close','volume']的DataFrame"""
+        return self.base_provider.get_ah_daily(symbol, market, start_date, end_date)

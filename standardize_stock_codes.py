@@ -27,7 +27,7 @@ def analyze_code_formats():
             CASE 
                 WHEN symbol LIKE '%.SH' THEN 'SH后缀格式'
                 WHEN symbol LIKE '%.SZ' THEN 'SZ后缀格式'
-                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式'
+                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式（已移除）'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '纯数字格式'
                 WHEN symbol IS NULL OR symbol = '' THEN '空值'
                 ELSE '其他格式'
@@ -54,7 +54,7 @@ def analyze_code_formats():
             CASE 
                 WHEN symbol LIKE '%.SH' THEN 'SH后缀格式'
                 WHEN symbol LIKE '%.SZ' THEN 'SZ后缀格式'
-                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式'
+                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式（已移除）'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '纯数字格式'
                 WHEN symbol IS NULL OR symbol = '' THEN '空值'
                 ELSE '其他格式'
@@ -84,7 +84,7 @@ def normalize_symbol(raw: str) -> str:
     号段：
     - 沪市：60xxxx、688xxx、689xxx、900xxx（B股） -> .SH
     - 深市：000xxx、001xxx、002xxx、003xxx、300xxx、301xxx、200xxx（B股） -> .SZ
-    - 北交所：43xxxx、83xxxx、87xxxx -> .BJ
+    - 北交所：43xxxx、83xxxx、87xxxx -> .BJ（已移除，不再支持BJ股票，返回None）
     - 明确排除：以88开头的板块/指数（如880/881同花顺行业与概念）不作为个股，返回None
     返回标准化代码或None（无法识别）
     """
@@ -119,29 +119,36 @@ def normalize_symbol(raw: str) -> str:
             return f"{num}.SZ" if num.startswith(("000", "001", "002", "003", "300", "301", "200")) else None
         return None
 
-    # 形如 SH000001 / SZ000001 / BJ430001
+    # 形如 SH000001 / SZ000001 / BJ430001（BJ已移除，返回None）
     m = re.fullmatch(r"(SH|SZ|BJ)(\d{6})", s)
     if m:
+        if m.group(1) == 'BJ':
+            return None  # BJ股票已移除
         return _validate_pair(m.group(2), m.group(1))
 
-    # 形如 000001SH / 000001SZ / 430001BJ
+    # 形如 000001SH / 000001SZ / 430001BJ（BJ已移除，返回None）
     m = re.fullmatch(r"(\d{6})(SH|SZ|BJ)", s)
     if m:
+        if m.group(2) == 'BJ':
+            return None  # BJ股票已移除
         return _validate_pair(m.group(1), m.group(2))
 
-    # 形如 000001.SH / 000001.SZ / 430001.BJ
+    # 形如 000001.SH / 000001.SZ / 430001.BJ（BJ已移除，返回None）
     m = re.fullmatch(r"(\d{6})\.(SH|SZ|BJ)", s)
     if m:
+        if m.group(2) == 'BJ':
+            return None  # BJ股票已移除
         return _validate_pair(m.group(1), m.group(2))
 
-    # 纯6位数字：根据号段推断
+    # 纯6位数字：根据号段推断（BJ已移除）
     if re.fullmatch(r"\d{6}", s):
         d = s
         # 排除 88xxxx 板块/指数
         if d.startswith("88"):
             return None
+        # 北交所代码（43, 83, 87开头）已移除，返回None
         if d.startswith(("43", "83", "87")):
-            return f"{d}.BJ"
+            return None
         if d.startswith("60") or d.startswith("688") or d.startswith("689") or d.startswith("900"):
             return f"{d}.SH"
         if d.startswith(("000", "001", "002", "003", "300", "301", "200")):
@@ -284,14 +291,14 @@ def verify_standardization():
     
     print("\n=== 验证代码格式统一效果 ===")
     
-    # 检查统一后的格式分布
+    # 检查统一后的格式分布（BJ已移除）
     print("\n1. stocks表格式分布:")
     cursor.execute("""
         SELECT 
             CASE 
                 WHEN symbol LIKE '%.SH' THEN 'SH后缀格式'
                 WHEN symbol LIKE '%.SZ' THEN 'SZ后缀格式'
-                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式'
+                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式（已移除）'
                 WHEN symbol IS NULL THEN '空值'
                 ELSE '其他格式'
             END as format_type,
@@ -310,7 +317,7 @@ def verify_standardization():
             CASE 
                 WHEN symbol LIKE '%.SH' THEN 'SH后缀格式'
                 WHEN symbol LIKE '%.SZ' THEN 'SZ后缀格式'
-                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式'
+                WHEN symbol LIKE '%.BJ' THEN 'BJ后缀格式（已移除）'
                 WHEN symbol IS NULL THEN '空值'
                 ELSE '其他格式'
             END as format_type,

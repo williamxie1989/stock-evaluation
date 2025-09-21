@@ -20,6 +20,7 @@ from concurrent_data_sync_service import ConcurrentDataSyncService
 from concurrent_enhanced_data_provider import ConcurrentEnhancedDataProvider
 from optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
 from datetime import datetime, timedelta
+from typing import Optional, List, Dict
 import logging
 import time
 import asyncio
@@ -161,7 +162,7 @@ async def read_root():
     return FileResponse("static/index.html")
 
 @app.get("/analysis")
-async def read_analysis(symbol: str = None):
+async def read_analysis(symbol: Optional[str] = None):
     """分析页面路由"""
     return FileResponse("static/analysis.html")
 
@@ -290,9 +291,7 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                         continue
                     symbol = f"{code_str}.SZ"
                 elif market == 'BJ':
-                    if len(code_str) != 6:
-                        continue
-                    symbol = f"{code_str}.BJ"
+                    continue  # BJ股票已移除，跳过北交所
                 elif market == 'HK':
                     if not include_hk:
                         continue  # 跳过港股
@@ -345,12 +344,17 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                 start_date = None
                 if not full and latest_map.get(symbol):
                     try:
-                        start_date = (pd.to_datetime(latest_map[symbol]) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                    except Exception:
+                        latest_date = pd.to_datetime(latest_map[symbol])
+                        if not pd.isnull(latest_date):
+                            start_date = (latest_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                        else:
+                            start_date = None
+                    except Exception as e:
+                        logger.warning(f"解析最新日期失败: {e}")
                         start_date = None
                 # 对于港股，需要传递字符串格式的代码（如"02318"）
                 symbol_for_akshare = code_digits if market == 'A' else str(code_digits).zfill(5)
-                df_hist = _provider.get_ah_daily(symbol=symbol_for_akshare, market=market, start_date=start_date)
+                df_hist = _provider.get_ah_daily(symbol=symbol_for_akshare, market=market, start_date=start_date)  # type: pd.DataFrame
                 if df_hist is not None and not df_hist.empty:
                     df_hist = df_hist.copy()
                     df_hist['symbol'] = symbol
@@ -368,10 +372,10 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
         spot = _provider.get_ah_spot()
         if spot is not None and not spot.empty:
             # A 股侧
-            if set(['code_a', 'price_a']).issubset(spot.columns):
+            if 'code_a' in spot.columns and 'price_a' in spot.columns:
                 for _, r in spot.iterrows():
                     c, p = r.get('code_a'), r.get('price_a')
-                    if pd.notna(c) and pd.notna(p):
+                    if pd.notna(c) and pd.notna(p) and p is not None:
                         sym = _to_a_symbol_with_suffix(str(c))
                         if sym:
                             quotes_rows.append({
@@ -381,10 +385,10 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                                 'volume': r.get('volume_a') if 'volume_a' in spot.columns else None
                             })
             # H 股侧
-            if set(['code_h', 'price_h']).issubset(spot.columns):
+            if 'code_h' in spot.columns and 'price_h' in spot.columns:
                 for _, r in spot.iterrows():
                     c, p = r.get('code_h'), r.get('price_h')
-                    if pd.notna(c) and pd.notna(p):
+                    if pd.notna(c) and pd.notna(p) and p is not None:
                         sym = _to_h_symbol_with_suffix(str(c))
                         if sym:
                             quotes_rows.append({
@@ -490,7 +494,7 @@ async def get_stock_picks(top_n: int = 10, limit_symbols: int | None = 500, forc
                             mkt_caps_frames.append(df_caps)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
-                    if 'amount' not in df.columns or df['amount'].isna().all():
+                    if df[['amount']].isnull().values.any():
                         df['amount_fill'] = df['volume'].fillna(0) * df['close'].fillna(0)
                     else:
                         df['amount_fill'] = df['amount'].fillna(df['volume'].fillna(0) * df['close'].fillna(0))
@@ -663,8 +667,8 @@ async def get_candidate_stocks(market: str = None, board_type: str = None, limit
     """获取候选股票代码列表（用于选股分析）"""
     try:
         candidates = stock_list_manager.get_candidate_stocks(
-            market_filter=[market] if market else None,
-            board_filter=[board_type] if board_type else None,
+            market_filter=[market] if market else [],
+            board_filter=[board_type] if board_type else [],
             limit=limit
         )
         return {"candidates": candidates, "count": len(candidates)}
@@ -725,12 +729,12 @@ async def select_stocks_by_markets(request: dict):
         }
 
 @app.get("/api/market_statistics")
-async def get_market_statistics(selected_markets: str = None):
+async def get_market_statistics(selected_markets: Optional[List[str]] = None):
     """获取市场统计信息"""
     try:
-        markets_list = None
+        markets_list = []
         if selected_markets:
-            markets_list = [m.strip() for m in selected_markets.split(',')]
+            markets_list = [m.strip() for m in selected_markets.split(',') if m.strip()]
         
         result = market_selector_service.get_market_statistics(markets_list)
         return result

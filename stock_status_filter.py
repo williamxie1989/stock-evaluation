@@ -1,170 +1,147 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import re
 import logging
-from typing import List, Dict, Any, Set
+from typing import Dict, List, Any, Set
 from datetime import datetime, timedelta
 import pandas as pd
 
+
+# 已知指数代码列表
+KNOWN_INDICES = [
+    '000112.SZ',  # 380电信
+    '000974.SZ',  # 800金融
+    '000914.SZ',  # 300金融
+    '000913.SZ',  # 300银行
+    '000915.SZ',  # 300地产
+    '000916.SZ',  # 300消费
+    '000917.SZ',  # 300成长
+    '000918.SZ',  # 300价值
+    '000919.SZ',  # 300R成长
+    '000920.SZ',  # 300R价值
+    '000921.SZ',  # 300等权
+    '000922.SZ',  # 300分层
+]
+
+# 指数名称模式
+INDEX_PATTERNS = [
+    r'\d+电信',      # 匹配"380电信"这样的格式
+    r'\d+金融',      # 匹配"800金融"这样的格式
+    r'\d+银行',      # 匹配"300银行"这样的格式
+    r'\d+地产',      # 匹配"300地产"这样的格式
+    r'\d+消费',      # 匹配"300消费"这样的格式
+    r'\d+成长',      # 匹配"300成长"这样的格式
+    r'\d+价值',      # 匹配"300价值"这样的格式
+    r'\d+R成长',     # 匹配"300R成长"这样的格式
+    r'\d+R价值',     # 匹配"300R价值"这样的格式
+    r'\d+等权',      # 匹配"300等权"这样的格式
+    r'\d+分层',      # 匹配"300分层"这样的格式
+    r'^HSI$',        # 恒生指数
+    r'^恒生',         # 恒生相关
+    r'^上证',         # 上证相关
+    r'^中证',         # 中证相关
+    r'^沪深',         # 沪深相关
+    r'^创业板',       # 创业板相关
+    r'^科创板',       # 科创板相关
+    r'^科技',         # 科技相关
+]
+
+
+def is_likely_index(symbol: str = None, name: str = None) -> bool:
+    """
+    判断是否为指数标的
+    
+    Args:
+        symbol: 股票代码
+        name: 股票名称
+        
+    Returns:
+        bool: 是否为指数标的
+    """
+    if symbol and symbol in KNOWN_INDICES:
+        return True
+    
+    if name:
+        for pattern in INDEX_PATTERNS:
+            if re.search(pattern, name):
+                return True
+    
+    return False
+
+
 class StockStatusFilter:
-    """股票状态过滤器：识别和过滤退市、ST、停牌等不可交易股票"""
+    """股票状态过滤器"""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        
-        # 退市股票名称关键词
-        self.delisted_keywords = [
-            '退市', '退', 'ST退', '*ST退', 
-            '终止上市', '摘牌', '已退市'
-        ]
-        
-        # ST股票名称模式
-        self.st_patterns = [
-            r'^ST\s*',      # ST开头
-            r'^\*ST\s*',    # *ST开头
-            r'^S\*ST\s*',   # S*ST开头
-            r'^SST\s*',      # SST开头
-            r'^S\s*',        # S开头（部分停牌股票）
-        ]
-        
-        # 停牌相关关键词
-        self.suspended_keywords = [
-            '停牌', '暂停上市', '暂停交易', 
-            '长期停牌', '临时停牌'
-        ]
-        
-        # 其他不可交易状态
-        self.other_invalid_keywords = [
-            '清算', '破产', '重整', '注销',
-            '吊销', '终止', '解散'
-        ]
-        
-        # 新增：已知退市代码列表（用于修正历史并购/更名导致的名称未包含“退市”的情况）
-        # 注意：同时包含带/不带交易所后缀的写法，避免数据源不一致导致漏判
-        self.known_delisted_symbols: set[str] = {
-            '000022', '000022.SZ',  # 深赤湾A（已退市/更名并不再交易）
-        }
-    
-    def is_delisted_stock(self, name: str, symbol: str = None) -> bool:
-        """判断是否为退市股票"""
-        if not name and not symbol:
-            return False
-        
-        # 1) 先按已知退市代码列表拦截（最精确）
-        if symbol:
-            s = str(symbol).strip()
-            base = s.split('.')[0]
-            if s in self.known_delisted_symbols or base in self.known_delisted_symbols:
-                self.logger.debug(f"命中已知退市代码: {s}")
-                return True
-        
-        if not name:
-            return False
-            
-        name = str(name).strip()
-        
-        # 2) 名称关键词判定
-        for keyword in self.delisted_keywords:
-            if keyword in name:
-                return True
-        
-        # 3) 特殊代码段判定
-        if symbol:
-            symbol = str(symbol).strip()
-            # 一些退市股票可能有特殊的代码格式
-            if symbol.startswith('400') or symbol.startswith('420'):
-                return True
-        
-        return False
     
     def is_st_stock(self, name: str) -> bool:
         """判断是否为ST股票"""
         if not name:
             return False
-            
-        name = str(name).strip().upper()
-        
-        # 检查ST模式
-        for pattern in self.st_patterns:
-            if re.match(pattern, name, re.IGNORECASE):
-                return True
-        
-        return False
+        name = name.upper()
+        return 'ST' in name or '*ST' in name or 'S*ST' in name or 'SST' in name
     
     def is_suspended_stock(self, name: str) -> bool:
-        """判断是否为停牌股票（基于名称）"""
+        """判断是否为停牌股票"""
         if not name:
             return False
-            
-        name = str(name).strip()
+        return '停牌' in name
+    
+    def is_delisted_stock(self, name: str, symbol: str = None) -> bool:
+        """判断是否为退市股票"""
         
-        # 检查停牌关键词
-        for keyword in self.suspended_keywords:
-            if keyword in name:
-                return True
+        # 检查是否为指数标的
+        if is_likely_index(symbol, name):
+            return True
         
-        return False
+        if not name and not symbol:
+            return False
+        
+        # 检查退市标识
+        name = name.upper() if name else ""
+        return '退市' in name or '终止上市' in name or '摘牌' in name
     
     def is_invalid_stock(self, name: str, symbol: str = None) -> bool:
-        """判断是否为其他不可交易股票"""
-        if not name:
-            return False
-            
-        name = str(name).strip()
-        
-        # 检查其他无效状态关键词
-        for keyword in self.other_invalid_keywords:
-            if keyword in name:
-                return True
-        
-        return False
-
-    def _is_b_share_code(self, symbol: str) -> bool:
-        """判断是否为B股代码（900/200开头）"""
-        if not symbol:
-            return False
-        code = str(symbol).split('.')[0].strip()
-        return code.startswith('900') or code.startswith('200')
-
-    def _is_star_market_code(self, symbol: str) -> bool:
-        """判断是否为科创板A股代码（688/689开头）"""
-        if not symbol:
-            return False
-        code = str(symbol).split('.')[0].strip()
-        return code.startswith('688') or code.startswith('689')
-
-    def _is_bse_stock_code(self, symbol: str) -> bool:
-        """判断是否为北交所股票代码（8开头且以.BJ结尾，或43/83开头）"""
-        if not symbol:
-            return False
-        symbol_str = str(symbol).strip()
-        # 北交所股票通常格式为 830001.BJ 或 430001.BJ
-        if '.BJ' in symbol_str.upper():
+        """判断是否为无效股票"""
+        if not name and not symbol:
             return True
-        # 也可能是8开头的6位数字代码
-        code = symbol_str.split('.')[0].strip()
-        return (code.startswith('8') and len(code) == 6) or code.startswith('43') or code.startswith('83')
-
-    def _has_no_trades_in_last_days(self, symbol: str, db_manager: Any, days: int = 10) -> bool:
-        """判断过去days天内是否完全无成交（volume为0或无记录）"""
+        
+        # 检查特殊标识
+        name = name.upper() if name else ""
+        invalid_keywords = ['无效', '错误', '测试', 'DEMO', 'NULL', 'NONE']
+        return any(keyword in name for keyword in invalid_keywords)
+    
+    def _is_b_share_code(self, symbol: str) -> bool:
+        """判断是否为B股代码"""
+        if not symbol:
+            return False
+        return symbol.startswith('900') or symbol.startswith('200')
+    
+    def _is_star_market_code(self, symbol: str) -> bool:
+        """判断是否为科创板代码"""
+        if not symbol:
+            return False
+        return symbol.startswith('688') or symbol.startswith('689')
+    
+    def _is_bse_stock_code(self, symbol: str) -> bool:
+        """判断是否为北交所股票代码（已移除，不再支持BJ股票）"""
+        if not symbol:
+            return False
+        # BJ股票已移除，直接返回True表示需要过滤
+        return symbol.endswith('.BJ')
+    
+    def _has_no_trades_in_last_days(self, symbol: str, db_manager, days: int = 10) -> bool:
+        """检查过去N天是否无成交"""
         try:
-            if db_manager is None or not symbol:
-                return False  # 无法判断则不据此过滤
-            cutoff = (datetime.today() - timedelta(days=days)).date().isoformat()
             with db_manager.get_conn() as conn:
-                df = pd.read_sql_query(
-                    "SELECT date, volume FROM prices_daily WHERE symbol = ? AND date >= ? ORDER BY date DESC",
-                    conn,
-                    params=[symbol, cutoff]
-                )
-            if df.empty:
-                return True  # 过去days天完全无记录 => 视为无成交
-            # 将volume缺失视为0
-            vol_sum = pd.to_numeric(df['volume'], errors='coerce').fillna(0).sum()
-            return vol_sum <= 0
+                query = """
+                    SELECT SUM(COALESCE(volume, 0)) as total_volume
+                    FROM prices_daily
+                    WHERE symbol = ? AND date >= date('now', '-{} days')
+                """.format(days)
+                result = conn.execute(query, (symbol,)).fetchone()
+                return result is None or result[0] is None or result[0] <= 0
         except Exception as e:
-            self.logger.warning(f"检查近{days}天成交量失败 {symbol}: {e}")
+            self.logger.warning(f"检查股票{symbol}近{days}天成交量失败: {e}")
             return False
     
     def should_filter_stock(self, name: str, symbol: str = None, 
@@ -205,13 +182,17 @@ class StockStatusFilter:
         if exclude_star_market and symbol and self._is_star_market_code(symbol):
             return {'should_filter': True, 'reason': 'star_market'}
         
-        # 可选：排除北交所股票
-        if exclude_bse_stock and symbol and self._is_bse_stock_code(symbol):
-            return {'should_filter': True, 'reason': 'bse_stock'}
+        # 强制排除北交所股票（BJ股票已移除，不再支持）
+        if symbol and self._is_bse_stock_code(symbol):
+            return {'should_filter': True, 'reason': 'bse_stock_removed'}
         
         # 检查退市股票（始终过滤）
         if self.is_delisted_stock(name, symbol):
             return {'should_filter': True, 'reason': 'delisted'}
+        
+        # 检查指数标的
+        if is_likely_index(symbol, name):
+            return {'should_filter': True, 'reason': 'index'}
         
         # 检查ST股票
         if include_st and self.is_st_stock(name):
@@ -314,6 +295,12 @@ class StockStatusFilter:
                 exclude_bse_stock=exclude_bse_stock
             )
             
+            # 检查指数标的（独立的指数过滤）
+            if is_likely_index(symbol, name):
+                removed_stocks.append({**stock, 'removal_reason': 'index'})
+                removal_reasons['index'] = removal_reasons.get('index', 0) + 1
+                continue
+            
             if filter_result['should_filter']:
                 removed_stocks.append({**stock, 'removal_reason': filter_result['reason']})
                 removal_reasons[filter_result['reason']] = removal_reasons.get(filter_result['reason'], 0) + 1
@@ -400,8 +387,11 @@ if __name__ == "__main__":
         {'symbol': '688001.SH', 'name': '某科创板'},
         {'symbol': '689001.SH', 'name': '某科创板2'},
         {'symbol': '900001.SH', 'name': '某B股'},
-        {'symbol': '830001.BJ', 'name': '某北交所股票'},
-        {'symbol': '430001.BJ', 'name': '某北交所股票2'},
+        {'symbol': '830001.BJ', 'name': '某北交所股票(已移除)'},
+        {'symbol': '430001.BJ', 'name': '某北交所股票2(已移除)'}, # BJ股票已移除，测试用例保留
+        {'symbol': '000112.SZ', 'name': '380电信'},
+        {'symbol': '000974.SZ', 'name': '800金融'},
+        {'symbol': '000914.SZ', 'name': '300金融'},
     ]
     
     result = filter_obj.filter_stock_list(test_stocks, exclude_star_market=True, exclude_bse_stock=True)

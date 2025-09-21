@@ -895,9 +895,8 @@ class StockAnalyzer:
                 code = stock_symbol.replace('.SZ', '')
                 file_path = f"data/sz/lday/sz{code}.day"
             elif stock_symbol.endswith('.BJ'):
-                # 北京证券交易所
-                code = stock_symbol.replace('.BJ', '')
-                file_path = f"data/bj/lday/bj{code}.day"
+                # 北京证券交易所（BJ股票已移除，返回None）
+                return None
             else:
                 # 默认尝试上海
                 file_path = f"data/sh/lday/sh{stock_symbol}.day"

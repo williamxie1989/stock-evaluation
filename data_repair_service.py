@@ -26,11 +26,11 @@ class DataRepairService:
             
             # 查询各市场板块的股票数量
             stock_query = """
-                SELECT market, board_type, COUNT(*) as total_stocks
+                SELECT s.market, s.board_type, COUNT(DISTINCT s.symbol) as total_stocks
                 FROM stocks 
-                WHERE market IN ('SH', 'SZ', 'BJ')
+                WHERE market IN ('SH', 'SZ')  # BJ股票已移除
                 GROUP BY market, board_type
-                ORDER BY market, board_type
+                ORDER BY s.market, s.board_type
             """
             cursor.execute(stock_query)
             stock_counts = cursor.fetchall()
@@ -40,7 +40,7 @@ class DataRepairService:
                 SELECT s.market, s.board_type, COUNT(DISTINCT s.symbol) as stocks_with_data
                 FROM stocks s
                 JOIN prices_daily p ON s.symbol = p.symbol
-                WHERE s.market IN ('SH', 'SZ', 'BJ')
+                WHERE s.market IN ('SH', 'SZ')  # BJ股票已移除
                 GROUP BY s.market, s.board_type
                 ORDER BY s.market, s.board_type
             """
@@ -220,7 +220,7 @@ class DataRepairService:
         markets_to_repair = [
             ('SH', '主板'),
             ('SH', '科创板'),
-            ('BJ', '北交所'),
+            # ('BJ', '北交所'),  # BJ股票已移除
             ('SZ', '创业板'),
             ('SZ', '中小板')
         ]
