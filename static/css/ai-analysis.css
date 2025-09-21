@@ -15,9 +15,12 @@
 
 .markdown-body-ai {
   /* 容器系统 */
-  width: 100%;
+  width: var(--container-width);
+  margin: 0 auto;
   padding: 2rem 1rem;
-  @apply bg-white rounded-xl shadow-lg;
+  background: #ffffff;
+  border-radius: 1rem;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
 
   /* 排版系统变量 */
   --base-font: 18px;
@@ -39,12 +42,115 @@
   line-height: var(--line-height);
 }
 
+/* 技术指标列表样式 */
+.technical-indicator-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    background-color: #fafafa;
+    border-radius: 6px;
+    border: 1px solid #f0f0f0;
+    transition: all 0.3s ease;
+    min-height: 44px;
+}
+
+.technical-indicator-item:hover {
+    background-color: #f5f5f5;
+    border-color: #e0e0e0;
+}
+
+.technical-indicator-name {
+    font-weight: 500;
+    color: #262626;
+    font-size: 0.875rem;
+    flex: 0 0 30%;
+    text-align: left;
+}
+
+.technical-indicator-value {
+    font-weight: 600;
+    color: #1890ff;
+    font-size: 0.875rem;
+    font-family: 'Courier New', monospace;
+    flex: 0 0 35%;
+    text-align: center;
+}
+
+.technical-indicator-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    white-space: nowrap;
+    flex: 0 0 30%;
+    text-align: right;
+}
+
+.status-buy {
+    background-color: #f6ffed;
+    color: #52c41a;
+    border: 1px solid #b7eb8f;
+}
+
+.status-sell {
+    background-color: #fff2e8;
+    color: #fa8c16;
+    border: 1px solid #ffd591;
+}
+
+.status-hold {
+    background-color: #f0f5ff;
+    color: #1890ff;
+    border: 1px solid #91d5ff;
+}
+
+.status-neutral {
+    background-color: #fafafa;
+    color: #595959;
+    border: 1px solid #d9d9d9;
+}
+
+/* 基本信息卡片样式优化 */
+.grid > div {
+    transition: all 0.3s ease;
+}
+
+.grid > div:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* 表格列宽优化 */
+table th:nth-child(1),
+table td:nth-child(1) {
+    width: 16.67%; /* 1/6 */
+}
+
+table th:nth-child(2),
+table td:nth-child(2) {
+    width: 16.67%; /* 1/6 */
+}
+
+table th:nth-child(3),
+table td:nth-child(3) {
+    width: 16.67%; /* 1/6 */
+}
+
+table th:nth-child(4),
+table td:nth-child(4) {
+    width: 50%; /* 1/2 */
+}
+
 /* 响应式排版系统 */
 @media (min-width: 768px) {
   .markdown-body-ai {
     --base-font: 20px;
     --spacing-unit: 2rem;
-    --container-width: min(90%, 80ch);
+    --container-width: min(90%, 1320px);
   }
 }
 /* 标题系统 */
@@ -57,18 +163,12 @@
 }
 
 .markdown-body-ai h1 {
-  font-size: calc(var(--base-font) * pow(var(--scale-ratio), 3)); /* 2.488rem */
-  border-bottom: 3px solid #e5e7eb;
-  padding-bottom: 0.6em;
-} {
-  font-size: calc(var(--base-font-size) * pow(var(--heading-scale), 3));
+  font-size: calc(var(--base-font) * pow(var(--scale-ratio), 3));
   margin: calc(var(--spacing-unit)*2) 0 var(--spacing-unit);
   font-weight: 800;
   border-bottom: 3px solid #e5e7eb;
   padding-bottom: 0.8em;
-This appears to be a dangling closing brace without a matching opening one. Given the context, it seems like this is an error. Without more information about which @-rule or selector this should belong to, it's hard to provide a definite fix. If this was meant to close the `.markdown-body-ai h1` selector block, we should ensure proper structure. But as the selection only contains `}`, and based on the instructions to make it an @-rule or selector, I'll assume it's a malformed block end. Please check the surrounding code to ensure proper CSS structure.
-
-However, if we assume this is meant to close the `.markdown-body-ai h1` block, here's the corrected form:
+}
 
 .markdown-body-ai h2 {
   font-size: calc(var(--base-font-size) * pow(var(--heading-scale), 2.5));
@@ -82,8 +182,10 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
   position: absolute;
   left: 0;
   color: #3b82f6;
-} {
-  @apply text-4xl font-extrabold mb-8;
+
+  font-size: 2.25rem;
+  font-weight: 800;
+  margin-bottom: 2rem;
   letter-spacing: -0.025em;
   text-shadow: 0 2px 4px rgba(0,0,0,0.1);
   color: #1e3a8a;
@@ -93,12 +195,21 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
 }
 
 #aiAnalysis h2 {
-  @apply text-3xl font-bold mt-12 mb-6;
+  font-size: 1.875rem;
+  font-weight: 700;
+  margin-top: 3rem;
+  margin-bottom: 1.5rem;
   position: relative;
   padding-left: 2rem;
   &::before {
     content: '';
-    @apply absolute left-0 top-1/2 w-4 h-1 bg-blue-500 transform -translate-y-1/2;
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 1rem;
+    height: 0.25rem;
+    background-color: #3b82f6;
+    transform: translateY(-50%);
   }
   color: #2563eb;
   padding-left: 1.5rem;
@@ -106,23 +217,35 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
 }
 
 .ai-analysis-section h3 {
-  @apply text-xl font-medium mt-6 mb-3;
+  font-size: 1.25rem;
+  font-weight: 500;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
   color: #3b82f6;
 }
 
 .ai-analysis-section h2 {
-  @apply text-xl font-semibold mt-6 mb-3;
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
   background: linear-gradient(90deg, #bfdbfe 0.5rem, transparent 0);
   padding-left: 1rem;
 }
 
 .ai-analysis-section h3 {
-  @apply text-lg font-medium mt-4 mb-2;
+  font-size: 1.125rem;
+  font-weight: 500;
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
   color: #3b82f6;
 }
 
 #aiAnalysis .prose p {
-  @apply text-gray-900 text-lg leading-loose mb-8;
+  color: #111827;
+  font-size: 1.125rem;
+  line-height: 1.75;
+  margin-bottom: 2rem;
   font-family: 'Noto Serif SC', system-ui;
   max-width: 65ch;
   background-color: rgba(255,255,255,0.9);
@@ -133,17 +256,23 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
 
 /* 特殊内容块样式 */
 .trend-analysis {
-  @apply border-l-4 border-blue-200 pl-4;
+  border-left-width: 4px;
+  border-color: #bfdbfe;
+  padding-left: 1rem;
   background-color: #f0f4ff;
 }
 
 .technical-indicator {
-  @apply border-l-4 border-green-200 pl-4;
+  border-left-width: 4px;
+  border-color: #bbf7d0;
+  padding-left: 1rem;
   background-color: #f0fdf4;
 }
 
 .risk-warning {
-  @apply border-l-4 border-red-200 pl-4;
+  border-left-width: 4px;
+  border-color: #fecaca;
+  padding-left: 1rem;
   background-color: #fef2f2;
 }
 
@@ -176,7 +305,7 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
   color: #3b82f6;
 }
 
-.markdown-body-ai ol {
+.markdown-body-ai {
   counter-reset: section;
 }
 
@@ -186,13 +315,8 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
   position: absolute;
   left: 0;
   color: #64748b;
-} {
-  font-size: var(--base-font-size);
-  line-height: var(--line-height);
-  margin: var(--spacing-unit) 0;
-  hyphens: auto;
-  text-align: justify;
 }
+
 
 /* 列表系统 */
 .markdown-body-ai ul {
@@ -205,7 +329,7 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
   position: relative;
 }
 
-.markdown-body-ai li:before {
+.markdown-body-ai li::before {
   content: '•';
   color: #3b82f6;
   position: absolute;
@@ -213,17 +337,120 @@ However, if we assume this is meant to close the `.markdown-body-ai h1` block, h
 }
 
 /* 代码块 */
+/* 代码块系统 */
 .markdown-body-ai pre {
   background: #f8fafc;
-  padding: 1.5em;
-  border-radius: 8px;
+  border-radius: 0.5rem;
+  padding: 1.25rem;
   overflow-x: auto;
   box-shadow: inset 0 2px 4px rgba(0,0,0,0.05);
-} {
-  @apply text-gray-800 leading-relaxed mb-6;
+}
+
+.markdown-body-ai pre {
+  color: #1e293b;
+  line-height: 1.75;
+  margin-bottom: 1.5rem;
   background: rgba(255,255,255,0.95);
   padding: 1.5rem;
   border-radius: 0.5rem;
   box-shadow: 0 4px 12px rgba(0,0,0,0.08);
   line-height: 1.75;
+}
+
+/* 表格样式 */
+.markdown-body-ai table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  background: white;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+
+.markdown-body-ai thead {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  color: white;
+}
+
+.markdown-body-ai th {
+  padding: 1rem 1.5rem;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0.025em;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.markdown-body-ai td {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #f3f4f6;
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+.markdown-body-ai tbody tr {
+  transition: all 0.2s ease;
+}
+
+.markdown-body-ai tbody tr:hover {
+  background-color: #f8fafc;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+
+.markdown-body-ai tbody tr:nth-child(even) {
+  background-color: #f9fafb;
+}
+
+.markdown-body-ai tbody tr:nth-child(even):hover {
+  background-color: #f3f4f6;
+}
+
+/* 表格响应式 */
+@media (max-width: 768px) {
+  .markdown-body-ai table {
+    font-size: 0.875rem;
+  }
+  
+  .markdown-body-ai th,
+  .markdown-body-ai td {
+    padding: 0.75rem 1rem;
+  }
+}
+
+/* 表格中的强调文本 */
+.markdown-body-ai table strong {
+  color: #1f2937;
+  font-weight: 600;
+}
+
+.markdown-body-ai table td:first-child strong {
+  color: #3b82f6;
+  font-weight: 700;
+}
+
+/* 表格中的标签样式 */
+.markdown-body-ai table .tag {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  border-radius: 9999px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin: 0 0.25rem;
+}
+
+.markdown-body-ai table .tag-buy {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.markdown-body-ai table .tag-sell {
+  background-color: #fef2f2;
+  color: #dc2626;
+}
+
+.markdown-body-ai table .tag-hold {
+  background-color: #fef3c7;
+  color: #d97706;
 }
