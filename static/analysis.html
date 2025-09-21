@@ -469,15 +469,34 @@
                             }
                             
                             return `
-                                <div class="technical-indicator-item">
-                                    <div class="indicator-name">${displayName}</div>
-                                    <div class="indicator-value">${displayValue}</div>
-                                    <span class="indicator-status ${statusClass}">${statusText}</span>
-                                </div>
+                                <tr class="hover:bg-gray-50 transition-colors">
+                                    <td class="px-4 py-3 font-medium text-gray-900">${displayName}</td>
+                                    <td class="px-4 py-3 text-gray-700 font-mono">${displayValue}</td>
+                                    <td class="px-4 py-3">
+                                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusClass}">
+                                            ${statusText}
+                                        </span>
+                                    </td>
+                                </tr>
                             `;
                         }).join('');
                     
-                    document.getElementById('technicalIndicators').innerHTML = indicatorsHtml || '<p class="text-gray-500 text-center py-4">暂无技术指标数据</p>';
+                    document.getElementById('technicalIndicators').innerHTML = `
+                        <div class="overflow-hidden bg-white shadow-sm border border-gray-200 rounded-lg">
+                            <table class="min-w-full divide-y divide-gray-200">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">指标名称</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">数值</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white divide-y divide-gray-200">
+                                    ${indicatorsHtml}
+                                </tbody>
+                            </table>
+                        </div>
+                    ` || '<p class="text-gray-500 text-center py-4">暂无技术指标数据</p>';
 
                     // 渲染K线图
                     if (result.chart_data) {
@@ -560,9 +579,9 @@
                             if (param.seriesName === 'K线') {
                                 result += `开盘: ${param.data[1]}<br/>收盘: ${param.data[2]}<br/>最低: ${param.data[3]}<br/>最高: ${param.data[4]}<br/>`;
                             } else if (param.seriesName === '买入信号') {
-                                result += `<span style="color: #22c55e">🔺 买入信号: ${param.data[1]}元</span><br/>`;
+                                result += `<span style="color: #ef4444">🔺 买入信号: ${param.data[1]}元</span><br/>`;
                             } else if (param.seriesName === '卖出信号') {
-                                result += `<span style="color: #ef4444">🔻 卖出信号: ${param.data[1]}元</span><br/>`;
+                                result += `<span style="color: #22c55e">🔻 卖出信号: ${param.data[1]}元</span><br/>`;
                             } else if (param.seriesName === '组合净值') {
                                 result += `组合净值: ${param.data}<br/>`;
                             }
@@ -661,11 +680,11 @@
                         symbol: 'triangle',
                         symbolSize: 25,
                         itemStyle: {
-                            color: '#22c55e'
+                            color: '#ef4444'
                         },
                         emphasis: {
                             itemStyle: {
-                                color: '#16a34a',
+                                color: '#dc2626',
                                 borderColor: '#fff',
                                 borderWidth: 2
                             }
@@ -679,11 +698,11 @@
                         symbol: 'triangle-down',
                         symbolSize: 25,
                         itemStyle: {
-                            color: '#ef4444'
+                            color: '#22c55e'
                         },
                         emphasis: {
                             itemStyle: {
-                                color: '#dc2626',
+                                color: '#16a34a',
                                 borderColor: '#fff',
                                 borderWidth: 2
                             }
@@ -799,7 +818,7 @@
                         </div>
                         <div class="flex justify-between items-center">
                             <span class="text-gray-600">风险评分</span>
-                            <span class="font-semibold">${riskReport.risk_score}/100</span>
+                            <span class="font-semibold">${riskReport.risk_score.toFixed(1)}/100</span>
                         </div>
                         <div class="flex justify-between items-center">
                             <span class="text-gray-600">建议仓位</span>

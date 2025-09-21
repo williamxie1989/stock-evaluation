@@ -454,3 +454,19 @@ table td:nth-child(4) {
   background-color: #fef3c7;
   color: #d97706;
 }
+
+/* 技术指标表格状态样式 */
+.status-buy {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.status-sell {
+  background-color: #fef2f2;
+  color: #dc2626;
+}
+
+.status-neutral {
+  background-color: #f3f4f6;
+  color: #6b7280;
+}

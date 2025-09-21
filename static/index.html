@@ -88,7 +88,7 @@
                         class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                     >
                     <button 
-                        onclick="analyzeStock()" 
+                        onclick="analyzeStockInNewTab()" 
                         class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors duration-200"
                     >
                         分析股票
@@ -1015,9 +1015,9 @@
             // 交易信号
             const signalsHtml = data.signals.length > 0 ? 
                 data.signals.map(signal => `
-                    <div class="p-2 mb-2 rounded ${signal.type === 'BUY' ? 'bg-green-100' : (signal.type === 'SELL' ? 'bg-red-100' : 'bg-yellow-100')}">
+                    <div class="p-2 mb-2 rounded ${signal.type === 'BUY' ? 'bg-red-100' : (signal.type === 'SELL' ? 'bg-green-100' : 'bg-yellow-100')}">
                         <strong>${signal.date}</strong> - 
-                        <span class="${signal.type === 'BUY' ? 'text-green-800' : (signal.type === 'SELL' ? 'text-red-800' : 'text-yellow-800')}">
+                        <span class="${signal.type === 'BUY' ? 'text-red-800' : (signal.type === 'SELL' ? 'text-green-800' : 'text-yellow-800')}">
                             ${signal.type} @ ${signal.price.toFixed(2)}
                         </span>
                         <br><small>${signal.reason}</small>
@@ -1054,7 +1054,7 @@
                 
                 if (data.success && data.stocks) {
                     const stockButtons = data.stocks.map(stock => 
-                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStockInNewTab();" 
                                 class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
                             ${stock}
                         </button>`
@@ -1064,7 +1064,7 @@
                     // 如果API不存在，显示默认热门股票
                     const defaultStocks = ['000001.SZ', '000002.SZ', '600036.SH', '600519.SH', '000858.SZ'];
                     const stockButtons = defaultStocks.map(stock => 
-                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                        `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStockInNewTab();" 
                                 class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
                             ${stock}
                         </button>`
@@ -1076,7 +1076,7 @@
                 // 显示默认热门股票
                 const defaultStocks = ['000001.SZ', '000002.SZ', '600036.SH', '600519.SH', '000858.SZ'];
                 const stockButtons = defaultStocks.map(stock => 
-                    `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStock();" 
+                    `<button onclick="document.getElementById('stockInput').value='${stock}'; analyzeStockInNewTab();" 
                                 class="px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-sm">
                             ${stock}
                         </button>`
@@ -1093,7 +1093,7 @@
         // 监听Enter键触发分析
         document.getElementById('stockInput').addEventListener('keypress', function(event) {
             if (event.key === 'Enter') {
-                analyzeStock();
+                analyzeStockInNewTab();
             }
         });
     </script>

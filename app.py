@@ -160,6 +160,11 @@ def _to_h_symbol_with_suffix(code: str | None) -> str | None:
 async def read_root():
     return FileResponse("static/index.html")
 
+@app.get("/analysis")
+async def read_analysis(symbol: str = None):
+    """分析页面路由"""
+    return FileResponse("static/analysis.html")
+
 @app.post("/api/analyze")
 async def analyze_stock(request: StockRequest):
     """分析股票"""

@@ -1071,7 +1071,7 @@ class StockAnalyzer:
             # 构造前端需要的报告格式
             report = {
                 "risk_level": risk_assessment['risk_level'],
-                "risk_score": risk_assessment['risk_score'] * 10,  # 转换为10分制
+                "risk_score": risk_assessment['risk_score'] * 100,  # 转换为百分比显示（0-100）
                 "position_size": risk_assessment['suggested_position_pct'],
                 "stop_loss": stop_loss_price,
                 "take_profit": take_profit_price,
