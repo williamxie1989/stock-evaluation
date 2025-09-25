@@ -37,14 +37,17 @@ class EnhancedFeatureGenerator(FeatureGenerator):
             return pd.DataFrame()
             
         try:
-            # 先生成基础特征
-            features = super().generate_features(df)
-            if features.empty:
-                return pd.DataFrame()
-            
             # 确保数据格式正确
             df = df.copy()
-            df = df.sort_values('date' if 'date' in df.columns else df.index)
+            
+            # 检查索引类型，如果不是日期索引则使用默认索引
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df = df.set_index('date')
+                else:
+                    # 创建默认索引
+                    df.index = pd.RangeIndex(len(df))
             
             # 提取OHLCV数据
             high = df['High'].astype(float) if 'High' in df.columns else df['high'].astype(float)
@@ -52,6 +55,11 @@ class EnhancedFeatureGenerator(FeatureGenerator):
             close = df['Close'].astype(float) if 'Close' in df.columns else df['close'].astype(float)
             volume = df['Volume'].astype(float) if 'Volume' in df.columns else df['volume'].astype(float)
             open_price = df['Open'].astype(float) if 'Open' in df.columns else df['open'].astype(float)
+            
+            # 先生成基础特征
+            features = super().generate_features(df)
+            if features.empty:
+                return pd.DataFrame()
             
             # === 新增高级技术指标 ===
             
@@ -170,34 +178,42 @@ class EnhancedFeatureGenerator(FeatureGenerator):
             # === 添加模型期望的特征名称映射 ===
             # 为了与训练好的模型兼容，添加特定的特征名称
             
-            # MACD相关特征
-            features['momentum_macd'] = features['macd']
-            features['momentum_macd_signal'] = features['macd_signal']
+            # 使用pd.concat一次性添加所有特征，避免DataFrame碎片化
+            additional_features = pd.DataFrame({
+                # MACD相关特征
+                'momentum_macd': features['macd'],
+                'momentum_macd_signal': features['macd_signal'],
+                
+                # 形态识别特征（简化版）
+                'pattern_engulfing': self._detect_engulfing_pattern(open_price, high, low, close),
+                'pattern_hammer': self._detect_hammer_pattern(open_price, high, low, close),
+                
+                # 成交量指标
+                'volume_obv': self._calculate_obv(close, volume),
+                'volume_vwap': self._calculate_vwap(high, low, close, volume),
+                
+                # 趋势指标
+                'trend_ma5': features['sma_5'],
+                'trend_ma20': features['sma_20'],
+                'trend_ma60': features['sma_60'],
+                
+                # RSI和ATR
+                'momentum_rsi': features['rsi_14'],
+                'volatility_atr': features['atr']
+            }, index=features.index)
             
-            # 形态识别特征（简化版）
-            features['pattern_engulfing'] = self._detect_engulfing_pattern(open_price, high, low, close)
-            features['pattern_hammer'] = self._detect_hammer_pattern(open_price, high, low, close)
+            # 使用pd.concat一次性合并所有特征
+            features = pd.concat([features, additional_features], axis=1)
             
-            # 成交量指标
-            features['volume_obv'] = self._calculate_obv(close, volume)
-            features['volume_vwap'] = self._calculate_vwap(high, low, close, volume)
-            
-            # 趋势指标
-            features['trend_ma5'] = features['sma_5']
-            features['trend_ma20'] = features['sma_20']
-            features['trend_ma60'] = features['sma_60']
-            
-            # RSI和ATR
-            features['momentum_rsi'] = features['rsi_14']
-            features['volatility_atr'] = features['atr']
-            
-            # 填充NaN值
-            features = features.fillna(method='ffill').fillna(0)
+            # 填充NaN值 - 使用新的API替代弃用的method参数
+            features = features.ffill().fillna(0)
             
             return features
             
         except Exception as e:
             logger.error(f"特征生成失败: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
 
     def _calculate_trend_strength(self, prices: pd.Series, period: int) -> pd.Series:

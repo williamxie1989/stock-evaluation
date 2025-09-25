@@ -201,22 +201,12 @@ class OptimizedModelTrainer:
         
         # 1. 训练分类模型 - 优化超参数提高区分度
         logger.info("训练分类模型...")
-        trainer_cls = MLTrainer(
-            task_type='classification',
-            # 使用优化的参数提高区分度
-            logistic_params={
-                'C': 1.0,  # 适中的正则化强度，平衡过拟合和欠拟合
-                'penalty': 'l2',  # L2正则化，保持特征稳定性
-                'solver': 'lbfgs',  # 更稳定的求解器
-                'class_weight': 'balanced',  # 自动平衡类别权重
-                'max_iter': 2000,  # 增加迭代次数确保收敛
-                'random_state': 42,
-                'tol': 1e-6  # 更严格的收敛条件
-            }
-        )
+        trainer_cls = MLTrainer()
         
         # 训练模型
-        cls_model, cls_scaler = trainer_cls.train_model(X, y['cls'])
+        cls_result = trainer_cls.train_model(X, y['cls'])
+        cls_model = cls_result['model']
+        cls_scaler = cls_result['model'].named_steps['scaler']
         
         # 保存分类模型
         cls_model_path = os.path.join(save_dir, f'optimized_cls_model_{timestamp}.pkl')
@@ -234,18 +224,11 @@ class OptimizedModelTrainer:
         
         # 2. 训练回归模型 - 优化参数提高预测精度
         logger.info("训练回归模型...")
-        trainer_reg = MLTrainer(
-            task_type='regression',
-            ridge_params={
-                'alpha': 1.0,  # 适中的正则化强度
-                'random_state': 42,
-                'solver': 'auto',  # 自动选择最优求解器
-                'max_iter': 2000,  # 增加迭代次数
-                'tol': 1e-6  # 更严格的收敛条件
-            }
-        )
+        trainer_reg = MLTrainer()
         
-        reg_model, reg_scaler = trainer_reg.train_model(X, y['reg'])
+        reg_result = trainer_reg.train_regression_model(X, y['reg'])
+        reg_model = reg_result['model']
+        reg_scaler = reg_result['model'].named_steps['scaler']
         
         # 保存回归模型
         reg_model_path = os.path.join(save_dir, f'optimized_reg_model_{timestamp}.pkl')

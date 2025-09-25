@@ -37,7 +37,15 @@ class FeatureGenerator:
         try:
             # 确保数据格式正确
             df = df.copy()
-            df = df.sort_values('date' if 'date' in df.columns else df.index)
+            
+            # 检查索引类型，如果不是日期索引则使用默认索引
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df = df.set_index('date')
+                else:
+                    # 创建默认索引
+                    df.index = pd.RangeIndex(len(df))
             
             # 提取OHLCV数据 - 支持大小写列名
             high = df['High'].astype(float) if 'High' in df.columns else df['high'].astype(float)
@@ -177,6 +185,8 @@ class FeatureGenerator:
             
         except Exception as e:
             logger.error(f"特征生成失败: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
     
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
