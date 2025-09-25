@@ -368,7 +368,12 @@ class BacktestEngine:
         
         # 年化索提诺比率
         sortino = np.mean(excess_returns) / downside_std * np.sqrt(252)
-        return sortino
+        
+        # 如果结果无效，返回0
+        if np.isnan(sortino) or np.isinf(sortino):
+            return 0.0
+            
+        return float(sortino)
     
     def _calculate_trade_stats(self) -> Dict[str, float]:
         """计算交易统计"""
@@ -401,7 +406,7 @@ class BacktestEngine:
         # 计算盈亏因子
         gross_profit = sum(r for r in trade_returns if r > 0)
         gross_loss = abs(sum(r for r in trade_returns if r < 0))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 100.0  # 使用大数值代替无穷大
         
         # 平均收益率
         avg_return = np.mean(trade_returns)
@@ -414,31 +419,52 @@ class BacktestEngine:
     
     def generate_report(self, performance: Dict[str, Any]) -> str:
         """生成回测报告"""
+        # 安全获取性能指标，确保没有无穷大或无效值
+        initial_value = performance.get('initial_value', 0.0)
+        final_value = performance.get('final_value', 0.0)
+        total_return = performance.get('total_return', 0.0)
+        annualized_return = performance.get('annualized_return', 0.0)
+        max_drawdown = performance.get('max_drawdown', 0.0)
+        drawdown_duration = performance.get('drawdown_duration_days', 0)
+        sharpe_ratio = performance.get('sharpe_ratio', 0.0)
+        sortino_ratio = performance.get('sortino_ratio', 0.0)
+        total_trades = performance.get('total_trades', 0)
+        win_rate = performance.get('win_rate', 0.0)
+        profit_factor = performance.get('profit_factor', 0.0)
+        avg_trade_return = performance.get('avg_trade_return', 0.0)
+        commission_total = performance.get('commission_total', 0.0)
+        
+        # 确保所有数值都是有效的，避免无穷大和NaN
+        def safe_float(value, default=0.0):
+            if np.isnan(value) or np.isinf(value):
+                return default
+            return float(value)
+        
         report = f"""
 股票策略回测报告
 ================
 
 基本性能指标
 ------------
-- 初始资金: ¥{performance['initial_value']:,.2f}
-- 最终资金: ¥{performance['final_value']:,.2f}
-- 总收益率: {performance['total_return_pct']:.2f}%
-- 年化收益率: {performance['annualized_return_pct']:.2f}%
-- 最大回撤: {performance['max_drawdown_pct']:.2f}%
-- 回撤持续时间: {performance['drawdown_duration_days']} 天
+- 初始资金: ¥{safe_float(initial_value):,.2f}
+- 最终资金: ¥{safe_float(final_value):,.2f}
+- 总收益率: {safe_float(total_return):.2%}
+- 年化收益率: {safe_float(annualized_return):.2%}
+- 最大回撤: {safe_float(max_drawdown):.2%}
+- 回撤持续时间: {int(drawdown_duration)} 天
 
 风险调整收益
 ------------
-- 夏普比率: {performance['sharpe_ratio']:.2f}
-- 索提诺比率: {performance['sortino_ratio']:.2f}
+- 夏普比率: {safe_float(sharpe_ratio):.2f}
+- 索提诺比率: {safe_float(sortino_ratio):.2f}
 
 交易统计
 --------
-- 总交易次数: {performance['total_trades']}
-- 胜率: {performance['win_rate_pct']:.1f}%
-- 盈亏因子: {performance['profit_factor']:.2f}
-- 平均交易收益率: {performance['avg_trade_return_pct']:.2f}%
-- 总佣金费用: ¥{performance['commission_total']:.2f}
+- 总交易次数: {int(total_trades)}
+- 胜率: {safe_float(win_rate):.1%}
+- 盈亏因子: {safe_float(profit_factor):.2f}
+- 平均交易收益率: {safe_float(avg_trade_return):.2%}
+- 总佣金费用: ¥{safe_float(commission_total):.2f}
 
 交易明细
 --------

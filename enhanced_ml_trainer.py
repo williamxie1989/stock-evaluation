@@ -261,8 +261,9 @@ class EnhancedMLTrainer:
             # 根据模型类型建议参数
             if model_type == 'logistic':
                 params = {
-                    'C': trial.suggest_loguniform('C', 0.01, 100.0),
+                    'C': trial.suggest_float('C', 0.01, 100.0, log=True),
                     'penalty': trial.suggest_categorical('penalty', ['l1', 'l2']),
+                    'solver': trial.suggest_categorical('solver', ['liblinear', 'saga']),
                     'class_weight': trial.suggest_categorical('class_weight', ['balanced', None])
                 }
             elif model_type == 'randomforest':
@@ -276,18 +277,18 @@ class EnhancedMLTrainer:
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', 50, 300),
                     'max_depth': trial.suggest_int('max_depth', 3, 12),
-                    'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 0.3),
-                    'subsample': trial.suggest_uniform('subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0)
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+                    'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)
                 }
             elif model_type == 'lightgbm':
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', 50, 300),
                     'max_depth': trial.suggest_int('max_depth', 3, 12),
-                    'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 0.3),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
                     'num_leaves': trial.suggest_int('num_leaves', 20, 100),
-                    'subsample': trial.suggest_uniform('subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0)
+                    'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)
                 }
             
             # 创建模型并训练
@@ -301,6 +302,11 @@ class EnhancedMLTrainer:
                 X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
                 
+                # 检查训练集和验证集是否都包含至少两个类别
+                if len(np.unique(y_tr)) < 2 or len(np.unique(y_val)) < 2:
+                    scores.append(0.5)  # 如果训练集或验证集只有一个类别，返回中性分数
+                    continue
+                    
                 pipeline.fit(X_tr, y_tr)
                 y_pred_proba = pipeline.predict_proba(X_val)[:, 1]
                 
@@ -367,6 +373,40 @@ class EnhancedMLTrainer:
             
             logger.info(f"训练{model_type}模型: 训练集 {len(X_train)} 样本, 测试集 {len(X_test)} 样本")
             
+            # 检查数据是否包含至少两个类别
+            unique_classes = np.unique(y_train)
+            if len(unique_classes) < 2:
+                logger.warning(f"训练数据中只有一个类别 ({unique_classes[0]})，无法训练分类模型")
+                # 返回一个虚拟的结果
+                return {
+                    'model': None,
+                    'model_type': model_type,
+                    'best_params': {},
+                    'cv_score': 0.5,
+                    'feature_names': X.columns.tolist(),
+                    'feature_importance': {},
+                    'metrics': {
+                        'train_auc': 0.5,
+                        'test_auc': 0.5,
+                        'train_accuracy': 1.0 if len(unique_classes) == 1 else 0.5,
+                        'test_accuracy': 1.0 if len(unique_classes) == 1 else 0.5,
+                        'train_precision': 0.0,
+                        'test_precision': 0.0,
+                        'train_recall': 0.0,
+                        'test_recall': 0.0,
+                        'train_f1': 0.0,
+                        'test_f1': 0.0
+                    },
+                    'predictions': {
+                        'X_test': X_test,
+                        'y_test': y_test,
+                        'y_test_pred': np.full(len(y_test), unique_classes[0]) if len(unique_classes) == 1 else np.zeros(len(y_test)),
+                        'y_test_proba': np.full(len(y_test), 1.0) if len(unique_classes) == 1 else np.zeros(len(y_test))
+                    },
+                    'classification_report': {},
+                    'confusion_matrix': [[len(y_test), 0], [0, 0]] if len(unique_classes) == 1 else [[0, 0], [0, 0]]
+                }
+            
             # 超参数优化
             if use_optimization:
                 if self.use_bayesian_optimization:
@@ -393,8 +433,15 @@ class EnhancedMLTrainer:
             y_test_proba = final_pipeline.predict_proba(X_test)[:, 1]
             
             # 计算详细指标
-            train_auc = roc_auc_score(y_train, y_train_proba)
-            test_auc = roc_auc_score(y_test, y_test_proba)
+            try:
+                train_auc = roc_auc_score(y_train, y_train_proba)
+            except:
+                train_auc = 0.5
+            
+            try:
+                test_auc = roc_auc_score(y_test, y_test_proba)
+            except:
+                test_auc = 0.5
             train_accuracy = accuracy_score(y_train, y_train_pred)
             test_accuracy = accuracy_score(y_test, y_test_pred)
             train_precision = precision_score(y_train, y_train_pred, zero_division=0)
@@ -454,7 +501,106 @@ class EnhancedMLTrainer:
             logger.error(f"{model_type}模型训练失败: {e}")
             raise
     
-    def train_ensemble_model(self, X: pd.DataFrame, y: pd.Series, 
+    def train_regression_model(self, X: pd.DataFrame, y: pd.Series, 
+                             test_size: float = 0.2, use_grid_search: bool = False,
+                             cv_folds: int = 5, scoring: str = 'neg_mean_squared_error') -> Dict[str, Any]:
+        """训练回归模型"""
+        try:
+            if X.empty or len(y) == 0:
+                raise ValueError("特征或标签数据为空")
+            
+            # 分割数据
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=42
+            )
+            
+            logger.info(f"训练回归模型: 训练集 {len(X_train)} 样本, 测试集 {len(X_test)} 样本")
+            
+            # 创建回归管线
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('ridge', Ridge(alpha=1.0, random_state=42))
+            ])
+            
+            # 超参数优化
+            if use_grid_search:
+                param_grid = {
+                    'ridge__alpha': [0.1, 1.0, 10.0, 100.0]
+                }
+                
+                grid_search = GridSearchCV(
+                    pipeline, param_grid, cv=cv_folds, scoring=scoring, n_jobs=-1
+                )
+                grid_search.fit(X_train, y_train)
+                
+                best_params = grid_search.best_params_
+                best_score = grid_search.best_score_
+                
+                logger.info(f"网格搜索完成: 最佳参数 {best_params}, 最佳得分 {-best_score:.4f}")
+                
+                # 使用最佳参数重新训练
+                pipeline.set_params(**best_params)
+            
+            # 训练模型
+            pipeline.fit(X_train, y_train)
+            
+            # 预测
+            y_train_pred = pipeline.predict(X_train)
+            y_test_pred = pipeline.predict(X_test)
+            
+            # 计算评估指标
+            train_mse = mean_squared_error(y_train, y_train_pred)
+            test_mse = mean_squared_error(y_test, y_test_pred)
+            train_mae = mean_absolute_error(y_train, y_train_pred)
+            test_mae = mean_absolute_error(y_test, y_test_pred)
+            train_r2 = r2_score(y_train, y_train_pred)
+            test_r2 = r2_score(y_test, y_test_pred)
+            
+            # 获取特征重要性（系数绝对值）
+            feature_importance = {}
+            if hasattr(pipeline.named_steps['ridge'], 'coef_'):
+                coef = pipeline.named_steps['ridge'].coef_
+                if len(coef.shape) > 1:
+                    coef = coef[0]  # 处理多输出情况
+                
+                feature_names = X.columns.tolist()
+                for i, importance in enumerate(np.abs(coef)):
+                    if i < len(feature_names):
+                        feature_importance[feature_names[i]] = float(importance)
+            
+            # 构建结果
+            result = {
+                'model': pipeline,
+                'model_type': 'ridge',
+                'best_params': best_params if use_grid_search else {'ridge__alpha': 1.0},
+                'cv_score': best_score if use_grid_search else None,
+                'feature_names': X.columns.tolist(),
+                'feature_importance': feature_importance,
+                'metrics': {
+                    'train_mse': train_mse,
+                    'test_mse': test_mse,
+                    'train_mae': train_mae,
+                    'test_mae': test_mae,
+                    'train_r2': train_r2,
+                    'test_r2': test_r2
+                },
+                'predictions': {
+                    'X_test': X_test,
+                    'y_test': y_test,
+                    'y_test_pred': y_test_pred
+                }
+            }
+            
+            logger.info(f"回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+            logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"回归模型训练失败: {e}")
+            raise
+
+    def train_ensemble_model(self, X: pd.DataFrame, y: pd.Series,
                            model_types: List[str] = None,
                            test_size: float = 0.2,
                            use_optimization: bool = True) -> Dict[str, Any]:

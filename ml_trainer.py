@@ -51,10 +51,11 @@ class MLTrainer:
         
         # 默认超参数
         self.default_params = {
-            'logistic__C': [0.01, 0.1, 1.0, 10.0],
+            'logistic__C': [0.001, 0.01, 0.1],  # 降低正则化强度范围，防止过拟合
             'logistic__penalty': ['l1', 'l2'],
             'logistic__solver': ['liblinear'],
-            'logistic__max_iter': [1000]
+            'logistic__max_iter': [1000],
+            'logistic__class_weight': ['balanced']  # 添加类别权重平衡
         }
         # 添加回归超参数网格
         self.default_regression_params = {

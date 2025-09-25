@@ -181,10 +181,15 @@ class IntelligentStockSelector:
                     else:
                         # 兼容旧格式：直接保存了Estimator/Pipeline
                         fname_lower = fname.lower()
-                        inferred_task = 'classification' if ('logistic' in fname_lower or 'cls' in fname_lower) else ('regression' if 'reg' in fname_lower else None)
+                        inferred_task = 'classification' if ('logistic' in fname_lower or 'cls' in fname_lower or 'classification' in fname_lower) else ('regression' if 'reg' in fname_lower or 'regression' in fname_lower else None)
                         inferred_period = '30d' if '30d' in fname_lower else ('10d' if '10d' in fname_lower else None)
                         if inferred_task and (inferred_period == period or inferred_period is None):
-                            wrapper = {'model': data, 'feature_names': None, 'metadata': {'task': inferred_task, 'period': inferred_period}}
+                            # 对于Pipeline对象，尝试获取feature_names_in_属性
+                            feature_names = []
+                            if hasattr(data, 'feature_names_in_'):
+                                feature_names = data.feature_names_in_.tolist()
+                            
+                            wrapper = {'model': data, 'feature_names': feature_names, 'metadata': {'task': inferred_task, 'period': inferred_period}}
                             if inferred_task == 'classification':
                                 cls_candidates.append((fname, wrapper))
                             elif inferred_task == 'regression':
@@ -193,15 +198,40 @@ class IntelligentStockSelector:
                     logger.debug(f"读取模型失败 {fpath}: {e}")
                     continue
             if cls_candidates:
-                # 取最新（文件名包含时间戳，已排序）
-                self.cls_model_data = cls_candidates[-1][1]
-                self.cls_feature_names = self.cls_model_data.get('feature_names') or []
-                logger.info(f"已加载分类模型: {cls_candidates[-1][0]} 特征数={len(self.cls_feature_names)}")
+                # 优先选择xgboost模型，如果没有则选择最新模型
+                xgboost_candidates = [(fname, data) for fname, data in cls_candidates if 'xgboost' in fname.lower()]
+                if xgboost_candidates:
+                    # 如果有xgboost模型，选择最新的xgboost模型
+                    self.cls_model_data = xgboost_candidates[-1][1]
+                    selected_model = xgboost_candidates[-1][0]
+                else:
+                    # 否则选择最新模型
+                    self.cls_model_data = cls_candidates[-1][1]
+                    selected_model = cls_candidates[-1][0]
+                
+                # 优先从字典中获取特征名称，如果是Pipeline对象则从feature_names_in_属性获取
+                if isinstance(self.cls_model_data, dict):
+                    self.cls_feature_names = self.cls_model_data.get('feature_names') or []
+                else:
+                    # 对于Pipeline对象，尝试获取feature_names_in_属性
+                    if hasattr(self.cls_model_data, 'feature_names_in_'):
+                        self.cls_feature_names = self.cls_model_data.feature_names_in_.tolist()
+                    else:
+                        self.cls_feature_names = []
+                logger.info(f"已加载分类模型: {selected_model} 特征数={len(self.cls_feature_names)}")
             else:
                 logger.warning("未找到30d分类模型")
             if reg_candidates:
                 self.reg_model_data = reg_candidates[-1][1]
-                self.reg_feature_names = self.reg_model_data.get('feature_names') or []
+                # 优先从字典中获取特征名称，如果是Pipeline对象则从feature_names_in_属性获取
+                if isinstance(self.reg_model_data, dict):
+                    self.reg_feature_names = self.reg_model_data.get('feature_names') or []
+                else:
+                    # 对于Pipeline对象，尝试获取feature_names_in_属性
+                    if hasattr(self.reg_model_data, 'feature_names_in_'):
+                        self.reg_feature_names = self.reg_model_data.feature_names_in_.tolist()
+                    else:
+                        self.reg_feature_names = []
                 logger.info(f"已加载回归模型: {reg_candidates[-1][0]} 特征数={len(self.reg_feature_names)}")
             else:
                 logger.warning("未找到30d回归模型")
@@ -384,10 +414,23 @@ class IntelligentStockSelector:
                 model_r = self.reg_model_data['model']
                 expected_features_r = self.reg_feature_names or []
                 Xr = features_df.copy()
+                
+                # 当未提供特征名时，回退为使用数值型特征（排除symbol）
+                if not expected_features_r:
+                    candidate_cols = [c for c in Xr.columns if c != 'symbol']
+                    # 仅选择数值列
+                    expected_features_r = [c for c in candidate_cols if np.issubdtype(Xr[c].dtype, np.number)]
+                    logger.warning(f"回归模型特征名称为空，回退到使用数值型特征，数量: {len(expected_features_r)}")
+                
                 for col in expected_features_r:
                     if col not in Xr.columns:
                         Xr[col] = 0
                 Xr = Xr[expected_features_r].fillna(0)
+                
+                # 检查特征矩阵是否为空
+                if Xr.empty or Xr.shape[1] == 0:
+                    logger.error("回归特征矩阵为空，无法进行预测")
+                    raise ValueError("回归特征矩阵为空")
                 
                 # 应用增强预处理pipeline
                 if self.use_enhanced_preprocessing and self.reg_preprocessor is not None:
@@ -396,11 +439,28 @@ class IntelligentStockSelector:
                 else:
                     # 原有的预处理逻辑
                     use_pipeline_scaler_r = hasattr(model_r, 'named_steps') and 'scaler' in getattr(model_r, 'named_steps', {})
-                    Xr_input = Xr if use_pipeline_scaler_r else (self.reg_model_data.get('scaler').transform(Xr) if self.reg_model_data.get('scaler') else Xr)
+                    scaler_r = self.reg_model_data.get('scaler')
+                    if use_pipeline_scaler_r:
+                        Xr_input = Xr
+                    elif scaler_r is not None:
+                        Xr_input = scaler_r.transform(Xr)
+                    else:
+                        # 在线标准化，避免数值尺度问题
+                        try:
+                            col_std = Xr.std().replace(0, 1e-6)
+                            Xr_norm = (Xr - Xr.mean()) / col_std
+                            Xr_input = Xr_norm.clip(-5, 5).fillna(0)
+                            logger.info("回归模型未找到标准化器，已对特征进行在线标准化处理")
+                        except Exception:
+                            logger.warning("回归模型在线标准化失败，退回原始特征")
+                            Xr_input = Xr
                 
                 exp_returns = model_r.predict(Xr_input)
+                logger.info(f"回归模型预测成功，样本数: {len(exp_returns)}")
         except Exception as e:
             logger.error(f"回归预测失败: {e}")
+            # 设置默认返回值
+            exp_returns = np.array([0.0] * len(features_df))
             
         # 如果分类概率过于极端，尝试用技术指标进行微调
         try:

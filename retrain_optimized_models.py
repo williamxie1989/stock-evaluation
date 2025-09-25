@@ -112,6 +112,9 @@ class OptimizedModelTrainer:
         y_cls = combined_df['label_cls']
         y_reg = combined_df['label_reg']
         
+        # 修复特征名称警告：为特征列添加标准名称
+        X.columns = [f'feature_{i}' for i in range(X.shape[1])]
+        
         # 数据质量检查
         self._check_data_quality(X, y_cls, y_reg)
         
