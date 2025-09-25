@@ -67,7 +67,7 @@ def analyze_data_quality_by_market(conn):
     
     cursor = conn.cursor()
     
-    markets = ['SZ', 'SH', 'HK', 'UNKNOWN']  # BJ股票已移除，不再分析
+    markets = ['SZ', 'SH', 'UNKNOWN']  # BJ股票已移除，不再分析
     
     for market in markets:
         print(f"\n{'-'*50}")
@@ -217,7 +217,7 @@ def analyze_code_format_issues(conn):
                 WHEN symbol LIKE '%.SZ' THEN '深交所格式(.SZ)'
                 WHEN symbol LIKE '%.SS' THEN '上交所格式(.SS)'
                 WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)(已移除)'
-                WHEN symbol LIKE '%%%%%' THEN '港股格式(5位数字)'
+                WHEN symbol LIKE '%%%%%' THEN 'A股格式(6位数字)'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '6位数字格式'
                 WHEN symbol LIKE 'None.%' THEN '异常格式(None.)'
                 ELSE '其他格式'
@@ -241,7 +241,7 @@ def analyze_code_format_issues(conn):
                 WHEN symbol LIKE '%.SZ' THEN '深交所格式(.SZ)'
                 WHEN symbol LIKE '%.SS' THEN '上交所格式(.SS)'
                 WHEN symbol LIKE '%.BJ' THEN '北交所格式(.BJ)(已移除)'
-                WHEN symbol LIKE '%%%%%' THEN '港股格式(5位数字)'
+                WHEN symbol LIKE '%%%%%' THEN 'A股格式(6位数字)'
                 WHEN LENGTH(symbol) = 6 AND symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN '6位数字格式'
                 ELSE '其他格式'
             END as format_type,

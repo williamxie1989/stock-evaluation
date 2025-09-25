@@ -10,6 +10,7 @@ import struct
 from dotenv import load_dotenv
 from typing import Dict, List, Any
 from akshare_data_provider import AkshareDataProvider
+from enhanced_realtime_provider import EnhancedRealtimeProvider
 from signal_generator import SignalGenerator
 from backtest_engine import BacktestEngine
 from risk_management import RiskManager
@@ -35,6 +36,9 @@ class StockAnalyzer:
         
         # 初始化akshare数据提供者
         self.akshare_provider = AkshareDataProvider()
+        
+        # 初始化增强版实时行情数据提供器
+        self.realtime_provider = EnhancedRealtimeProvider()
         
         # 初始化信号生成器、回测引擎和风险管理器
         self.signal_generator = SignalGenerator()
@@ -964,6 +968,18 @@ class StockAnalyzer:
                 except:
                     pass  # 忽略yfinance错误，继续使用已有数据
             
+            # 获取实时行情数据
+            realtime_quote = None
+            try:
+                print(f"尝试获取 {stock_symbol} 实时行情数据")
+                realtime_quote = self.realtime_provider.get_realtime_quote(stock_symbol)
+                if realtime_quote:
+                    print(f"成功获取实时行情数据: {realtime_quote}")
+                else:
+                    print(f"获取实时行情数据失败")
+            except Exception as e:
+                print(f"获取实时行情数据异常: {e}")
+            
             # 计算技术指标
             technical_data = self.calculate_technical_indicators(df)
             print("技术指标计算完成")
@@ -996,7 +1012,8 @@ class StockAnalyzer:
                 'data_source': 'akshare' if 'akshare' in str(type(self.akshare_provider)) else ('tdx_file' if data_result.get('data_source') == 'tdx_file' else ('free_api' if len(df) <= 1 else 'yfinance')),
                 'backtest': backtest_result,
                 'risk_report': self.get_risk_report(technical_data, signals),
-                'chart_data': self._generate_chart_data(technical_data, backtest=backtest_result)
+                'chart_data': self._generate_chart_data(technical_data, backtest=backtest_result),
+                'realtime_quote': realtime_quote  # 添加实时行情数据
             }
             
             # 确保交易信号正确传递到最终结果中

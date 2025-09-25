@@ -19,6 +19,7 @@ from data_sync_service import DataSyncService
 from concurrent_data_sync_service import ConcurrentDataSyncService
 from concurrent_enhanced_data_provider import ConcurrentEnhancedDataProvider
 from optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
+from enhanced_realtime_provider import EnhancedRealtimeProvider
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import logging
@@ -67,6 +68,7 @@ analyzer = StockAnalyzer()
 _db = DatabaseManager()
 _provider = EnhancedDataProvider()  # 使用增强数据提供者，支持过滤逻辑
 _optimized_provider = OptimizedEnhancedDataProvider()  # 优化版数据提供者，减少重试延迟
+_realtime_provider = EnhancedRealtimeProvider()  # 增强版实时行情数据提供器
 # 初始化服务
 data_sync_service = DataSyncService()
 concurrent_data_sync_service = ConcurrentDataSyncService(max_workers=8, db_batch_size=50)
@@ -102,8 +104,9 @@ async def startup_event():
         async def _prewarm_stock_picks():
             try:
                 logger.info("[startup] 开始后台预热 /api/stock-picks 缓存 (limit_symbols=500, top_n=10)")
-                await get_stock_picks(top_n=10, limit_symbols=500, force_refresh=True, debug=1)
-                logger.info("[startup] 预热完成")
+                # 直接调用同步方法，避免异步调用问题
+                result = selector_service.get_stock_picks(top_n=10)
+                logger.info(f"[startup] 预热完成，结果: {len(result.get('data', {}).get('picks', [])) if result.get('success') else '失败'}")
             except Exception as e:
                 logger.warning(f"[startup] 预热失败: {e}")
         asyncio.create_task(_prewarm_stock_picks())
@@ -121,7 +124,7 @@ async def startup_event():
         if not existing_stocks:
             # 首次启动，完整初始化 - 扩大股票覆盖范围，暂时只处理A股
             print("检测到首次启动，开始完整数据初始化...")
-            result = await refresh_data(max_symbols=1000, full=True, batch_size=25, delay_seconds=1.5, include_hk=False)
+            result = await refresh_data(max_symbols=1000, full=True, batch_size=25, delay_seconds=1.5)
             if result.get("success"):
                 data = result.get("data", {})
                 print(f"完整数据初始化完成: 处理了{data.get('symbols', 0)}只股票，插入{data.get('inserted_daily_rows', 0)}条日线数据，{data.get('quotes_rows', 0)}条实时行情")
@@ -130,7 +133,7 @@ async def startup_event():
         else:
             # 已有数据，进行增量更新，暂时只处理A股
             print(f"检测到已有股票数据，进行增量更新...")
-            result = await refresh_data(max_symbols=0, full=False, batch_size=20, delay_seconds=0.8, include_hk=False)  # max_symbols=0表示处理所有股票
+            result = await refresh_data(max_symbols=0, full=False, batch_size=20, delay_seconds=0.8)  # max_symbols=0表示处理所有股票
             if result.get("success"):
                 data = result.get("data", {})
                 print(f"增量数据更新完成: 处理了{data.get('symbols', 0)}只股票，插入{data.get('inserted_daily_rows', 0)}条日线数据，{data.get('quotes_rows', 0)}条实时行情")
@@ -150,11 +153,7 @@ def _to_a_symbol_with_suffix(code: str | None) -> str | None:
     return f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
 
 
-def _to_h_symbol_with_suffix(code: str | None) -> str | None:
-    if code is None or str(code).lower() == 'nan':
-        return None
-    code = str(code).zfill(5)
-    return f"{code}.HK"
+
 
 
 @app.get("/")
@@ -208,7 +207,7 @@ async def get_popular_stocks():
 
 
 @app.post("/api/refresh-data")
-async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: int = 10, delay_seconds: float = 1.0, include_hk: bool = False):
+async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: int = 10, delay_seconds: float = 1.0):
     """
     刷新全市场股票元数据与增量日线/实时行情：
     - 写入 stocks（包含全市场股票信息）
@@ -220,7 +219,6 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
     - full: 是否完整初始化（True）还是增量更新（False）
     - batch_size: 批量处理大小，防止API限流
     - delay_seconds: 批次间延时，控制API调用频率
-    - include_hk: 是否包含港股（False表示只处理A股）
     """
     try:
         # 1) 获取全市场股票列表并写入 stocks 表
@@ -229,41 +227,24 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
         stock_rows = []
         
         if all_stocks is None or all_stocks.empty:
-            print("获取全市场股票列表失败，使用A+H股配对作为回退方案...")
-            # 回退方案：使用 A+H 配对列表
-            pairs = _provider.get_ah_stock_list()
-            if pairs is None or pairs.empty:
-                print("A+H股配对也失败，使用种子股票列表...")
-                # 最终回退：使用种子股票
-                seed_symbols = [
-                    {"symbol": "600519.SH", "name": "贵州茅台"},
-                    {"symbol": "000858.SZ", "name": "五粮液"},
-                    {"symbol": "300750.SZ", "name": "宁德时代"},
-                    {"symbol": "002594.SZ", "name": "比亚迪"},
-                    {"symbol": "601318.SH", "name": "中国平安"}
-                ]
-                for s in seed_symbols:
-                    sym = s["symbol"]
-                    market = "SH" if (sym.endswith(".SH") or sym.endswith(".SS")) else "SZ"
-                    stock_rows.append({
-                        "symbol": sym,
-                        "name": s.get("name"),
-                        "market": market,
-                        "ah_pair": None
-                    })
-            else:
-                # 使用A+H配对数据
-                for _, r in pairs.iterrows():
-                    name = r.get('name')
-                    code_a = r.get('code_a') if 'code_a' in pairs.columns else None
-                    code_h = r.get('code_h') if 'code_h' in pairs.columns else None
-                    sym_a = _to_a_symbol_with_suffix(code_a)
-                    sym_h = _to_h_symbol_with_suffix(code_h)
-                    if sym_a:
-                        market = 'SH' if (str(sym_a).endswith('.SH') or str(sym_a).endswith('.SS')) else 'SZ'
-                        stock_rows.append({"symbol": sym_a, "name": name, "market": market, "ah_pair": sym_h})
-                    if sym_h:
-                        stock_rows.append({"symbol": sym_h, "name": name, "market": "HK", "ah_pair": sym_a})
+            print("获取全市场股票列表失败，使用种子股票列表...")
+            # 回退方案：使用种子股票
+            seed_symbols = [
+                {"symbol": "600519.SH", "name": "贵州茅台"},
+                {"symbol": "000858.SZ", "name": "五粮液"},
+                {"symbol": "300750.SZ", "name": "宁德时代"},
+                {"symbol": "002594.SZ", "name": "比亚迪"},
+                {"symbol": "601318.SH", "name": "中国平安"}
+            ]
+            for s in seed_symbols:
+                sym = s["symbol"]
+                market = "SH" if (sym.endswith(".SH") or sym.endswith(".SS")) else "SZ"
+                stock_rows.append({
+                    "symbol": sym,
+                    "name": s.get("name"),
+                    "market": market,
+                    "ah_pair": None
+                })
         else:
             # 使用全市场股票数据
             print(f"成功获取全市场股票列表，共 {len(all_stocks)} 只股票")
@@ -292,13 +273,6 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                     symbol = f"{code_str}.SZ"
                 elif market == 'BJ':
                     continue  # BJ股票已移除，跳过北交所
-                elif market == 'HK':
-                    if not include_hk:
-                        continue  # 跳过港股
-                    # 港股常见为 4-5 位，统一补零到 5 位
-                    if len(code_str) not in (4, 5):
-                        continue
-                    symbol = f"{code_str.zfill(5)}.HK"
                 else:
                     continue  # 跳过未知市场
 
@@ -334,13 +308,8 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
             print(f"处理批次 {i//batch_size + 1}/{(len(symbols) + batch_size - 1)//batch_size}，包含 {len(batch_symbols)} 只股票")
             
             for symbol in batch_symbols:
-                if symbol.endswith('.HK'):
-                    market = 'H'
-                    # 港股代码格式：保持5位数字，前面补0
-                    code_digits = re.sub(r"\D", "", symbol.split('.')[0]).zfill(5)
-                else:
-                    market = 'A'
-                    code_digits = re.sub(r"\D", "", symbol.split('.')[0]).zfill(6)
+                market = 'A'
+                code_digits = re.sub(r"\D", "", symbol.split('.')[0]).zfill(6)
                 start_date = None
                 if not full and latest_map.get(symbol):
                     try:
@@ -352,9 +321,7 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                     except Exception as e:
                         logger.warning(f"解析最新日期失败: {e}")
                         start_date = None
-                # 对于港股，需要传递字符串格式的代码（如"02318"）
-                symbol_for_akshare = code_digits if market == 'A' else str(code_digits).zfill(5)
-                df_hist = _provider.get_ah_daily(symbol=symbol_for_akshare, market=market, start_date=start_date)  # type: pd.DataFrame
+                df_hist = _provider.get_stock_historical_data(symbol=code_digits, period="1y")  # type: pd.DataFrame
                 if df_hist is not None and not df_hist.empty:
                     df_hist = df_hist.copy()
                     df_hist['symbol'] = symbol
@@ -367,40 +334,40 @@ async def refresh_data(max_symbols: int = 50, full: bool = False, batch_size: in
                 print(f"批次完成，等待 {delay_seconds} 秒...")
                 await asyncio.sleep(delay_seconds)
 
-        # 5) 实时行情快照
+        # 5) 实时行情快照 - 已移除启动时批量获取，避免性能问题和API限制
+        # 实时行情数据时效性短，启动时获取意义不大，且容易触发API限制
         quotes_rows = []
-        spot = _provider.get_ah_spot()
-        if spot is not None and not spot.empty:
-            # A 股侧
-            if 'code_a' in spot.columns and 'price_a' in spot.columns:
-                for _, r in spot.iterrows():
-                    c, p = r.get('code_a'), r.get('price_a')
-                    if pd.notna(c) and pd.notna(p) and p is not None:
-                        sym = _to_a_symbol_with_suffix(str(c))
-                        if sym:
-                            quotes_rows.append({
-                                'symbol': sym,
-                                'price': float(p),
-                                'change_pct': r.get('pct_chg_a'),
-                                'volume': r.get('volume_a') if 'volume_a' in spot.columns else None
-                            })
-            # H 股侧
-            if 'code_h' in spot.columns and 'price_h' in spot.columns:
-                for _, r in spot.iterrows():
-                    c, p = r.get('code_h'), r.get('price_h')
-                    if pd.notna(c) and pd.notna(p) and p is not None:
-                        sym = _to_h_symbol_with_suffix(str(c))
-                        if sym:
-                            quotes_rows.append({
-                                'symbol': sym,
-                                'price': float(p),
-                                'change_pct': r.get('pct_chg_h'),
-                                'volume': r.get('volume_h') if 'volume_h' in spot.columns else None
-                            })
-        if quotes_rows:
-            _db.insert_quotes_realtime(pd.DataFrame(quotes_rows), source='akshare_ah_spot')
+        
+        # 注释掉启动时的实时行情批量获取，改为按需获取
+        # # 使用增强版实时行情提供器获取A股实时行情
+        # # 获取所有A股代码列表
+        # all_stocks = _provider.get_all_stock_list()
+        # 
+        # if all_stocks is not None and not all_stocks.empty:
+        #     # 使用批量获取功能，提高效率
+        #     symbols = all_stocks['symbol'].tolist()
+        #     
+        #     # 批量获取实时行情
+        #     batch_quotes = _realtime_provider.get_batch_realtime_quotes(symbols)
+        #     
+        #     for symbol, quote in batch_quotes.items():
+        #         try:
+        #             if quote and 'price' in quote:
+        #                 quotes_rows.append({
+        #                     'symbol': symbol,
+        #                     'price': float(quote['price']),
+        #                     'change_pct': quote.get('change_pct'),
+        #                     'volume': quote.get('volume')
+        #                 })
+        #         except Exception as e:
+        #             logger.warning(f"处理股票 {symbol} 实时行情失败: {e}")
+        # 
+        # if quotes_rows:
+        #     _db.insert_quotes_realtime(pd.DataFrame(quotes_rows), source='enhanced_realtime_provider')
+        # else:
+        #     logger.warning("实时行情快照获取失败，未获取到有效数据")
 
-        return {"success": True, "data": {"symbols": len(symbols), "inserted_daily_rows": total_rows, "quotes_rows": len(quotes_rows)}}
+        return {"success": True, "data": {"symbols": len(symbols), "inserted_daily_rows": total_rows, "quotes_rows": 0}}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

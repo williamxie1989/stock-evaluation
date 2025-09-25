@@ -112,7 +112,7 @@ class StockDataRedownloader:
         elif symbol.endswith('.SZ'):
             return 'SZ'
         elif symbol.endswith('.HK'):
-            return 'HK'
+            return 'UNKNOWN'  # 港股代码已移除，统一标记为UNKNOWN
         else:
             return 'UNKNOWN'
     

@@ -74,7 +74,7 @@ class CompleteStockDatabaseBuilder:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         symbol TEXT NOT NULL,              -- 股票代码（A股代码）
                         name TEXT,                         -- 股票名称
-                        market TEXT,                       -- 市场标识，如 SH/SZ/HK
+                        market TEXT,                       -- 市场标识，如 SH/SZ
                         board_type TEXT,                   -- 板块类型（主板、创业板、科创板等）
                         exchange TEXT,                     -- 交易所名称
                         ah_pair TEXT,                      -- 若有，对应另一市场代码，例如 H 股代码

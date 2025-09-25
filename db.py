@@ -41,7 +41,7 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,              -- 股票代码（A股代码）
                     name TEXT,                         -- 股票名称
-                    market TEXT,                       -- 市场标识，如 SH/SZ/HK
+                    market TEXT,                       -- 市场标识，如 SH/SZ
                     board_type TEXT,                   -- 板块类型（主板、创业板、科创板等）
                     exchange TEXT,                     -- 交易所名称
                     ah_pair TEXT,                      -- 若有，对应另一市场代码，例如 H 股代码
@@ -422,7 +422,7 @@ class DatabaseManager:
     def list_symbols(self, markets: list[str] | None = None, limit: int = None) -> list[dict]:
         """
         从 stocks 表读取候选标的列表。
-        - markets: 可选，['SH','SZ','HK'] 之一；None 表示全部
+        - markets: 可选，['SH','SZ'] 之一；None 表示全部
         - limit: 返回的最大记录数
         返回: [{symbol, name, market, ah_pair}, ...]
         """

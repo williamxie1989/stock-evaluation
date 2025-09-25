@@ -13,7 +13,6 @@ class MarketType(Enum):
     SZ_MAIN = "深市主板"  # 深圳主板  
     CHINEXT = "创业板"    # 创业板
     # BEIJING = "北交所"   # 北京证券交易所 - BJ股票已移除
-    HK = "H股"          # 港股（暂不同步）
 
 class MarketSelectorService:
     """
@@ -33,9 +32,8 @@ class MarketSelectorService:
         self.market_mapping = {
             MarketType.SH_MAIN: {'exchange': '上海证券交易所', 'market': 'SH', 'board_types': ['主板']},
             MarketType.SZ_MAIN: {'exchange': '深圳证券交易所', 'market': 'SZ', 'board_types': ['主板']},
-            MarketType.CHINEXT: {'exchange': '深圳证券交易所', 'market': 'SZ', 'board_types': ['创业板']},
+            MarketType.CHINEXT: {'exchange': '深圳证券交易所', 'market': 'SZ', 'board_types': ['创业板']}
             # MarketType.BEIJING: {'exchange': '北京证券交易所', 'market': 'BJ', 'board_types': ['北交所']},  # BJ股票已移除
-            MarketType.HK: {'exchange': '香港证券交易所', 'market': 'HK', 'board_types': ['主板', '创业板']}
         }
     
     def get_available_markets(self) -> Dict[str, Any]:
@@ -60,7 +58,7 @@ class MarketSelectorService:
                     'stock_count': int(stock_count),  # 确保是Python int类型
                     'data_freshness': data_freshness,
                     'available': bool(stock_count > 0 and data_freshness['is_fresh']),
-                    'enabled': bool(market_type != MarketType.HK)  # H股暂时不启用
+                    'enabled': True
                 }
             
             return {
@@ -137,7 +135,7 @@ class MarketSelectorService:
             self.logger.info(f"开始基于市场 {selected_markets} 进行选股")
             
             # 验证选定的市场
-            valid_markets = [m.value for m in MarketType if m != MarketType.HK]  # 排除H股和已移除的BJ股
+            valid_markets = [m.value for m in MarketType]
             invalid_markets = [m for m in selected_markets if m not in valid_markets]
             
             if invalid_markets:
@@ -589,7 +587,7 @@ class MarketSelectorService:
         """获取市场统计信息"""
         try:
             if not selected_markets:
-                selected_markets = [m.value for m in MarketType if m != MarketType.HK]
+                selected_markets = [m.value for m in MarketType]
             
             statistics = {}
             

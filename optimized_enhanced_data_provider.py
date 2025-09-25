@@ -202,9 +202,7 @@ class OptimizedEnhancedDataProvider:
         """委托给基础提供者"""
         return self.base_provider.get_all_stock_list()
 
-    def get_ah_spot(self):
-        """委托给基础提供者"""
-        return self.base_provider.get_ah_spot()
+
 
     def set_preferred_sources(self, sources: List[str]) -> None:
         """设置首选数据源"""
