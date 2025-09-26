@@ -103,9 +103,12 @@ async def startup_event():
     if os.environ.get("SKIP_PREWARM", "0") not in ("1", "true", "True"):
         async def _prewarm_stock_picks():
             try:
-                logger.info("[startup] 开始后台预热 /api/stock-picks 缓存 (limit_symbols=500, top_n=10)")
-                # 直接调用同步方法，避免异步调用问题
-                result = selector_service.get_stock_picks(top_n=10)
+                # 预热时使用与智能选股API相同的默认参数，确保缓存命中
+                limit_symbols = 500  # 与API默认参数一致
+                top_n = 60  # 与API默认参数一致
+                logger.info(f"[startup] 开始后台预热 /api/stock-picks 缓存 (limit_symbols={limit_symbols}, top_n={top_n})")
+                # 调用异步的get_stock_picks方法，使用与API相同的参数
+                result = await get_stock_picks(top_n=top_n, limit_symbols=limit_symbols)
                 logger.info(f"[startup] 预热完成，结果: {len(result.get('data', {}).get('picks', [])) if result.get('success') else '失败'}")
             except Exception as e:
                 logger.warning(f"[startup] 预热失败: {e}")
@@ -1034,4 +1037,11 @@ async def check_data_freshness(markets: str = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8003)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0", 
+        port=8003,
+        reload=False,
+        workers=1,
+        log_level="info"
+    )

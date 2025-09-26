@@ -278,33 +278,75 @@ class IntelligentStockSelector:
         
         all_features = []
         
-        for symbol in symbols:
-            try:
-                # 获取价格数据（尽量多取一些，生成更多稳定特征）
-                prices = self.db.get_last_n_bars([symbol], n=180)
-                if prices.empty or len(prices) < 20:
-                    logger.warning(f"股票 {symbol} 历史数据不足（少于20条记录）")
+        # 批量获取所有股票的历史数据，减少数据库查询次数
+        try:
+            # 分批处理，避免一次性查询过多数据
+            batch_size = 50
+            for i in range(0, len(symbols), batch_size):
+                batch_symbols = symbols[i:i+batch_size]
+                logger.info(f"批量获取股票历史数据: {i+1}-{min(i+batch_size, len(symbols))}/{len(symbols)}")
+                
+                # 批量获取价格数据
+                all_prices = self.db.get_last_n_bars(batch_symbols, n=180)
+                if all_prices.empty:
+                    logger.warning(f"批量 {batch_symbols} 历史数据为空")
                     continue
                 
-                # 仅保留该股票并按时间排序
-                prices = prices[prices['symbol'] == symbol].copy()
-                prices = prices.sort_values('date')
-                
-                # 使用FeatureGenerator计算完整特征集（支持大小写列名）
-                factor_dict = self.feature_generator.calculate_factor_features(prices)
-                if not factor_dict:
+                # 按股票分组处理
+                for symbol in batch_symbols:
+                    try:
+                        # 提取该股票的数据
+                        prices = all_prices[all_prices['symbol'] == symbol].copy()
+                        if prices.empty or len(prices) < 20:
+                            logger.debug(f"股票 {symbol} 历史数据不足（少于20条记录）")
+                            continue
+                        
+                        # 按时间排序
+                        prices = prices.sort_values('date')
+                        
+                        # 使用FeatureGenerator计算完整特征集（支持大小写列名）
+                        factor_dict = self.feature_generator.calculate_factor_features(prices)
+                        if not factor_dict:
+                            continue
+                        factor_dict['symbol'] = symbol
+                        all_features.append(pd.Series(factor_dict))
+                        
+                    except Exception as e:
+                        logger.error(f"处理股票 {symbol} 时出错: {e}")
+                        continue
+                        
+        except Exception as e:
+            logger.error(f"批量获取特征数据失败: {e}")
+            # 回退到逐个处理
+            for symbol in symbols:
+                try:
+                    # 获取价格数据（尽量多取一些，生成更多稳定特征）
+                    prices = self.db.get_last_n_bars([symbol], n=180)
+                    if prices.empty or len(prices) < 20:
+                        logger.warning(f"股票 {symbol} 历史数据不足（少于20条记录）")
+                        continue
+                    
+                    # 仅保留该股票并按时间排序
+                    prices = prices[prices['symbol'] == symbol].copy()
+                    prices = prices.sort_values('date')
+                    
+                    # 使用FeatureGenerator计算完整特征集（支持大小写列名）
+                    factor_dict = self.feature_generator.calculate_factor_features(prices)
+                    if not factor_dict:
+                        continue
+                    factor_dict['symbol'] = symbol
+                    all_features.append(pd.Series(factor_dict))
+                    
+                except Exception as e:
+                    logger.error(f"处理股票 {symbol} 时出错: {e}")
                     continue
-                factor_dict['symbol'] = symbol
-                all_features.append(pd.Series(factor_dict))
-                
-            except Exception as e:
-                logger.error(f"处理股票 {symbol} 时出错: {e}")
-                continue
         
         if all_features:
             result = pd.DataFrame(all_features)
+            logger.info(f"特征获取完成，共处理 {len(result)} 只股票")
             return result
         else:
+            logger.warning("特征获取结果为空")
             return pd.DataFrame()
     
     def predict_stocks(self, symbols: List[str], top_n: int = 10) -> List[Dict[str, Any]]:

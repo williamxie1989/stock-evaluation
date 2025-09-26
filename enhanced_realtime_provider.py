@@ -96,6 +96,7 @@ class EnhancedRealtimeProvider:
                 return cached_data
         
         # 多数据源尝试
+        successful_results = []
         for source in self.data_sources:
             for attempt in range(self.max_retries):
                 try:
@@ -114,6 +115,15 @@ class EnhancedRealtimeProvider:
                         delay = self.retry_delay * (2 ** attempt) * (0.8 + 0.4 * random.random())
                         time.sleep(delay)
                         
+                except requests.exceptions.ConnectionError as e:
+                    self.logger.warning(f"数据源 {source['name']} 连接失败 (尝试 {attempt + 1}): {e}")
+                    # 连接错误，立即尝试下一个数据源
+                    break
+                except requests.exceptions.Timeout as e:
+                    self.logger.warning(f"数据源 {source['name']} 请求超时 (尝试 {attempt + 1}): {e}")
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (2 ** attempt) * (0.8 + 0.4 * random.random())
+                        time.sleep(delay)
                 except Exception as e:
                     self.logger.warning(f"数据源 {source['name']} 获取 {symbol} 实时行情失败 (尝试 {attempt + 1}): {e}")
                     
@@ -121,8 +131,9 @@ class EnhancedRealtimeProvider:
                         delay = self.retry_delay * (2 ** attempt) * (0.8 + 0.4 * random.random())
                         time.sleep(delay)
         
-        self.logger.error(f"所有数据源均无法获取 {symbol} 实时行情")
-        return None
+        # 如果所有数据源都失败，尝试使用备用方案
+        self.logger.warning(f"所有数据源均无法获取 {symbol} 实时行情，尝试备用方案")
+        return self._get_fallback_realtime_quote(symbol)
     
     def _get_akshare_ah_spot(self, symbol: str) -> Optional[Dict[str, Any]]:
         """使用AkShare获取A股实时行情"""
@@ -580,6 +591,74 @@ class EnhancedRealtimeProvider:
         self.data_sources = new_order
         self.logger.info(f"数据源优先级已更新: {[s['name'] for s in self.data_sources]}")
     
+    def _get_fallback_realtime_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        备用方案：当所有数据源都失败时，使用备用方法获取实时行情
+        
+        Args:
+            symbol: 股票代码
+            
+        Returns:
+            实时行情数据字典，或None如果备用方案也失败
+        """
+        try:
+            self.logger.info(f"尝试备用方案获取 {symbol} 实时行情")
+            
+            # 方案1：尝试使用AkShare的备用接口
+            try:
+                # 使用AkShare的备用实时行情接口
+                if symbol.endswith('.SZ'):
+                    code = symbol.replace('.SZ', '')
+                    df = ak.stock_zh_a_spot()
+                    if df is not None and not df.empty:
+                        match = df[df['代码'] == code]
+                        if not match.empty:
+                            row = match.iloc[0]
+                            return {
+                                'price': float(row['最新价']) if row['最新价'] != '' else 0,
+                                'change': float(row['涨跌额']) if row['涨跌额'] != '' else 0,
+                                'change_pct': float(row['涨跌幅']) if row['涨跌幅'] != '' else 0,
+                                'volume': float(row['成交量']) if row['成交量'] != '' else 0,
+                                'timestamp': datetime.now().isoformat(),
+                                'source': 'akshare_fallback'
+                            }
+            except Exception as e:
+                self.logger.warning(f"备用方案1 (AkShare备用接口) 失败: {e}")
+            
+            # 方案2：尝试使用本地数据库中的最新价格
+            try:
+                from db import DatabaseManager
+                db_manager = DatabaseManager()
+                latest_bars = db_manager.get_last_n_bars([symbol], n=1)
+                if not latest_bars.empty:
+                    latest_row = latest_bars.iloc[0]
+                    return {
+                        'price': float(latest_row['close']),
+                        'change': 0,  # 无法获取实时涨跌
+                        'change_pct': 0,  # 无法获取实时涨跌幅
+                        'volume': 0,  # 无法获取实时成交量
+                        'timestamp': datetime.now().isoformat(),
+                        'source': 'database_fallback',
+                        'note': '使用数据库最新价格作为备用'
+                    }
+            except Exception as e:
+                self.logger.warning(f"备用方案2 (数据库备用) 失败: {e}")
+            
+            # 方案3：返回一个基本的实时行情结构，但标记为备用
+            self.logger.warning(f"所有备用方案均失败，返回基础实时行情结构")
+            return {
+                'price': 0,
+                'change': 0,
+                'change_pct': 0,
+                'volume': 0,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'fallback',
+                'note': '实时行情获取失败，使用备用结构'
+            }
+            
+        except Exception as e:
+            self.logger.error(f"备用方案执行异常: {e}")
+            return None
 
 
 # 全局实例
