@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股票预测系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .prediction-form {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            border: 2px solid #e9ecef;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #495057;
+        }
+        
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+        }
+        
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .results {
+            display: none;
+            margin-top: 30px;
+        }
+        
+        .result-card {
+            background: white;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            transition: transform 0.3s ease;
+        }
+        
+        .result-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #f8f9fa;
+        }
+        
+        .stock-symbol {
+            font-size: 1.5em;
+            font-weight: 700;
+            color: #2c3e50;
+        }
+        
+        .prediction-date {
+            color: #6c757d;
+            font-size: 0.9em;
+        }
+        
+        .prediction-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        
+        .prediction-item {
+            text-align: center;
+            padding: 20px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        }
+        
+        .prediction-item.regression {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            color: white;
+        }
+        
+        .prediction-item.classification {
+            background: linear-gradient(135deg, #007bff 0%, #6610f2 100%);
+            color: white;
+        }
+        
+        .prediction-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .prediction-value {
+            font-size: 2em;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+        
+        .prediction-detail {
+            font-size: 0.8em;
+            opacity: 0.8;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            display: none;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #f5c6cb;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .success {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #c3e6cb;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .feature-info {
+            background: #e3f2fd;
+            color: #1565c0;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #bbdefb;
+            margin-top: 15px;
+            font-size: 0.9em;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+            
+            .header {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+            
+            .prediction-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 智能股票预测系统</h1>
+            <p>基于机器学习的股票价格预测与趋势分析</p>
+        </div>
+        
+        <div class="content">
+            <div class="prediction-form">
+                <h2 style="margin-bottom: 20px; color: #2c3e50;">📊 股票预测</h2>
+                
+                <div class="form-group">
+                    <label for="symbol">股票代码</label>
+                    <input type="text" id="symbol" placeholder="例如: 000001.SZ, 000002.SZ" value="000001.SZ">
+                </div>
+                
+                <div class="form-group">
+                    <label for="days">历史数据天数</label>
+                    <select id="days">
+                        <option value="30">30天</option>
+                        <option value="60">60天</option>
+                        <option value="90" selected>90天</option>
+                        <option value="120">120天</option>
+                        <option value="180">180天</option>
+                    </select>
+                </div>
+                
+                <button class="btn" onclick="predictStock()">🔮 开始预测</button>
+            </div>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>正在分析股票数据，请稍候...</p>
+            </div>
+            
+            <div class="error" id="error"></div>
+            <div class="success" id="success"></div>
+            
+            <div class="results" id="results">
+                <div class="result-card">
+                    <div class="result-header">
+                        <div class="stock-symbol" id="result-symbol"></div>
+                        <div class="prediction-date" id="result-date"></div>
+                    </div>
+                    
+                    <div class="prediction-grid">
+                        <div class="prediction-item regression">
+                            <div class="prediction-label">预期收益率</div>
+                            <div class="prediction-value" id="regression-prediction"></div>
+                            <div class="prediction-detail">未来5个交易日</div>
+                        </div>
+                        
+                        <div class="prediction-item classification">
+                            <div class="prediction-label">上涨概率</div>
+                            <div class="prediction-value" id="classification-probability"></div>
+                            <div class="prediction-detail">模型置信度</div>
+                        </div>
+                    </div>
+                    
+                    <div class="feature-info" id="feature-info"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function predictStock() {
+            const symbol = document.getElementById('symbol').value.trim();
+            const days = document.getElementById('days').value;
+            
+            if (!symbol) {
+                showError('请输入股票代码');
+                return;
+            }
+            
+            // 显示加载状态
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('success').style.display = 'none';
+            
+            try {
+                // 调用Python后端进行预测
+                const response = await fetch('/api/predict', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        symbol: symbol,
+                        days_back: parseInt(days)
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`预测失败: ${response.statusText}`);
+                }
+                
+                const result = await response.json();
+                
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+                
+                displayResults(result);
+                
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+        
+        function displayResults(result) {
+            document.getElementById('result-symbol').textContent = result.symbol;
+            document.getElementById('result-date').textContent = `预测日期: ${result.data_date}`;
+            
+            // 显示回归预测结果
+            if (result.predictions.regression) {
+                const regression = result.predictions.regression;
+                const percentage = (regression.latest_prediction * 100).toFixed(2);
+                document.getElementById('regression-prediction').textContent = `${percentage}%`;
+            }
+            
+            // 显示分类预测结果
+            if (result.predictions.classification) {
+                const classification = result.predictions.classification;
+                const probability = (classification.probability * 100).toFixed(1);
+                document.getElementById('classification-probability').textContent = `${probability}%`;
+            }
+            
+            // 显示特征信息
+            document.getElementById('feature-info').innerHTML = 
+                `📈 特征分析: 使用了 ${result.features_shape[1]} 个技术指标进行预测，基于 ${result.features_shape[0]} 个历史数据点`;
+            
+            document.getElementById('results').style.display = 'block';
+            document.getElementById('success').textContent = '预测完成！';
+            document.getElementById('success').style.display = 'block';
+        }
+        
+        function showError(message) {
+            document.getElementById('error').textContent = message;
+            document.getElementById('error').style.display = 'block';
+        }
+        
+        // 页面加载时自动预测默认股票
+        window.addEventListener('load', function() {
+            setTimeout(() => predictStock(), 1000);
+        });
+        
+        // 回车键触发预测
+        document.getElementById('symbol').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                predictStock();
+            }
+        });
+    </script>
+</body>
+</html>

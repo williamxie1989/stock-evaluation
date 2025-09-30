@@ -10,9 +10,12 @@ import struct
 from dotenv import load_dotenv
 from typing import Dict, List, Any
 from akshare_data_provider import AkshareDataProvider
+from enhanced_realtime_provider import EnhancedRealtimeProvider
 from signal_generator import SignalGenerator
 from backtest_engine import BacktestEngine
 from risk_management import RiskManager
+from advanced_signal_generator import AdvancedSignalGenerator, Signal
+from adaptive_trading_system import AdaptiveTradingSystem, MarketRegime
 import logging
 import re
 
@@ -33,6 +36,9 @@ class StockAnalyzer:
         
         # 初始化akshare数据提供者
         self.akshare_provider = AkshareDataProvider()
+        
+        # 初始化增强版实时行情数据提供器
+        self.realtime_provider = EnhancedRealtimeProvider()
         
         # 初始化信号生成器、回测引擎和风险管理器
         self.signal_generator = SignalGenerator()
@@ -621,10 +627,18 @@ class StockAnalyzer:
     
     def _serialize_signal(self, signal):
         """将交易信号转换为可序列化的字典"""
+        # 安全处理价格值，防止NaN或无穷大导致JSON序列化错误
+        price = signal['price']
+        if pd.isna(price) or np.isinf(price):
+            # 如果价格是NaN或无穷大，使用0作为默认值
+            safe_price = 0.0
+        else:
+            safe_price = float(price)
+        
         return {
             'date': signal['date'].strftime('%Y-%m-%d'),
             'type': signal['type'],
-            'price': float(signal['price']),
+            'price': safe_price,
             'reason': signal['reason']
         }
     
@@ -895,9 +909,8 @@ class StockAnalyzer:
                 code = stock_symbol.replace('.SZ', '')
                 file_path = f"data/sz/lday/sz{code}.day"
             elif stock_symbol.endswith('.BJ'):
-                # 北京证券交易所
-                code = stock_symbol.replace('.BJ', '')
-                file_path = f"data/bj/lday/bj{code}.day"
+                # 北京证券交易所（BJ股票已移除，返回None）
+                return None
             else:
                 # 默认尝试上海
                 file_path = f"data/sh/lday/sh{stock_symbol}.day"
@@ -955,13 +968,31 @@ class StockAnalyzer:
                 except:
                     pass  # 忽略yfinance错误，继续使用已有数据
             
+            # 获取实时行情数据
+            realtime_quote = None
+            try:
+                print(f"尝试获取 {stock_symbol} 实时行情数据")
+                realtime_quote = self.realtime_provider.get_realtime_quote(stock_symbol)
+                if realtime_quote:
+                    print(f"成功获取实时行情数据: {realtime_quote}")
+                else:
+                    print(f"获取实时行情数据失败")
+            except Exception as e:
+                print(f"获取实时行情数据异常: {e}")
+            
             # 计算技术指标
             technical_data = self.calculate_technical_indicators(df)
             print("技术指标计算完成")
             
-            # 生成交易信号
-            signals = self.generate_trading_signals(technical_data)
-            print(f"生成交易信号，信号数量: {len(signals)}")
+            # 安全处理浮点数值，防止NaN/无穷大值
+            def safe_float(value):
+                if pd.isna(value) or np.isinf(value):
+                    return 0.0
+                return float(value)
+            
+            # 生成交易信号（使用优化后的高级信号生成器）
+            signals = self.generate_advanced_signals(technical_data)
+            print(f"生成高级交易信号，信号数量: {len(signals)}")
             
             # AI分析（重新启用AI分析，但信号提取功能保持禁用）
             ai_analysis = self.analyze_with_ai(technical_data, market_data, stock_info, signals)
@@ -977,11 +1008,12 @@ class StockAnalyzer:
                 'technical_data': self._serialize_dataframe(technical_data.tail(10)),
                 'signals': [self._serialize_signal(signal) for signal in signals[-10:]],  # 最近10个信号
                 'ai_analysis': ai_analysis,
-                'latest_price': float(technical_data['Close'].iloc[-1]) if len(technical_data) > 0 else 0,
+                'latest_price': safe_float(technical_data['Close'].iloc[-1]) if len(technical_data) > 0 else 0,
                 'data_source': 'akshare' if 'akshare' in str(type(self.akshare_provider)) else ('tdx_file' if data_result.get('data_source') == 'tdx_file' else ('free_api' if len(df) <= 1 else 'yfinance')),
                 'backtest': backtest_result,
                 'risk_report': self.get_risk_report(technical_data, signals),
-                'chart_data': self._generate_chart_data(technical_data, backtest=backtest_result)
+                'chart_data': self._generate_chart_data(technical_data, backtest=backtest_result),
+                'realtime_quote': realtime_quote  # 添加实时行情数据
             }
             
             # 确保交易信号正确传递到最终结果中
@@ -1071,7 +1103,7 @@ class StockAnalyzer:
             # 构造前端需要的报告格式
             report = {
                 "risk_level": risk_assessment['risk_level'],
-                "risk_score": risk_assessment['risk_score'] * 10,  # 转换为10分制
+                "risk_score": risk_assessment['risk_score'] * 100,  # 转换为百分比显示（0-100）
                 "position_size": risk_assessment['suggested_position_pct'],
                 "stop_loss": stop_loss_price,
                 "take_profit": take_profit_price,
@@ -1098,19 +1130,25 @@ class StockAnalyzer:
             return {"kline": [], "indicators": {}, "signals": []}
         
         try:
-            # 获取最近60天的数据用于图表显示
-            chart_data = technical_data.tail(60).copy()
+            # 使用所有可用数据生成图表，不再限制为60天
+            chart_data = technical_data.copy()
             
             # 准备K线数据
             kline_data = []
             for idx, row in chart_data.iterrows():
+                # 安全处理浮点数值，防止NaN/无穷大值
+                def safe_float(value):
+                    if pd.isna(value) or np.isinf(value):
+                        return 0.0
+                    return float(value)
+                
                 kline_data.append({
                     'date': idx.strftime('%Y-%m-%d'),
-                    'open': float(row['Open']),
-                    'high': float(row['High']),
-                    'low': float(row['Low']),
-                    'close': float(row['Close']),
-                    'volume': float(row['Volume'])
+                    'open': safe_float(row['Open']),
+                    'high': safe_float(row['High']),
+                    'low': safe_float(row['Low']),
+                    'close': safe_float(row['Close']),
+                    'volume': safe_float(row['Volume'])
                 })
             
             # 准备技术指标数据
@@ -1118,40 +1156,40 @@ class StockAnalyzer:
             
             # 移动平均线
             if 'MA5' in chart_data.columns:
-                indicators['ma5'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MA5'])} 
+                indicators['ma5'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MA5'])} 
                                    for idx, row in chart_data.iterrows() if not pd.isna(row['MA5'])]
             if 'MA10' in chart_data.columns:
-                indicators['ma10'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MA10'])} 
+                indicators['ma10'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MA10'])} 
                                     for idx, row in chart_data.iterrows() if not pd.isna(row['MA10'])]
             if 'MA20' in chart_data.columns:
-                indicators['ma20'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MA20'])} 
+                indicators['ma20'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MA20'])} 
                                     for idx, row in chart_data.iterrows() if not pd.isna(row['MA20'])]
             
             # MACD
             if 'MACD' in chart_data.columns:
-                indicators['macd'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MACD'])} 
+                indicators['macd'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MACD'])} 
                                    for idx, row in chart_data.iterrows() if not pd.isna(row['MACD'])]
             if 'MACD_Signal' in chart_data.columns:
-                indicators['macd_signal'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MACD_Signal'])} 
+                indicators['macd_signal'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MACD_Signal'])} 
                                            for idx, row in chart_data.iterrows() if not pd.isna(row['MACD_Signal'])]
             if 'MACD_Hist' in chart_data.columns:
-                indicators['macd_hist'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['MACD_Hist'])} 
+                indicators['macd_hist'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['MACD_Hist'])} 
                                           for idx, row in chart_data.iterrows() if not pd.isna(row['MACD_Hist'])]
             
             # RSI
             if 'RSI' in chart_data.columns:
-                indicators['rsi'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['RSI'])} 
+                indicators['rsi'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['RSI'])} 
                                    for idx, row in chart_data.iterrows() if not pd.isna(row['RSI'])]
             
             # 布林带
             if 'BB_Upper' in chart_data.columns:
-                indicators['bb_upper'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['BB_Upper'])} 
+                indicators['bb_upper'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['BB_Upper'])} 
                                         for idx, row in chart_data.iterrows() if not pd.isna(row['BB_Upper'])]
             if 'BB_Middle' in chart_data.columns:
-                indicators['bb_middle'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['BB_Middle'])} 
+                indicators['bb_middle'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['BB_Middle'])} 
                                          for idx, row in chart_data.iterrows() if not pd.isna(row['BB_Middle'])]
             if 'BB_Lower' in chart_data.columns:
-                indicators['bb_lower'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': float(row['BB_Lower'])} 
+                indicators['bb_lower'] = [{'date': idx.strftime('%Y-%m-%d'), 'value': safe_float(row['BB_Lower'])} 
                                         for idx, row in chart_data.iterrows() if not pd.isna(row['BB_Lower'])]
             
             # 交易信号
@@ -1163,7 +1201,7 @@ class StockAnalyzer:
                         signals_data.append({
                             'date': signal['date'].strftime('%Y-%m-%d'),
                             'type': signal['type'],
-                            'price': float(signal['price']),
+                            'price': safe_float(signal['price']),
                             'reason': signal.get('reason', '')
                         })
                 except Exception as e:
@@ -1210,7 +1248,7 @@ class StockAnalyzer:
                         port_resampled = port_resampled.fillna(method='bfill').fillna(0.0)
 
                         for d, v in port_resampled.items():
-                            portfolio_series.append({'date': d.strftime('%Y-%m-%d'), 'value': float(v)})
+                            portfolio_series.append({'date': d.strftime('%Y-%m-%d'), 'value': safe_float(v)})
 
                     # 交易标记：仅保留在当前图表时间窗（chart_data）内的标记，避免图上显示过多无关点
                     chart_dates = {idx.strftime('%Y-%m-%d') for idx in chart_data.index}
@@ -1237,7 +1275,7 @@ class StockAnalyzer:
                             trade_markers.append({
                                 'date': date_str,
                                 'type': trade_type,
-                                'price': float(trade_price) if trade_price is not None else None
+                                'price': safe_float(trade_price) if trade_price is not None else None
                             })
             except Exception as e:
                 print(f"叠加回测数据到图表时出错: {e}")
@@ -1254,19 +1292,230 @@ class StockAnalyzer:
             print(f"生成K线图数据失败: {str(e)}")
             return {"kline": [], "indicators": {}, "signals": []}
 
+    def generate_advanced_signals(self, df):
+        """生成高级交易信号（使用优化后的信号生成器）"""
+        try:
+            # 创建高级信号生成器实例
+            advanced_generator = AdvancedSignalGenerator()
+            
+            # 生成高级信号
+            advanced_signals = advanced_generator.generate_signals(df)
+            
+            # 转换为与现有系统兼容的格式，并处理NaN/无穷大值
+            compatible_signals = []
+            for signal in advanced_signals:
+                # 安全处理浮点数值
+                def safe_float(value):
+                    if pd.isna(value) or np.isinf(value):
+                        return 0.0
+                    return float(value)
+                
+                compatible_signals.append({
+                    'date': signal.date,
+                    'type': signal.type,
+                    'price': safe_float(signal.price),
+                    'reason': signal.reason,
+                    'confidence': safe_float(signal.confidence),
+                    'stop_loss': safe_float(signal.stop_loss) if signal.stop_loss is not None else None,
+                    'take_profit': safe_float(signal.take_profit) if signal.take_profit is not None else None
+                })
+            
+            return compatible_signals
+            
+        except Exception as e:
+            print(f"高级信号生成失败: {str(e)}")
+            # 失败时回退到传统信号生成
+            return self.generate_trading_signals(df)
+
+    def analyze_with_adaptive_system(self, stock_symbol, portfolio_value=100000):
+        """使用自适应交易系统分析股票"""
+        try:
+            print(f"使用自适应交易系统分析股票: {stock_symbol}")
+            
+            # 获取股票数据
+            data_result = self.akshare_provider.get_stock_data(stock_symbol)
+            if data_result is None:
+                data_result = self.get_free_stock_data(stock_symbol)
+            
+            df = data_result['stock_data']
+            stock_info = data_result['stock_info']
+            
+            # 计算技术指标
+            technical_data = self.calculate_technical_indicators(df)
+            
+            # 生成高级信号
+            advanced_signals = self.generate_advanced_signals(technical_data)
+            
+            # 创建自适应交易系统实例
+            adaptive_system = AdaptiveTradingSystem()
+            
+            # 分析市场环境
+            market_regime = adaptive_system.analyze_market_regime(technical_data)
+            
+            # 获取最新信号
+            latest_signal = advanced_signals[-1] if advanced_signals else None
+            
+            # 生成交易决策
+            if latest_signal:
+                # 将字典信号转换为Signal对象
+                signal_obj = Signal(
+                    date=pd.Timestamp.now(),
+                    type=latest_signal.get('type', 'HOLD'),
+                    price=latest_signal.get('price', technical_data['Close'].iloc[-1]),
+                    reason=latest_signal.get('reason', '无信号'),
+                    confidence=latest_signal.get('confidence', 0.5),
+                    factor='adaptive_system'
+                )
+                decision = adaptive_system.generate_trading_decision(signal_obj, technical_data)
+            else:
+                # 创建默认HOLD信号
+                hold_signal = Signal(
+                    date=pd.Timestamp.now(),
+                    type='HOLD',
+                    price=technical_data['Close'].iloc[-1],
+                    reason='无交易信号',
+                    confidence=0.5,
+                    factor='adaptive_system'
+                )
+                decision = adaptive_system.generate_trading_decision(hold_signal, technical_data)
+            
+            # 构建结果
+            result = {
+                'success': True,
+                'stock_info': stock_info,
+                'market_regime': market_regime.value,
+                'advanced_signals': [self._serialize_signal(signal) for signal in advanced_signals[-10:]],
+                'trading_decision': {
+                    'action': decision.action,
+                    'position_size': decision.position_size,
+                    'stop_loss': decision.stop_loss,
+                    'take_profit': decision.take_profit,
+                    'confidence': decision.confidence,
+                    'reason': decision.reason
+                },
+                'risk_metrics': adaptive_system.calculate_risk_metrics(technical_data),
+                'latest_price': float(technical_data['Close'].iloc[-1]) if len(technical_data) > 0 else 0
+            }
+            
+            print("自适应交易系统分析完成")
+            return result
+            
+        except Exception as e:
+            print(f"自适应交易系统分析失败: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    def compare_signal_generators(self, stock_symbol):
+        """比较传统信号生成器和高级信号生成器的效果"""
+        try:
+            print(f"比较信号生成器效果: {stock_symbol}")
+            
+            # 获取股票数据
+            data_result = self.akshare_provider.get_stock_data(stock_symbol)
+            if data_result is None:
+                data_result = self.get_free_stock_data(stock_symbol)
+            
+            df = data_result['stock_data']
+            
+            # 计算技术指标
+            technical_data = self.calculate_technical_indicators(df)
+            
+            # 生成传统信号
+            traditional_signals = self.generate_trading_signals(technical_data)
+            
+            # 生成高级信号
+            advanced_signals = self.generate_advanced_signals(technical_data)
+            
+            # 运行回测比较
+            traditional_backtest = self.run_backtest(technical_data, traditional_signals)
+            advanced_backtest = self.run_backtest(technical_data, advanced_signals)
+            
+            # 比较结果
+            comparison = {
+                'traditional': {
+                    'signal_count': len(traditional_signals),
+                    'performance': traditional_backtest.get('performance_metrics', {}),
+                    'latest_signals': [self._serialize_signal(signal) for signal in traditional_signals[-5:]]
+                },
+                'advanced': {
+                    'signal_count': len(advanced_signals),
+                    'performance': advanced_backtest.get('performance_metrics', {}),
+                    'latest_signals': [self._serialize_signal(signal) for signal in advanced_signals[-5:]]
+                },
+                'improvement': {
+                    'signal_quality': len(advanced_signals) / max(len(traditional_signals), 1),
+                    'return_improvement': (
+                        advanced_backtest.get('performance_metrics', {}).get('total_return', 0) - 
+                        traditional_backtest.get('performance_metrics', {}).get('total_return', 0)
+                    )
+                }
+            }
+            
+            print("信号生成器比较完成")
+            return comparison
+            
+        except Exception as e:
+            print(f"信号生成器比较失败: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
 # 示例使用
 if __name__ == "__main__":
     import sys
-    stock_code = sys.argv[1] if len(sys.argv) > 1 else "TEST.STOCK"
+    stock_code = sys.argv[1] if len(sys.argv) > 1 else "000001.SZ"
     analyzer = StockAnalyzer()
-    result = analyzer.analyze_stock(stock_code)
     
-    # 如果分析成功，打印完整的AI分析报告
-    if result.get('success', False):
-        ai_analysis = result.get('ai_analysis', '')
+    # 测试传统分析
+    print("=== 传统股票分析 ===")
+    traditional_result = analyzer.analyze_stock(stock_code)
+    
+    if traditional_result.get('success', False):
+        ai_analysis = traditional_result.get('ai_analysis', '')
         if isinstance(ai_analysis, str):
             print(ai_analysis)
         else:
-            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+            print("传统分析完成")
     else:
-        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        print(f"传统分析失败: {traditional_result.get('error', '未知错误')}")
+    
+    # 测试自适应交易系统
+    print("\n=== 自适应交易系统分析 ===")
+    adaptive_result = analyzer.analyze_with_adaptive_system(stock_code)
+    
+    if adaptive_result.get('success', False):
+        print(f"市场环境: {adaptive_result.get('market_regime', '未知')}")
+        decision = adaptive_result.get('trading_decision', {})
+        print(f"交易决策: {decision.get('action', '未知')}")
+        print(f"仓位大小: {decision.get('position_size', 0):.2f}%")
+        print(f"止损价格: {decision.get('stop_loss', 0):.2f}")
+        print(f"止盈价格: {decision.get('take_profit', 0):.2f}")
+        print(f"置信度: {decision.get('confidence', 0):.2f}")
+        print(f"理由: {decision.get('reason', '无')}")
+    else:
+        print(f"自适应分析失败: {adaptive_result.get('error', '未知错误')}")
+    
+    # 比较信号生成器效果
+    print("\n=== 信号生成器比较 ===")
+    comparison_result = analyzer.compare_signal_generators(stock_code)
+    
+    if comparison_result.get('success', False):
+        traditional = comparison_result.get('traditional', {})
+        advanced = comparison_result.get('advanced', {})
+        improvement = comparison_result.get('improvement', {})
+        
+        print(f"传统信号数量: {traditional.get('signal_count', 0)}")
+        print(f"高级信号数量: {advanced.get('signal_count', 0)}")
+        print(f"信号质量提升: {improvement.get('signal_quality', 0):.2f}x")
+        print(f"收益提升: {improvement.get('return_improvement', 0):.2f}%")
+        
+        traditional_perf = traditional.get('performance', {})
+        advanced_perf = advanced.get('performance', {})
+        
+        print(f"传统系统总收益: {traditional_perf.get('total_return', 0):.2f}%")
+        print(f"高级系统总收益: {advanced_perf.get('total_return', 0):.2f}%")
+    else:
+        print(f"比较失败: {comparison_result.get('error', '未知错误')}")

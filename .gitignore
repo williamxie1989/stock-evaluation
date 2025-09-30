@@ -1,1 +1,124 @@
+# 环境配置文件
 .env
+.env.local
+.env.production
+.env.staging
+
+# Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+stock_data.db
+stock_data.sqlite3
+stocks.db
+
+# 日志文件
+*.log
+logs/
+*.log.*
+
+# 模型文件（可选择性忽略）
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.model
+
+# 缓存和临时文件
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# 数据文件（根据需要调整）
+hsjday/
+*.csv
+*.xlsx
+*.json
+/archive/
+*.txt
+!README.txt
+
+# Chrome驱动
+chromedriver/
+*.zip
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# 系统文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 特定目录
+hsjday/
+archive/run_outputs/
+
+# 测试文件（根据需要调整）
+test_*.py
+*_test.py
+tests/
+
+# 报告文件
+*_report_*.txt
+*_report_*.csv
+optimization_demo_report.txt
+
+# 临时和调试文件
+debug_*.py
+simple_*.py
+analyze_*.py
+check_*.py
+fix_*.py
+import_*.py
+comprehensive_*.py
+detailed_*.py
+stock_data.db
