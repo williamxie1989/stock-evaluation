@@ -76,11 +76,11 @@ coverage.xml
 .hypothesis/
 
 # 数据文件（根据需要调整）
-data/
+hsjday/
 *.csv
 *.xlsx
 *.json
-archive/run_outputs/
+/archive/
 *.txt
 !README.txt
 
