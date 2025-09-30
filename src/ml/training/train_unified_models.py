@@ -41,15 +41,23 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("lightgbm").setLevel(logging.ERROR)
+logging.getLogger("sklearn").setLevel(logging.WARNING)
 
 class UnifiedModelTrainer:
     """统一模型训练器，支持分类和回归任务"""
     
-    def __init__(self):
+    def __init__(self, enable_feature_selection: bool = True):
+        """初始化统一模型训练器
+        Args:
+            enable_feature_selection: 是否在数据预处理阶段启用特征选择优化器
+        """
         # 使用现有的统一数据访问层
         self.data_access = create_unified_data_access()
         self.db_manager = self.data_access.db_manager
         self.feature_generator = EnhancedFeatureGenerator()
+        # 新增: 特征选择开关
+        self.enable_feature_selection = enable_feature_selection
     
     def prepare_training_data(self, stock_list: List[str] = None, mode: str = 'both', lookback_days: int = 365, 
                             n_stocks: int = 1000, prediction_period: int = 30) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
@@ -73,7 +81,9 @@ class UnifiedModelTrainer:
         if stock_list is None or stock_list.empty:
             raise ValueError("无法获取股票列表")
         
-        symbols = stock_list['symbol'].tolist() if 'symbol' in stock_list.columns else stock_list['code'].tolist()
+        if 'symbol' not in stock_list.columns:
+            raise ValueError("股票列表缺少 'symbol' 列，请检查数据访问层是否已生成标准化代码")
+        symbols = stock_list['symbol'].tolist()
         logger.info(f"获取到 {len(symbols)} 只股票，使用前 {n_stocks} 只")
         
         # 设置日期范围
@@ -260,7 +270,12 @@ class UnifiedModelTrainer:
         
         # 标准化特征名称
         X_final.columns = [f'feature_{i}' for i in range(X_final.shape[1])]
-        
+
+        # 如果关闭特征选择，直接返回
+        if not getattr(self, 'enable_feature_selection', True):
+            logger.info("已关闭特征选择优化，直接返回清洗后的全部特征")
+            return X_final, y_reg_final, y_cls_final
+
         # 特征选择优化
         logger.info("开始特征选择优化...")
         try:
@@ -484,7 +499,8 @@ class UnifiedModelTrainer:
                                    use_grid_search: bool = 1,
                                    use_optuna: bool = False, optimization_trials: int = 50) -> Dict[str, Any]:
         """训练分类模型（多线程版本）"""
-        trainer = EnhancedMLTrainer(model_dir="models")  # 修改为保存到根目录
+        # 初始化增强版训练器（用于训练单个分类模型）
+        trainer = EnhancedMLTrainer(model_dir="models")
         results = {}
         
         # 分类模型类型（精简版：选择表现最好的两个）
@@ -710,13 +726,16 @@ class UnifiedModelTrainer:
         if model_type == 'lightgbm':
             try:
                 from lightgbm import LGBMRegressor
-                regressor = LGBMRegressor(objective='huber', random_state=42, n_jobs=-1)
+                # 设置 verbosity=-1 以关闭 LightGBM 冗余警告（如 "No further splits with positive gain"）
+                regressor = LGBMRegressor(objective='huber', random_state=42, n_jobs=-1, verbosity=-1)
                 param_grid = {
                     'regressor__n_estimators': [100, 300],
                     'regressor__learning_rate': [0.03, 0.1],
                     'regressor__max_depth': [-1, 6, 10],
                     'regressor__subsample': [0.8, 1.0],
-                    'regressor__colsample_bytree': [0.8, 1.0]
+                    'regressor__colsample_bytree': [0.8, 1.0],
+                    # 始终保持静默
+                    'regressor__verbosity': [-1]
                 }
             except ImportError:
                 logger.error("LightGBM未安装，跳过LightGBM训练")
@@ -764,7 +783,7 @@ class UnifiedModelTrainer:
                     'model_type': model_type,
                     'best_params': {},
                     'cv_score': None,
-                    'feature_names': X.columns.tolist(),
+                    'feature_names': X.columns.tolist() if hasattr(X, 'columns') else [],
                     'feature_importance': {},
                     'metrics': {
                         'train_mse': 0,
@@ -984,14 +1003,18 @@ def main():
     parser.add_argument("--no_grid_search", action="store_true", help="禁用网格搜索以加快速度")
     parser.add_argument("--use_optuna", action="store_true", help="使用Optuna进行超参数优化（优先级高于网格搜索）")
     parser.add_argument("--optimization_trials", type=int, default=50, help="Optuna/Bayesian优化时的迭代次数 (默认50)")
+    # 新增: 关闭特征选择开关
+    parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
     args = parser.parse_args()
 
     logger.info("=== 开始统一模型训练流程 ===")
     logger.info(f"参数: lookback={args.lookback}, n_stocks={args.n_stocks}, prediction_period={args.prediction_period}, mode={args.mode}, grid_search={'off' if args.no_grid_search else 'on'}")
 
     try:
-        trainer = UnifiedModelTrainer()
-        
+        trainer = UnifiedModelTrainer(enable_feature_selection=(not args.disable_feature_selection))
+        if args.disable_feature_selection:
+            logger.info("已通过命令行开关关闭特征选择优化")
+            
         # 准备训练数据（同时生成分类和回归标签）
         X, y = trainer.prepare_training_data(mode=args.mode, lookback_days=args.lookback, n_stocks=args.n_stocks, prediction_period=args.prediction_period)
         
