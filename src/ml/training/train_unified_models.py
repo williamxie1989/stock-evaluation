@@ -283,9 +283,8 @@ class UnifiedModelTrainer:
         logger.info(f"收益率均值: {y_reg_final.mean():.6f}, 标准差: {y_reg_final.std():.6f}")
         logger.info(f"正样本比例: {y_cls_final.mean():.3f}")
         
-        # 标准化特征名称
-        X_final.columns = [f'feature_{i}' for i in range(X_final.shape[1])]
-
+        # 保留可读特征名，避免预测阶段列名不一致问题
+        
         # 如果关闭特征选择，直接返回
         if not getattr(self, 'enable_feature_selection', True):
             logger.info("已关闭特征选择优化，直接返回清洗后的全部特征")
@@ -429,7 +428,7 @@ class UnifiedModelTrainer:
             if use_optuna:
                 try:
                     import optuna
-                    from sklearn.model_selection import train_test_split, KFold, cross_val_score, GridSearchCV
+                    from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score, GridSearchCV
                     from sklearn.preprocessing import StandardScaler
                     from sklearn.pipeline import Pipeline
                     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -438,7 +437,12 @@ class UnifiedModelTrainer:
                     if model_type == 'xgboost':
                         try:
                             from xgboost import XGBClassifier
-                            classifier = XGBClassifier(random_state=42, n_jobs=-1, eval_metric='logloss')
+                            # 计算类别不平衡比并动态设置 scale_pos_weight
+                            pos_cnt = int((y == 1).sum())
+                            neg_cnt = int((y == 0).sum())
+                            scale_pos_weight = (neg_cnt / pos_cnt) if pos_cnt > 0 else 1.0
+                            classifier = XGBClassifier(random_state=42, n_jobs=-1, eval_metric='logloss',
+                                                           scale_pos_weight=scale_pos_weight)
                         except ImportError:
                             logger.warning("XGBoost 未安装, 回退使用 trainer 默认实现")
                             raise ImportError
@@ -448,10 +452,12 @@ class UnifiedModelTrainer:
                                 'classifier__max_depth': trial.suggest_int('classifier__max_depth', 3, 10),
                                 'classifier__learning_rate': trial.suggest_float('classifier__learning_rate', 0.01, 0.3, log=True),
                                 'classifier__subsample': trial.suggest_float('classifier__subsample', 0.6, 1.0),
-                                'classifier__colsample_bytree': trial.suggest_float('classifier__colsample_bytree', 0.6, 1.0)
+                                'classifier__colsample_bytree': trial.suggest_float('classifier__colsample_bytree', 0.6, 1.0),
+                                'classifier__reg_lambda': trial.suggest_float('classifier__reg_lambda', 0.0, 5.0),
+                                'classifier__reg_alpha': trial.suggest_float('classifier__reg_alpha', 0.0, 5.0)
                             }
                             pipe.set_params(**trial_params)
-                            cv = KFold(n_splits=3, shuffle=True, random_state=42)
+                            cv = TimeSeriesSplit(n_splits=3)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
                             return 1 - scores.mean()  # minimize
                     elif model_type == 'logistic':
@@ -462,7 +468,7 @@ class UnifiedModelTrainer:
                                 'classifier__penalty': trial.suggest_categorical('classifier__penalty', ['l1', 'l2'])
                             }
                             pipe.set_params(**trial_params)
-                            cv = KFold(n_splits=3, shuffle=True, random_state=42)
+                            cv = TimeSeriesSplit(n_splits=3)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
                             return 1 - scores.mean()
                     else:
@@ -480,22 +486,53 @@ class UnifiedModelTrainer:
                     logger.info(f"Optuna完成: 最佳参数 {best_params}")
 
                     pipe.set_params(**best_params)
-                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                    pipe.fit(X_train, y_train)
+                    # 基于时间序列切分再次交叉验证并记录各折指标
+                    cv = TimeSeriesSplit(n_splits=3)
+                    cv_scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
+
+                    # 留出法评估
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+                    # 若为 XGBoost 则启用早停，监控验证集 logloss/AUC
+                    fit_params = {}
+                    if model_type == 'xgboost':
+                        eval_set = [(X_train, y_train), (X_test, y_test)]
+                        fit_params = {
+                            'classifier__eval_set': eval_set,
+                            'classifier__eval_metric': ['logloss', 'auc'],
+                            'classifier__early_stopping_rounds': 50,
+                            'classifier__verbose': False
+                        }
+                    pipe.fit(X_train, y_train, **fit_params)
                     y_train_pred = pipe.predict(X_train)
                     y_test_pred = pipe.predict(X_test)
+
+                    # 如果是 XGBoost，记录验证集最佳迭代及 logloss
+                    extra_metrics = {}
+                    if model_type == 'xgboost':
+                        booster = pipe.named_steps['classifier']
+                        if hasattr(booster, 'best_iteration'):
+                            extra_metrics['best_iteration'] = int(booster.best_iteration)
+                        if booster.evals_result_ and 'validation_0' in booster.evals_result_:
+                            logloss_list = booster.evals_result_['validation_0'].get('logloss', [])
+                            if logloss_list:
+                                extra_metrics['val_logloss'] = float(min(logloss_list))
 
                     result = {
                         'model': pipe,
                         'model_type': model_type,
                         'best_params': best_params,
-                        'metrics': {
+                        # 交叉验证指标后续持久化在 metrics 目录下的 CSV
+                        
+                    'metrics': {
                             'train_accuracy': accuracy_score(y_train, y_train_pred),
                             'test_accuracy': accuracy_score(y_test, y_test_pred),
                             'test_precision': precision_score(y_test, y_test_pred, zero_division=0),
                             'test_recall': recall_score(y_test, y_test_pred, zero_division=0),
-                            'test_f1': f1_score(y_test, y_test_pred, zero_division=0)
-                        }
+                            'test_f1': f1_score(y_test, y_test_pred, zero_division=0),
+                            'cv_scores': cv_scores.tolist(),
+                            'cv_mean': float(cv_scores.mean()),
+                            **extra_metrics,
+                        },
                     }
                 except ImportError:
                     # 回退至原 trainer 逻辑
@@ -508,10 +545,21 @@ class UnifiedModelTrainer:
                                               optimization_trials=optimization_trials)
             
             # 保存模型（与回归模型保持一致，只保存模型对象本身）
+            # 获取特征列顺序，确保保存
+            feature_names = list(X.columns) if hasattr(X, 'columns') else None
+            save_obj = {
+                'model': result['model'],
+                'feature_names': feature_names,
+                'metadata': {
+                    'task': 'classification',
+                    'model_type': model_type,
+                    'feature_config': getattr(self.feature_generator, 'feature_config', None)
+                }
+            }
             model_name = f"{model_type}_classification.pkl"
             model_path = os.path.join('models', model_name)
             with open(model_path, 'wb') as f:
-                pickle.dump(result['model'], f)
+                pickle.dump(save_obj, f)
             logger.info(f"{model_type} 分类模型已保存到: {model_path}")
             
             # 记录性能指标
@@ -523,6 +571,22 @@ class UnifiedModelTrainer:
                 test_recall = metrics.get('test_recall', 0)
                 test_f1 = metrics.get('test_f1', 0)
                 logger.info(f"{model_type} 分类模型性能: 训练准确率={train_acc:.4f}, 测试准确率={test_acc:.4f}, 精确率={test_precision:.4f}, 召回率={test_recall:.4f}, F1={test_f1:.4f}")
+                # ---- 持久化交叉验证各折指标到 CSV ----
+                try:
+                    import os, csv
+                    metrics_dir = 'metrics'
+                    os.makedirs(metrics_dir, exist_ok=True)
+                    csv_path = os.path.join(metrics_dir, f"{model_type}_classification_cv_scores.csv")
+                    cv_scores = metrics.get('cv_scores') if isinstance(metrics, dict) else None
+                    if cv_scores is not None:
+                        with open(csv_path, 'w', newline='') as f_csv:
+                            writer = csv.writer(f_csv)
+                            writer.writerow(['fold', 'accuracy'])
+                            for idx, score in enumerate(cv_scores, start=1):
+                                writer.writerow([idx, score])
+                        logger.info(f"交叉验证指标已保存到: {csv_path}")
+                except Exception as err:
+                    logger.warning(f"保存交叉验证指标失败: {err}")
 
             # 记录最佳得分（如果有）
             if 'best_score' in result:
@@ -583,9 +647,19 @@ class UnifiedModelTrainer:
                 result = self._train_tree_regression_model(X, y, model_type, use_grid_search, use_optuna, optimization_trials)
             
             # 保存模型
+            feature_names = list(X.columns) if hasattr(X, 'columns') else None
+            save_obj = {
+                'model': result['model'],
+                'feature_names': feature_names,
+                'metadata': {
+                    'task': 'regression',
+                    'model_type': model_type,
+                    'feature_config': getattr(self.feature_generator, 'feature_config', None)
+                }
+            }
             model_name = f"{model_type}_regression.pkl"
             with open(os.path.join('models', model_name), 'wb') as f:
-                pickle.dump(result['model'], f)
+                pickle.dump(save_obj, f)
             logger.info(f"{model_type} 回归模型已保存到: models/{model_name}")
             
             # 记录性能指标
@@ -847,7 +921,7 @@ class UnifiedModelTrainer:
         if use_optuna:
             try:
                 import optuna
-                from sklearn.model_selection import KFold, cross_val_score
+                from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
                 def objective(trial):
                     trial_params = {}
@@ -874,98 +948,54 @@ class UnifiedModelTrainer:
                             'regressor__min_samples_leaf': trial.suggest_int('regressor__min_samples_leaf', 1, 5)
                         }
                     elif model_type == 'xgboost':
+                        # XGBoost 回归器搜索空间
                         trial_params = {
-                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 400),
+                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 300),
                             'regressor__max_depth': trial.suggest_int('regressor__max_depth', 3, 10),
                             'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
                             'regressor__subsample': trial.suggest_float('regressor__subsample', 0.6, 1.0),
                             'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.6, 1.0)
                         }
-                    else:
-                        raise ValueError("不支持的模型类型")
+                        
+                    y_train_pred = pipe.predict(X_train)
+                    y_test_pred = pipe.predict(X_test)
+                    
+                    # 如果是 XGBoost，记录验证集最佳迭代及 logloss
+                    extra_metrics = {}
+                    if model_type == 'xgboost':
+                        booster = pipe.named_steps['classifier']
+                        if hasattr(booster, 'best_iteration'):
+                            extra_metrics['best_iteration'] = int(booster.best_iteration)
+                        if booster.evals_result_ and 'validation_0' in booster.evals_result_:
+                            logloss_list = booster.evals_result_['validation_0'].get('logloss', [])
+                            if logloss_list:
+                                extra_metrics['val_logloss'] = float(min(logloss_list))
 
-                    pipeline.set_params(**trial_params)
-                    cv = KFold(n_splits=3, shuffle=True, random_state=42)
-                    scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='neg_mean_squared_error', n_jobs=-1)
-                    return -scores.mean()
-
-                study = optuna.create_study(direction='minimize')
-                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
-                best_params = study.best_params
-                best_score = -study.best_value
-                logger.info(f"Optuna优化完成: 最佳参数 {best_params}, 最佳得分 {best_score:.4f}")
-
-                # 使用最佳参数训练
-                pipeline.set_params(**best_params)
+                    result = {
+                        'model': pipe,
+                        'model_type': model_type,
+                        'best_params': best_params,
+                        'metrics': {
+                            'train_mse': train_mse,
+                            'test_mse': test_mse,
+                            'train_mae': train_mae,
+                            'test_mae': test_mae,
+                            'train_r2': train_r2,
+                            'test_r2': test_r2
+                        },
+                        'predictions': {
+                            'X_test': X_test,
+                            'y_test': y_test,
+                            'y_test_pred': y_test_pred
+                        }
+                    }
+                    
+                    logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+                    logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
+                    
+                    return result
             except ImportError:
-                logger.warning("Optuna 未安装, 回退使用 GridSearchCV")
-                use_grid_search = True  # fallback
-        
-        if use_grid_search and not use_optuna:
-            # 网格搜索优化
-            grid_search = GridSearchCV(
-                pipeline, param_grid, cv=3, scoring='neg_mean_squared_error', n_jobs=-1
-            )
-            grid_search.fit(X_train, y_train)
-
-            best_params = grid_search.best_params_
-            best_score = -grid_search.best_score_
-
-            logger.info(f"网格搜索完成: 最佳参数 {best_params}, 最佳得分 {best_score:.4f}")
-
-            # 使用最佳参数重新训练
-            pipeline.set_params(**best_params)
-        
-        pipeline.fit(X_train, y_train)
-        
-        # 预测
-        y_train_pred = pipeline.predict(X_train)
-        y_test_pred = pipeline.predict(X_test)
-        
-        # 计算评估指标
-        train_mse = mean_squared_error(y_train, y_train_pred)
-        test_mse = mean_squared_error(y_test, y_test_pred)
-        train_mae = mean_absolute_error(y_train, y_train_pred)
-        test_mae = mean_absolute_error(y_test, y_test_pred)
-        train_r2 = r2_score(y_train, y_train_pred)
-        test_r2 = r2_score(y_test, y_test_pred)
-        
-        # 获取特征重要性
-        feature_importance = {}
-        if hasattr(pipeline.named_steps['regressor'], 'feature_importances_'):
-            importances = pipeline.named_steps['regressor'].feature_importances_
-            feature_names = X.columns.tolist()
-            for i, importance in enumerate(importances):
-                if i < len(feature_names):
-                    feature_importance[feature_names[i]] = float(importance)
-        
-        # 构建结果
-        result = {
-            'model': pipeline,
-            'model_type': model_type,
-            'best_params': best_params if use_grid_search else {},
-            'cv_score': best_score if use_grid_search else None,
-            'feature_names': X.columns.tolist(),
-            'feature_importance': feature_importance,
-            'metrics': {
-                'train_mse': train_mse,
-                'test_mse': test_mse,
-                'train_mae': train_mae,
-                'test_mae': test_mae,
-                'train_r2': train_r2,
-                'test_r2': test_r2
-            },
-            'predictions': {
-                'X_test': X_test,
-                'y_test': y_test,
-                'y_test_pred': y_test_pred
-            }
-        }
-        
-        logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
-        logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
-        
-        return result
+                logger.error("Optuna未安装，跳过Optuna搜索")
 
     def _empty_regression_result(self, model_type: str, X: pd.DataFrame):
         """当缺少依赖时返回占位结果"""
