@@ -643,6 +643,9 @@ class IntelligentStockSelector:
                 if recent_volume > 0:
                     data_quality_factor += 5
                 recent_bars = self.db.get_last_n_bars([symbol], n=5)
+                # 统一 recent_bars 数值列类型，避免 Decimal 与 float 运算冲突
+                if not recent_bars.empty and 'close' in recent_bars.columns:
+                    recent_bars['close'] = pd.to_numeric(recent_bars['close'], errors='coerce').astype(float)
                 if len(recent_bars) >= 5:
                     price_stability = 1 / (recent_bars['close'].std() / recent_bars['close'].mean() + 0.01)
                     data_quality_factor += min(10, price_stability * 2)
@@ -808,6 +811,12 @@ class IntelligentStockSelector:
                         'close': 'Close',
                         'volume': 'Volume'
                     })
+                    # 确保数值列为 float，避免 Decimal 类型导致运算错误
+                    numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    prices[numeric_cols] = prices[numeric_cols].apply(pd.to_numeric, errors='coerce').astype(float)
+                    # 确保数值列为 float，避免 Decimal 类型导致运算错误
+                    numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    prices[numeric_cols] = prices[numeric_cols].apply(pd.to_numeric, errors='coerce').astype(float)
                     
                     if len(prices) >= 10:
                         # 使用SignalGenerator计算factors
