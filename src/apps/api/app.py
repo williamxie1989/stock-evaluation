@@ -319,79 +319,16 @@ async def refresh_data(max_symbols: int = 50, full: bool = 0, batch_size: int = 
             # max_symbols=0 表示处理所有股票，不做限制
             pass
 
-        # 3) 获取已有最新日期，计算增量开始时间
-        latest_map = {} if full else _db.get_latest_dates_by_symbol()
-
-        # 4) 增量拉取并写入日线（批量处理）
-        import asyncio
-        total_rows = 0
-        processed_count = 0
-        
-        # 分批处理股票，防止API限流
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i:i + batch_size]
-            print(f"处理批次 {i//batch_size + 1}/{(len(symbols) + batch_size - 1)//batch_size}，包含 {len(batch_symbols)} 只股票")
-            
-            for symbol in batch_symbols:
-                market = 'A'
-                code_digits = re.sub(r"\D", "", symbol.split('.')[0]).zfill(6)
-                start_date = None
-                if not full and latest_map.get(symbol):
-                    try:
-                        latest_date = pd.to_datetime(latest_map[symbol], errors="coerce")
-                        if not pd.isnull(latest_date):
-                            start_date = (latest_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                        else:
-                            start_date = None
-                    except Exception as e:
-                        logger.warning(f"解析最新日期失败: {e}")
-                        start_date = None
-                df_hist = await _unified_data_access.get_historical_data(symbol=code_digits, start_date=start_date, end_date=datetime.now().strftime('%Y-%m-%d'))  # type: pd.DataFrame
-                if df_hist is not None and not df_hist.empty:
-                    df_hist = df_hist.copy()
-                    df_hist['symbol'] = symbol
-                    total_rows += _db.upsert_prices_daily(df_hist, source='akshare_ah_daily')
-                processed_count += 1
-                print(f"已处理 {processed_count}/{len(symbols)} 只股票: {symbol}")
-            
-            # 批次间延时，防止API限流
-            if i + batch_size < len(symbols):  # 不是最后一批
-                print(f"批次完成，等待 {delay_seconds} 秒...")
-                await asyncio.sleep(delay_seconds)
-
-        # 5) 实时行情快照 - 已移除启动时批量获取，避免性能问题和API限制
-        quotes_rows = []
-        
-        # 注释掉启动时的实时行情批量获取，改为按需获取
-        # # 使用增强版实时行情提供器获取A股实时行情
-        # # 获取所有A股代码列表
-        # all_stocks = _unified_data_access.get_all_stock_list()
-        # 
-        # if all_stocks is not None and not all_stocks.empty:
-        #     # 使用批量获取功能，提高效率
-        #     symbols = all_stocks['symbol'].tolist()
-        #     
-        #     # 批量获取实时行情
-        #     batch_quotes = _realtime_provider.get_batch_realtime_quotes(symbols)
-        #     
-        #     for symbol, quote in batch_quotes.items():
-        #         try:
-        #             if quote and 'price' in quote:
-        #                 quotes_rows.append({
-        #                     'symbol': symbol,
-        #                     'price': float(quote['price']),
-        #                     'change_pct': quote.get('change_pct'),
-        #                     'volume': quote.get('volume')
-        #                 })
-        #         except Exception as e:
-        #             logger.warning(f"处理股票 {symbol} 实时行情失败: {e}")
-        # 
-        # if quotes_rows:
-        #     _db.insert_quotes_realtime(pd.DataFrame(quotes_rows), source='enhanced_realtime_provider')
-        # else:
-        #     logger.warning("实时行情快照获取失败，未获取到有效数据")
-
-        return {"success": 1, "data": {"symbols": len(symbols), "inserted_daily_rows": total_rows, "quotes_rows": 0}}
+        # 3）委托给 sync_market_data_optimized 处理增量/全量同步，避免重复代码
+        request_params = {
+            "symbols": symbols,
+            "batch_size": batch_size,
+            "delay_seconds": delay_seconds,
+            "step_days": 15,
+        }
+        # full 情况下不限制 trade_date，由 sync_market_data_optimized 内部策略决定
+        result = await sync_market_data_optimized(request_params)
+        return result
     except Exception as e:
         return {"success": 0, "error": str(e)}
 
@@ -654,6 +591,24 @@ async def sync_market_data_optimized(request: dict = None):
                     step_days=step_days,
                     batch_size=batch_size
                 )
+                # 日期批量同步后，检查仍落后于昨日的股票并补漏
+                try:
+                    latest_map_raw = _db.get_latest_dates_by_symbol()
+                    latest_map = {sym: pd.to_datetime(dt_str, errors="coerce").normalize()
+                                  for sym, dt_str in latest_map_raw.items() if pd.notnull(pd.to_datetime(dt_str, errors="coerce"))}
+                    target_syms = symbols or list(latest_map.keys())
+                    symbols_pending = [s for s in target_syms if (latest_map.get(s) or pd.Timestamp("1970-01-01")) < pd.to_datetime(yesterday)]
+                    if symbols_pending:
+                        inc_stats = await _unified_data_access.sync_market_data(
+                            symbols=symbols_pending,
+                            batch_size=batch_size,
+                            delay=delay_seconds
+                        )
+                        # 合并统计
+                        stats["synced"] = stats.get("synced", 0) + inc_stats.get("synced", 0)
+                        stats["errors"] = stats.get("errors", 0) + inc_stats.get("errors", 0)
+                except Exception as gap_err:
+                    logger.warning(f"批量同步后补漏失败: {gap_err}")
             except Exception as date_sync_err:
                 logger.warning(f"按日期批量同步失败，回退逐股票增量同步: {date_sync_err}")
                 stats = await _unified_data_access.sync_market_data(
