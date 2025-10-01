@@ -602,6 +602,8 @@ async def sync_market_data_optimized(request: dict = None):
     """
     try:
         global _unified_data_access
+        import time  # 新增用于耗时统计
+        start_ts = time.time()
         if request is None:
             request = {}
         symbols = request.get('symbols')
@@ -659,7 +661,20 @@ async def sync_market_data_optimized(request: dict = None):
                     batch_size=batch_size,
                     delay=delay_seconds
                 )
-        return {"success": 1, "data": stats}
+        # 组装统计信息供前端展示
+        total_ops = stats.get("synced", 0) + stats.get("errors", 0)
+        statistics = {
+            "success_rate": round(stats.get("synced", 0) / total_ops, 4) if total_ops else 0,
+            "elapsed_time": round(time.time() - start_ts, 2),
+            "avg_time_per_stock": round((time.time() - start_ts) / stats.get("synced", 1), 2) if stats.get("synced", 0) else None,
+        }
+        # 采集源相关统计(如果后台返回则透传，否则默认0)
+        source_statistics = {
+            "total_retries": stats.get("total_retries", 0),
+            "circuit_breaker_triggers": stats.get("circuit_breaker_triggers", 0),
+        }
+
+        return {"success": 1, "data": stats, "statistics": statistics, "source_statistics": source_statistics}
     except Exception as e:
         logger.error(f"优化同步失败: {e}")
         return {"success": 0, "error": str(e)}
