@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import joblib
 import os
+# 新增 json 导入
+import json
 from sklearn.calibration import CalibratedClassifierCV
 from ...data.db.unified_database_manager import UnifiedDatabaseManager
 from .features import FeatureGenerator
@@ -20,6 +22,7 @@ from ...services.stock.stock_status_filter import StockStatusFilter
 # 引入字段映射工具，统一字段名
 from src.data.field_mapping import FieldMapper
 import logging
+import re
 
 # 导入增强预处理pipeline
 from src.ml.features.enhanced_preprocessing import EnhancedPreprocessingPipeline, create_enhanced_preprocessing_config
@@ -31,6 +34,55 @@ class IntelligentStockSelector:
     """
     智能选股服务
     """
+    
+    # 新增: 工具方法 – 统一替换匿名特征名，避免多处重复实现
+    def _replace_anonymous_feature_names(self, model, actual_column_names):
+        """如果模型的 feature_names_in_ 为匿名的 feature_0、feature_1 等，占位名字，则使用实际列名替换。
+        参数:
+            model: 任何带有 feature_names_in_ 属性的 sklearn/XGBoost 模型或 Pipeline
+            actual_column_names: list[str] – 真实的特征列名称，顺序与训练/预测一致
+        """
+        try:
+            # 如果是Pipeline, 递归处理其最后一个Estimator，并同步Pipeline本身
+            try:
+                from sklearn.pipeline import Pipeline
+                if isinstance(model, Pipeline):
+                    inner_est = model.steps[-1][1]
+                    self._replace_anonymous_feature_names(inner_est, actual_column_names)
+                    model.feature_names_in_ = np.array(actual_column_names)
+                    return
+            except Exception:
+                pass
+
+            # 针对 xgboost 模型的特殊处理，需要同时更新 booster 的 feature_names
+            try:
+                import xgboost as xgb  # 延迟导入，避免安装缺失时报错
+                if isinstance(model, xgb.XGBModel):
+                    model.feature_names_in_ = np.array(actual_column_names)
+                    booster = model.get_booster()
+                    booster.feature_names = actual_column_names
+                    return
+            except Exception:
+                pass  # 不是 xgboost 模型或导入失败
+
+            # 其他 sklearn 模型逻辑
+            if not hasattr(model, "feature_names_in_"):
+                # 若模型完全没有该属性，则直接赋值
+                model.feature_names_in_ = np.array(actual_column_names)
+                return
+
+            # 对已有属性进行检查/覆盖
+            feature_names = list(getattr(model, "feature_names_in_", []))
+            if not feature_names or len(feature_names) != len(actual_column_names):
+                model.feature_names_in_ = np.array(actual_column_names)
+                return
+
+            # 如果长度一致但存在匿名占位或者与当前列不一致，也覆盖
+            anonymous = all(re.match(r"^feature_\d+$", str(fn)) for fn in feature_names)
+            if anonymous or feature_names != actual_column_names:
+                model.feature_names_in_ = np.array(actual_column_names)
+        except Exception as e:
+            logger.debug(f"替换匿名特征名失败: {e}")
     
     def __init__(self, db_manager: UnifiedDatabaseManager = None, use_enhanced_features: bool = 1, 
                  use_enhanced_preprocessing: bool = 1, preprocessing_complexity: str = 'medium'):
@@ -214,27 +266,77 @@ class IntelligentStockSelector:
                 # 优先从字典中获取特征名称，如果是Pipeline对象则从feature_names_in_属性获取
                 if isinstance(self.cls_model_data, dict):
                     self.cls_feature_names = self.cls_model_data.get('feature_names') or []
+                    # 若仍为空，尝试从内部model获取
+                    if (not self.cls_feature_names) and isinstance(self.cls_model_data.get('model'), object):
+                        inner_model = self.cls_model_data.get('model')
+                        if hasattr(inner_model, 'feature_names_in_'):
+                            self.cls_feature_names = list(inner_model.feature_names_in_)
                 else:
                     # 对于Pipeline对象，尝试获取feature_names_in_属性
                     if hasattr(self.cls_model_data, 'feature_names_in_'):
                         self.cls_feature_names = self.cls_model_data.feature_names_in_.tolist()
                     else:
                         self.cls_feature_names = []
-                logger.info(f"已加载分类模型: {selected_model} 特征数={len(self.cls_feature_names)}")
+                # 如果仍然无法获取特征名，尝试从feature_cache注入
+                if not self.cls_feature_names or all(str(n).startswith('feature_') for n in self.cls_feature_names):
+                    feature_cache_file = os.path.join('feature_cache', 'selected_features.json')
+                    try:
+                        if os.path.exists(feature_cache_file):
+                            with open(feature_cache_file, 'r') as fc:
+                                cache_names = json.load(fc)
+                            # 仅当特征数量一致或当前为空时才替换，防止错误映射
+                            if len(cache_names) == len(self.cls_feature_names) or not self.cls_feature_names:
+                                self.cls_feature_names = cache_names
+                                logger.info(f"分类模型特征名已从缓存注入，共 {len(self.cls_feature_names)} 个特征")
+                        else:
+                            logger.debug("分类模型特征缓存文件不存在")
+                    except Exception as e:
+                        logger.debug(f"注入分类模型特征名失败: {e}")
+                # 同步更新模型对象的 feature_names_in_ 属性，避免预测时特征不匹配
+                try:
+                    target_model = self.cls_model_data.get('model') if isinstance(self.cls_model_data, dict) else self.cls_model_data
+                    if target_model is not None and self.cls_feature_names:
+                        target_model.feature_names_in_ = np.array(self.cls_feature_names)
+                except Exception as up_err:
+                    logger.debug(f"更新分类模型 feature_names_in_ 失败: {up_err}")
             else:
                 logger.warning("未找到30d分类模型")
             if reg_candidates:
                 self.reg_model_data = reg_candidates[-1][1]
-                # 优先从字典中获取特征名称，如果是Pipeline对象则从feature_names_in_属性获取
+                # 优先从字典或内部模型获取特征名称
                 if isinstance(self.reg_model_data, dict):
                     self.reg_feature_names = self.reg_model_data.get('feature_names') or []
+                    if (not self.reg_feature_names) and isinstance(self.reg_model_data.get('model'), object):
+                        inner_model_r = self.reg_model_data.get('model')
+                        if hasattr(inner_model_r, 'feature_names_in_'):
+                            self.reg_feature_names = list(inner_model_r.feature_names_in_)
                 else:
-                    # 对于Pipeline对象，尝试获取feature_names_in_属性
                     if hasattr(self.reg_model_data, 'feature_names_in_'):
                         self.reg_feature_names = self.reg_model_data.feature_names_in_.tolist()
                     else:
                         self.reg_feature_names = []
-                logger.info(f"已加载回归模型: {reg_candidates[-1][0]} 特征数={len(self.reg_feature_names)}")
+
+                # 如果仍然无法获取特征名，尝试从feature_cache注入
+                if not self.reg_feature_names or all(str(n).startswith('feature_') for n in self.reg_feature_names):
+                    feature_cache_file = os.path.join('feature_cache', 'selected_features.json')
+                    try:
+                        if os.path.exists(feature_cache_file):
+                            with open(feature_cache_file, 'r') as fc:
+                                cache_names = json.load(fc)
+                            if len(cache_names) == len(self.reg_feature_names) or not self.reg_feature_names:
+                                self.reg_feature_names = cache_names
+                                logger.info(f"回归模型特征名已从缓存注入，共 {len(self.reg_feature_names)} 个特征")
+                        else:
+                            logger.debug("回归模型特征缓存文件不存在")
+                    except Exception as e:
+                        logger.debug(f"注入回归模型特征名失败: {e}")
+                # 同步更新模型对象的 feature_names_in_ 属性，避免预测时特征不匹配
+                try:
+                    target_model_r = self.reg_model_data.get('model') if isinstance(self.reg_model_data, dict) else self.reg_model_data
+                    if target_model_r is not None and self.reg_feature_names:
+                        target_model_r.feature_names_in_ = np.array(self.reg_feature_names)
+                except Exception as up_err:
+                    logger.debug(f"更新回归模型 feature_names_in_ 失败: {up_err}")
             else:
                 logger.warning("未找到30d回归模型")
             return bool(self.cls_model_data or self.reg_model_data)
@@ -377,7 +479,16 @@ class IntelligentStockSelector:
             logger.warning("无法获取特征数据")
             return []
             
-        # -------- 统一特征数值列类型，避免 decimal.Decimal 与 float 运算问题 --------
+        # -------- 统一特征列名称大小写及数值类型，避免不一致导致特征缺失 --------
+        try:
+            # 将所有非symbol列名统一为小写，方便与模型训练阶段保持一致
+            new_cols = []
+            for c in features_df.columns:
+                new_cols.append(c if c == 'symbol' else c.lower())
+            features_df.columns = new_cols
+        except Exception as e:
+            logger.debug(f"特征列名统一失败: {e}")
+
         try:
             for col in features_df.columns:
                 if col == 'symbol':
@@ -406,10 +517,25 @@ class IntelligentStockSelector:
                     # 仅选择数值列
                     expected_features = [c for c in candidate_cols if np.issubdtype(Xc[c].dtype, np.number)]
                 
+                # 如果expected_features在特征表中缺失严重，尝试回退到交集或全部数值特征
+                available = [c for c in expected_features if c in Xc.columns]
+                if len(available) <= max(3, len(expected_features)*0.3):
+                    logger.warning(f"分类模型所需特征缺失严重({len(available)}/{len(expected_features)}), 回退到数值特征全集")
+                    available = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
+                # 确保所有期望特征均存在于特征矩阵中，不存在的填充0
                 for col in expected_features:
                     if col not in Xc.columns:
                         Xc[col] = 0
                 Xc = Xc[expected_features].fillna(0)
+                # 若整体方差为0，说明全部为常数列，再回退为所有数值特征
+                if np.isclose(Xc.var().sum(), 0):
+                    logger.error("分类特征矩阵方差为0，回退到原始数值特征全集")
+                    Xc = features_df[[c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]].fillna(0)
+                
+                # 使用类级别工具方法替换匿名特征名（已移至类定义）
+                
+                # 在预测前动态替换模型匿名特征名
+                self._replace_anonymous_feature_names(model, list(Xc.columns))
                 
                 # 应用增强预处理pipeline
                 if self.use_enhanced_preprocessing and self.cls_preprocessor is not None:
@@ -488,15 +614,22 @@ class IntelligentStockSelector:
                     expected_features_r = [c for c in candidate_cols if np.issubdtype(Xr[c].dtype, np.number)]
                     logger.warning(f"回归模型特征名称为空，回退到使用数值型特征，数量: {len(expected_features_r)}")
                 
+                available_r = [c for c in expected_features_r if c in Xr.columns]
+                if len(available_r) <= max(3, len(expected_features_r)*0.3):
+                    logger.warning(f"回归模型所需特征缺失严重({len(available_r)}/{len(expected_features_r)}), 回退到数值特征全集")
+                    available_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
                 for col in expected_features_r:
                     if col not in Xr.columns:
                         Xr[col] = 0
                 Xr = Xr[expected_features_r].fillna(0)
+                if np.isclose(Xr.var().sum(), 0):
+                    logger.error("回归特征矩阵方差为0，回退到原始数值特征全集")
+                    Xr = features_df[[c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]].fillna(0)
                 
-                # 检查特征矩阵是否为空
-                if Xr.empty or Xr.shape[1] == 0:
-                    logger.error("回归特征矩阵为空，无法进行预测")
-                    raise ValueError("回归特征矩阵为空")
+                # 使用类级别工具方法替换匿名特征名（已移至类定义）
+                
+                # 在预测前动态替换模型匿名特征名
+                self._replace_anonymous_feature_names(model_r, list(Xr.columns))
                 
                 # 应用增强预处理pipeline
                 if self.use_enhanced_preprocessing and self.reg_preprocessor is not None:
@@ -620,7 +753,7 @@ class IntelligentStockSelector:
                 r = 0.0
             if not np.isfinite(r):
                 r = 0.0
-            # 百分比单位纠偏：若预测在50%~500%之间，按百分数转小数；>500%视为异常，退回小幅估计
+            # 百分比单位ncorrect：若预测在50%~500%之间，按百分数转小数；>500%视为异常，退回小幅估计
             if abs(r) > 5:
                 # 极端异常，使用基于概率的小幅估计
                 r = (prob - 0.5) * 0.1
