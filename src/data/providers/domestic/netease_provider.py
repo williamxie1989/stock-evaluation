@@ -8,16 +8,17 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from src.core.interfaces import DataProviderInterface
+from src.data.providers.base_provider import DataProviderBase
 
 logger = logging.getLogger(__name__)
 
 
-class NeteaseDataProvider(DataProviderInterface):
+# 继承 DataProviderBase，获得重试/代理等
+class NeteaseDataProvider(DataProviderBase, DataProviderInterface):
     """通过网易财经 CSV 接口获取数据"""
 
-    def __init__(self, timeout: int = 10):
-        self.session = requests.Session()
-        self.timeout = timeout
+    def __init__(self, timeout: int = 10, **kwargs):
+        super().__init__(timeout=timeout, **kwargs)
         logger.info("NeteaseDataProvider 初始化完成")
 
     @staticmethod

@@ -664,7 +664,6 @@ class UnifiedDataAccessLayer:
         
         # 找出缺失的日期
         missing_dates = expected_dates - existing_dates
-        
         if not missing_dates:
             return []
         
@@ -677,7 +676,6 @@ class UnifiedDataAccessLayer:
         
         current_start = sorted_missing[0]
         current_end = sorted_missing[0]
-        
         for date in sorted_missing[1:]:
             if date == current_end + timedelta(days=1):
                 current_end = date

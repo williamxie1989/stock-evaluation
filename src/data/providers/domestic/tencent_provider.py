@@ -8,16 +8,17 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from src.core.interfaces import DataProviderInterface
+from src.data.providers.base_provider import DataProviderBase
 
 logger = logging.getLogger(__name__)
 
 
-class TencentDataProvider(DataProviderInterface):
+# 继承 DataProviderBase 以获得速率限制/重试等通用能力
+class TencentDataProvider(DataProviderBase, DataProviderInterface):
     """通过腾讯证券接口获取股票数据"""
 
-    def __init__(self, timeout: int = 8):
-        self.session = requests.Session()
-        self.timeout = timeout
+    def __init__(self, timeout: int = 8, **kwargs):
+        super().__init__(timeout=timeout, **kwargs)
         logger.info("TencentDataProvider 初始化完成")
 
     @staticmethod
@@ -58,11 +59,27 @@ class TencentDataProvider(DataProviderInterface):
             if not klines:
                 logger.warning(f"Tencent no kline data for {symbol}")
                 return None
-            # 每行: [date, open, close, high, low, volume, turnover_rate, ???]
-            records = [
-                [x[0], *[float(i) for i in x[1:6]], int(x[6])]
-                for x in klines
-            ]
+            records = []
+            for x in klines:
+                try:
+                    date_str = x[0]
+                    open_p, close_p, high_p, low_p = [float(v) for v in x[1:5]]
+                    volume_raw = x[6] if len(x) > 6 else 0
+                    if isinstance(volume_raw, dict):
+                        volume_val = volume_raw.get("volume") or volume_raw.get("vol") or 0
+                    else:
+                        volume_val = volume_raw
+                    try:
+                        volume = int(float(volume_val))
+                    except (ValueError, TypeError):
+                        volume = 0
+                    records.append([date_str, open_p, close_p, high_p, low_p, volume])
+                except Exception as inner_e:
+                    logger.debug("Skip malformed kline record %s: %s", x, inner_e)
+
+            if not records:
+                logger.warning(f"Tencent parsed no records for {symbol}")
+                return None
             df = pd.DataFrame(
                 records,
                 columns=[
@@ -72,7 +89,6 @@ class TencentDataProvider(DataProviderInterface):
                     "high",
                     "low",
                     "volume",
-                    "turnover_rate",
                 ],
             )
             df["date"] = pd.to_datetime(df["date"])
