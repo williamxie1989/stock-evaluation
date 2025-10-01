@@ -4,11 +4,13 @@
 
 import logging
 import pandas as pd
+import os
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
 from dataclasses import dataclass
 import threading
+import asyncio
 
 # 使用绝对导入
 from src.data.db.unified_database_manager import UnifiedDatabaseManager
@@ -33,8 +35,24 @@ class DataAccessConfig:
     preferred_data_sources: List[str] = None
     
     def __post_init__(self):
+        # 如果没有显式传入 preferred_data_sources，则尝试读取环境变量覆盖，否则使用默认值
         if self.preferred_data_sources is None:
-            self.preferred_data_sources = ['eastmoney', 'tencent', 'optimized_enhanced', 'enhanced_realtime', 'akshare', 'netease']
+            # 尝试加载 .env 并读取环境变量
+            try:
+                from dotenv import load_dotenv  # 局部导入，避免非必要依赖
+                load_dotenv()
+            except Exception:
+                # 若未安装 python-dotenv 或加载失败，直接忽略
+                pass
+
+            env_sources = os.getenv('PREFERRED_DATA_SOURCES')
+            if env_sources:
+                # 允许用户通过逗号分隔的形式自定义优先级，例如 "sina,eastmoney,akshare"
+                self.preferred_data_sources = [s.strip() for s in env_sources.split(',') if s.strip()]
+                logger.info(f"Preferred data sources set from environment variable: {self.preferred_data_sources}")
+            else:
+                # 默认优先使用 tushare，其次为其他国内行情源
+                self.preferred_data_sources = ['tushare', 'eastmoney', 'tencent', 'sina', 'optimized_enhanced', 'enhanced_realtime', 'akshare', 'netease']
 
 
 class UnifiedDataAccessLayer:
@@ -94,6 +112,8 @@ class UnifiedDataAccessLayer:
             from src.data.providers.domestic.eastmoney_provider import EastmoneyDataProvider
             from src.data.providers.domestic.tencent_provider import TencentDataProvider
             from src.data.providers.domestic.netease_provider import NeteaseDataProvider
+            from src.data.providers.domestic.tushare_provider import TushareDataProvider
+            from src.data.providers.domestic.sina_provider import SinaDataProvider
             
             providers = {
                 'akshare': AkshareDataProvider(),
@@ -101,7 +121,9 @@ class UnifiedDataAccessLayer:
                 'optimized_enhanced': OptimizedEnhancedDataProvider(),
                 'eastmoney': EastmoneyDataProvider(),
                 'tencent': TencentDataProvider(),
-                'netease': NeteaseDataProvider()
+                'netease': NeteaseDataProvider(),
+                'tushare': TushareDataProvider(),
+                'sina': SinaDataProvider()
             }
             
             initialization_results = {}
@@ -495,6 +517,10 @@ class UnifiedDataAccessLayer:
                               batch_size: Optional[int] = None,
                               delay: Optional[float] = None) -> Dict[str, Any]:
         """
+        （已存在）按股票代码批量同步市场数据
+        """
+        
+        """
         同步市场数据
         
         Args:
@@ -654,45 +680,34 @@ class UnifiedDataAccessLayer:
     
     def _find_missing_date_ranges(self, existing_data: pd.DataFrame, 
                                   start_date: datetime, end_date: datetime) -> List[tuple]:
-        """找出缺失的日期范围"""
+        """找出缺失的日期范围，仅考虑交易日"""
         if existing_data.empty:
+            trading_days = [d for d in pd.date_range(start_date, end_date, freq='D') if self._is_trading_day(d)]
+            if not trading_days:
+                return []
             return [(start_date, end_date)]
-        
-        # 获取现有数据的日期范围
+
         existing_dates = set(existing_data.index.date)
-        expected_dates = set(pd.date_range(start_date, end_date, freq='D').date)
-        
-        # 找出缺失的日期
+        expected_dates = {d.date() for d in pd.date_range(start_date, end_date, freq='D') if self._is_trading_day(d)}
+
         missing_dates = expected_dates - existing_dates
         if not missing_dates:
             return []
-        
-        # 将缺失日期转换为范围
+
         missing_ranges = []
         sorted_missing = sorted(missing_dates)
-        
-        if not sorted_missing:
-            return []
-        
         current_start = sorted_missing[0]
         current_end = sorted_missing[0]
         for date in sorted_missing[1:]:
             if date == current_end + timedelta(days=1):
                 current_end = date
             else:
-                missing_ranges.append((
-                    datetime.combine(current_start, datetime.min.time()),
-                    datetime.combine(current_end, datetime.min.time())
-                ))
+                missing_ranges.append((datetime.combine(current_start, datetime.min.time()),
+                                        datetime.combine(current_end, datetime.min.time())))
                 current_start = date
                 current_end = date
-        
-        # 添加最后一个范围
-        missing_ranges.append((
-            datetime.combine(current_start, datetime.min.time()),
-            datetime.combine(current_end, datetime.min.time())
-        ))
-        
+        missing_ranges.append((datetime.combine(current_start, datetime.min.time()),
+                               datetime.combine(current_end, datetime.min.time())))
         return missing_ranges
     
     def _is_data_complete(self, data: pd.DataFrame, start_date: datetime, end_date: datetime) -> bool:
@@ -866,3 +881,201 @@ class UnifiedDataAccessLayer:
         except Exception as e:
             logger.error(f"Failed to initialize UnifiedDataAccessLayer: {e}")
             return False
+
+    # 中国主要节假日列表（可根据需要补充）
+    HOLIDAYS: List[str] = [
+        # 格式 YYYY-MM-DD，例如 "2024-01-01" 表示元旦
+        "2024-01-01", "2024-02-09", "2024-02-12", "2024-04-04", "2024-05-01",
+        "2024-10-01", "2024-10-02", "2024-10-03"
+    ]
+
+    @staticmethod
+    def _is_trading_day(date_obj: Union[datetime, pd.Timestamp, datetime.date]) -> bool:
+        """判断是否为交易日：周一至周五且不在 HOLIDAYS 列表。"""
+        if isinstance(date_obj, datetime):
+            date_obj = date_obj.date()
+        elif isinstance(date_obj, pd.Timestamp):
+            date_obj = date_obj.date()
+        return date_obj.weekday() < 5 and date_obj.strftime('%Y-%m-%d') not in UnifiedDataAccessLayer.HOLIDAYS
+
+    @staticmethod
+    def _previous_trading_day(date_obj: datetime) -> datetime:
+        """获取前一个交易日（包括当天往前找）。"""
+        delta = timedelta(days=0)
+        while True:
+            candidate = (date_obj - delta).date()
+            if UnifiedDataAccessLayer._is_trading_day(candidate):
+                return datetime.combine(candidate, datetime.min.time())
+            delta += timedelta(days=1)
+
+    async def sync_market_data_by_date(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        step_days: int = 90,
+        delay: float = 0.2,
+        max_retries: int = 2,
+        rollback_on_failure: bool = True,
+    ) -> Dict[str, int]:
+        """按日期范围递归同步市场数据，带重试与失败回退逻辑。
+
+        Args:
+            symbol: 股票代码。
+            start_date: 起始日期（包含）。
+            end_date: 结束日期（包含）。
+            step_days: 每批最大天数，避免单次请求过大。
+            delay: 每批同步完后的异步等待时间，避免频繁访问数据源。
+            max_retries: 单批次最大重试次数。
+            rollback_on_failure: 若批次重试失败，是否回滚删除已写入的区间数据。
+
+        Returns:
+            包含成功同步条数与错误次数的统计字典。
+        """
+        synced, errors = 0, 0
+
+        async def _rollback_range(s_date: datetime, e_date: datetime):
+            """按需删除指定区间内已写入的数据，用于失败回退。"""
+            try:
+                table = "prices_daily"
+                if self.db_manager.db_type == "mysql":
+                    query = f"DELETE FROM {table} WHERE symbol=%s AND date BETWEEN %s AND %s"
+                    params = (symbol, s_date.date(), e_date.date())
+                else:  # sqlite
+                    query = f"DELETE FROM {table} WHERE symbol=? AND date BETWEEN ? AND ?"
+                    params = (symbol, s_date.date().isoformat(), e_date.date().isoformat())
+                self.db_manager.execute_update(query, params)
+            except Exception as exc:
+                logger.warning(f"Rollback failed for {symbol} {s_date.date()}-{e_date.date()}: {exc}")
+
+        async def _sync_range(s_date: datetime, e_date: datetime):
+            nonlocal synced, errors
+            if (e_date - s_date).days < 0:
+                return
+            # 拆分过长区间
+            if (e_date - s_date).days > step_days:
+                mid = s_date + timedelta(days=step_days)
+                await _sync_range(s_date, mid)
+                await _sync_range(mid + timedelta(days=1), e_date)
+                return
+
+            attempt = 0
+            while attempt <= max_retries:
+                try:
+                    data = await self.get_historical_data(
+                        symbol, s_date, e_date, force_refresh=True
+                    )
+                    if data is not None and not data.empty:
+                        synced += len(data)
+                        break  # 成功即跳出循环
+                    else:
+                        raise ValueError("No data returned")
+                except Exception as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        errors += 1
+                        logger.error(
+                            f"Sync failed for {symbol} {s_date.date()}-{e_date.date()} after {max_retries} retries: {exc}"
+                        )
+                        if rollback_on_failure:
+                            await _rollback_range(s_date, e_date)
+                    else:
+                        logger.debug(
+                            f"Retry {attempt}/{max_retries} for {symbol} {s_date.date()}-{e_date.date()} due to: {exc}"
+                        )
+                        await asyncio.sleep(delay)
+            await asyncio.sleep(delay)
+
+        await _sync_range(start_date, end_date)
+        return {"synced": synced, "errors": errors}
+
+    async def sync_market_data_all_by_date(
+        self,
+        trade_date: Union[str, datetime, pd.Timestamp],
+        batch_size: int = 50,
+        step_days: int = 15,
+        delay: float = 0.2,
+        max_retries: int = 2,
+        rollback_on_failure: bool = True,
+    ) -> Dict[str, int]:
+        """按指定交易日同步全市场（或配置范围）数据。
+
+        Args:
+            trade_date: 交易日（字符串 YYYY-MM-DD 或 datetime）。
+            batch_size: 每批并发股票数量，避免一次请求过大。
+            step_days: 传递给单只股票同步函数的步长参数。
+            delay: 每批次执行完后的 await 间隔（秒）。
+            max_retries: 单股票区间最大重试次数。
+            rollback_on_failure: 是否在单股票失败时回滚。
+
+        Returns:
+            成功与错误统计，例如 {"synced": 12345, "errors": 6}
+        """
+        # 解析日期
+        if isinstance(trade_date, str):
+            trade_date_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+        elif isinstance(trade_date, (datetime, pd.Timestamp)):
+            trade_date_dt = pd.to_datetime(trade_date).to_pydatetime()
+        else:
+            raise ValueError("trade_date 必须是 YYYY-MM-DD 字符串或 datetime")
+
+        # 优先尝试通过统一数据提供者一次性获取整日全市场数据，减少 API 调用次数
+        try:
+            bulk_df = self.unified_provider.get_market_data_by_date_range(
+                start_date=trade_date_dt.strftime("%Y-%m-%d"),
+                end_date=trade_date_dt.strftime("%Y-%m-%d"),
+                symbols=None,
+                quality_threshold=self.config.quality_threshold if hasattr(self, "config") else 0.7,
+            )
+        except Exception as e:
+            logger.warning(f"Bulk market fetch failed, fallback to per-symbol: {e}")
+            bulk_df = None
+
+        synced_total, errors_total = 0, 0
+
+        if bulk_df is not None and not bulk_df.empty:
+            # 保存数据到数据库，bulk_df 以 (date, symbol) 为索引
+            # 将数据按 symbol 分组写入，避免一次性过大
+            for symbol, df_sym in bulk_df.groupby(level=1):
+                # df_sym 的索引当前为 MultiIndex (date, symbol)，重置并处理
+                df_sym = df_sym.reset_index(level=1, drop=True)
+                try:
+                    await self.db_manager.save_stock_data(symbol, df_sym)
+                    synced_total += len(df_sym)
+                except Exception as exc:
+                    errors_total += 1
+                    logger.error(f"Save bulk data failed for {symbol}: {exc}")
+            return {"synced": synced_total, "errors": errors_total}
+
+        # —— 若批量获取失败则退化为逐股票调用 ——
+        symbols_df = self.get_all_stock_list()
+        if symbols_df is None or symbols_df.empty or "symbol" not in symbols_df.columns:
+            raise ValueError("无法获取股票列表进行按日期同步")
+        symbols: List[str] = symbols_df["symbol"].tolist()
+
+        async def _sync_symbol(sym: str):
+            return await self.sync_market_data_by_date(
+                symbol=sym,
+                start_date=trade_date_dt,
+                end_date=trade_date_dt,
+                step_days=step_days,
+                delay=delay,
+                max_retries=max_retries,
+                rollback_on_failure=rollback_on_failure,
+            )
+
+        # 简易批次异步调度，避免一次性创建过多任务
+        for i in range(0, len(symbols), batch_size):
+            batch_syms = symbols[i : i + batch_size]
+            tasks = [asyncio.create_task(_sync_symbol(s)) for s in batch_syms]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    errors_total += 1
+                    logger.error(f"Batch symbol sync error: {res}")
+                else:
+                    synced_total += res.get("synced", 0)
+                    errors_total += res.get("errors", 0)
+            await asyncio.sleep(delay)
+
+        return {"synced": synced_total, "errors": errors_total}

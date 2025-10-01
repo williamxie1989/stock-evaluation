@@ -595,24 +595,73 @@ async def get_market_statistics(selected_markets: Optional[List[str]] = None):
 
 @app.post("/api/sync_data_optimized")
 async def sync_market_data_optimized(request: dict = None):
+    """使用统一数据访问层执行增量市场数据同步
+
+    前端"优化同步"按钮调用此端点。如果统一数据访问层尚未初始化，
+    本函数会尝试即时创建，确保不会因 NoneType 造成调用失败。
+    """
     try:
+        global _unified_data_access
         if request is None:
             request = {}
-        markets = request.get('markets')
-        days = int(request.get('days', 365))
         symbols = request.get('symbols')
+        trade_date = request.get('trade_date')  # 新增: 指定交易日同步
         batch_size = int(request.get('batch_size', 20))
         delay_seconds = float(request.get('delay_seconds', 1.0))
+        step_days = int(request.get('step_days', 15))  # 新增: 同步分段天数
 
-        # 使用统一数据访问层进行优化的市场数据同步
-        stats = await _unified_data_access.sync_market_data(
-            markets=markets,
-            sync_type="incremental",
-            batch_size=batch_size,
-            delay_seconds=delay_seconds
-        )
+        # 若统一数据访问层未就绪，尝试重新初始化一次
+        if _unified_data_access is None:
+            try:
+                from src.core.unified_data_access_factory import create_unified_data_access
+                _unified_data_access = create_unified_data_access()
+                logger.info("已重新创建统一数据访问层实例，准备执行同步")
+            except Exception as init_err:
+                logger.error(f"无法初始化统一数据访问层: {init_err}")
+                return {"success": 0, "error": "统一数据访问层初始化失败"}
+
+        # 根据是否指定 trade_date 选择同步策略
+        if trade_date:
+            # 按日期批量同步（内部支持分段）
+            # 若未指定 symbols，则同步全市场
+            if not symbols:
+                stats = await _unified_data_access.sync_market_data_all_by_date(
+                    trade_date=trade_date,
+                    step_days=step_days,
+                    batch_size=batch_size
+                )
+            else:
+                # 否则逐股票同步
+                synced_total, errors_total = 0, 0
+                for sym in symbols:
+                    res = await _unified_data_access.sync_market_data_by_date(
+                        symbol=sym,
+                        start_date=pd.to_datetime(trade_date),
+                        end_date=pd.to_datetime(trade_date),
+                        step_days=step_days
+                    )
+                    synced_total += res.get("synced", 0)
+                    errors_total += res.get("errors", 0)
+                stats = {"synced": synced_total, "errors": errors_total}
+        else:
+            # 未指定 trade_date，先尝试按“昨日”批量同步，失败则回退增量同步
+            try:
+                yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+                stats = await _unified_data_access.sync_market_data_all_by_date(
+                    trade_date=yesterday,
+                    step_days=step_days,
+                    batch_size=batch_size
+                )
+            except Exception as date_sync_err:
+                logger.warning(f"按日期批量同步失败，回退逐股票增量同步: {date_sync_err}")
+                stats = await _unified_data_access.sync_market_data(
+                    symbols=symbols,  # None 表示全市场
+                    batch_size=batch_size,
+                    delay=delay_seconds
+                )
         return {"success": 1, "data": stats}
     except Exception as e:
+        logger.error(f"优化同步失败: {e}")
         return {"success": 0, "error": str(e)}
 
 @app.post("/api/sync_data_concurrent")
@@ -878,10 +927,11 @@ async def get_stock_history_data(symbol: str, start_date: str = None, end_date: 
 
 if __name__ == "__main__":
     import uvicorn
+    port = int(os.getenv("API_PORT", "8003"))
     uvicorn.run(
         "src.apps.api.app:app",
         host="0.0.0.0", 
-        port=8003,
+        port=port,
         reload=0,
         workers=1,
         log_level="info"

@@ -9,6 +9,11 @@
 <link rel="stylesheet" href="/static/css/ai-analysis.css">
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        const API_BASE = window.API_BASE || window.location.origin;
+        function api(path){return `${API_BASE}${path.startsWith('/')?path:'/'.concat(path)}`}
+        (function(){const f=window.fetch.bind(window);window.fetch=function(i,o){if(typeof i==='string'&&i.startsWith('http://localhost:8003')){i=api(i.substring('http://localhost:8003'.length));}return f(i,o);} })();
+    </script>
     <style>
         .loading {
             animation: spin 1s linear infinite;

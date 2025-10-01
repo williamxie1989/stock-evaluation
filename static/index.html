@@ -10,6 +10,26 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+    <script>
+        // 统一 API 基础地址：如需跨域部署可提前在页面注入 window.API_BASE
+        const API_BASE = window.API_BASE || window.location.origin;
+        function api(path) {
+            // 确保 path 以 / 开头
+            return `${API_BASE}${path.startsWith('/') ? path : '/' + path}`;
+        }
+    </script>
+    <script>
+        // 覆盖全局 fetch，将硬编码 localhost:8003 自动替换为 API_BASE
+        (function() {
+            const ORIGINAL_FETCH = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+                if (typeof input === 'string' && input.startsWith('http://localhost:8003')) {
+                    input = api(input.substring('http://localhost:8003'.length));
+                }
+                return ORIGINAL_FETCH(input, init);
+            };
+        })();
+    </script>
     <style>
         .loading {
             display: inline-block;
@@ -241,7 +261,6 @@
             try {
                 const response = await fetch('http://localhost:8003/api/popular-stocks');
                 const data = await response.json();
-                
                 const container = document.getElementById('popularStocks');
                 container.innerHTML = '';
                 
@@ -701,7 +720,16 @@
                 },
                 body: JSON.stringify(requestBody)
             })
-            .then(response => response.json())
+            .then(async response => {
+                let data;
+                try {
+                    data = await response.json();
+                } catch (e) {
+                    const text = await response.text();
+                    data = { success: 0, error: text || `HTTP ${response.status}` };
+                }
+                return data;
+            })
             .then(data => {
                 console.log('优化版数据刷新结果:', data);
                 
@@ -830,7 +858,7 @@
             if (!container) return;
             container.innerHTML = '<div class="flex items-center gap-2 text-gray-500"><div class="loading"></div><span>加载中...</span></div>';
             try {
-                const url = markets ? `http://localhost:8003/api/data_freshness?markets=${encodeURIComponent(markets.join(','))}` : 'http://localhost:8003/api/data_freshness';
+                const url = markets ? api(`/api/data_freshness?markets=${encodeURIComponent(markets.join(','))}`) : api('/api/data_freshness');
                 const response = await fetch(url);
                 const data = await response.json();
                 if (!data.success) {

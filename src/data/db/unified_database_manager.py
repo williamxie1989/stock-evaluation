@@ -881,6 +881,29 @@ class UnifiedDatabaseManager:
             logger.error(f"获取最新日期失败: {e}")
             return {}
 
+    def get_latest_trade_date(self) -> Optional[str]:
+        """获取 prices_daily 表中的最新交易日期。
+
+        Returns:
+            最新交易日期字符串 YYYY-MM-DD；若表为空或查询失败，则返回 None。
+        """
+        try:
+            query = """
+                SELECT MAX(date) as latest_date
+                FROM prices_daily
+            """
+            results = self.execute_query(query)
+            if results:
+                # 结果可能是 list[dict] 或 list[tuple]
+                row = results[0]
+                latest_date = row.get('latest_date') if isinstance(row, dict) else row[0]
+                if latest_date:
+                    return str(latest_date)
+            return None
+        except Exception as e:
+            logger.error(f"获取整体最新交易日期失败: {e}")
+            return None
+
     def get_last_n_bars(self, symbols: List[str] = None, n: int = 2) -> pd.DataFrame:
         """
         获取每个symbol最近n根K线

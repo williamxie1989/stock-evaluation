@@ -196,18 +196,28 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
             # 一致性评估
             if len(df) > 1:
                 # 检查数据连续性（没有大的间隔）
-                sort_column = date_col if date_col else df.index
-                df_sorted = df.sort_values(sort_column)
-                
                 if date_col:
+                    # 使用日期列排序
+                    df_sorted = df.sort_values(date_col)
                     try:
                         date_diffs = pd.to_datetime(df_sorted[date_col]).diff().dt.days
                         large_gaps = (date_diffs > 10).sum()
                         metrics.consistency = max(0.0, 1.0 - (large_gaps / len(df)))
-                    except:
+                    except Exception:
                         metrics.consistency = 0.8
                 else:
-                    metrics.consistency = 0.8
+                    # 若缺少日期列，则按索引排序并检查索引是否为 DatetimeIndex
+                    if isinstance(df.index, pd.DatetimeIndex):
+                        df_sorted = df.sort_index()
+                        try:
+                            date_diffs = df_sorted.index.to_series().diff().dt.days
+                            large_gaps = (date_diffs > 10).sum()
+                            metrics.consistency = max(0.0, 1.0 - (large_gaps / len(df)))
+                        except Exception:
+                            metrics.consistency = 0.8
+                    else:
+                        # 无法评估一致性，使用默认值
+                        metrics.consistency = 0.5
             else:
                 metrics.consistency = 0.5
             
@@ -618,3 +628,90 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
                 'active_entries': total_entries - expired_entries,
                 'cache_ttl': self.cache_ttl
             }
+
+    # 兼容DataProviderInterface常用方法名，转到get_historical_data
+    def get_stock_data(self, symbol: str, start_date: str, end_date: str, quality_threshold: float = 0.8):
+        """向后兼容统一命名"""
+        return self.get_historical_data(symbol, start_date, end_date, quality_threshold)
+
+    def get_market_data_by_date_range(self, start_date: str, end_date: str,
+                                       symbols: Optional[List[str]] = None,
+                                       quality_threshold: float = 0.7,
+                                       max_retries: int = 3) -> Optional[pd.DataFrame]:
+        """按日期范围获取市场数据（全市场或部分股票），带质量评估与失败回退。
+
+        该方法会尝试所有主要数据提供者的 ``get_market_data_by_date_range`` 或 ``get_stock_data_by_date`` 方法；若主要提供者均失败，则尝试备用提供者，
+        并在必要时降低质量阈值。成功返回后会写入缓存。
+
+        Args:
+            start_date: 开始日期 ``YYYY-MM-DD``
+            end_date: 结束日期 ``YYYY-MM-DD``
+            symbols: 股票列表，None 表示全市场
+            quality_threshold: 数据质量阈值
+            max_retries: 备用源最大重试次数
+
+        Returns:
+            合并后的行情 ``DataFrame``，或 ``None``（全部失败）。
+        """
+        cache_key = self._get_cache_key(
+            "market_range", start_date=start_date, end_date=end_date,
+            symbols="all" if symbols is None else ",".join(sorted(symbols))
+        )
+        cached = self._get_from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        def _try_provider(provider):
+            data = None
+            if hasattr(provider, "get_market_data_by_date_range"):
+                data = provider.get_market_data_by_date_range(start_date, end_date, symbols=symbols)
+            elif hasattr(provider, "get_stock_data_by_date"):
+                # 退化到逐日循环调用（效率可能低，但保证兼容）
+                from pandas import concat
+                cur_date = datetime.strptime(start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                frames = []
+                while cur_date <= end_dt:
+                    try:
+                        df_day = provider.get_stock_data_by_date(cur_date.strftime("%Y-%m-%d"), symbols=symbols)
+                        if df_day is not None and not df_day.empty:
+                            frames.append(df_day)
+                    except Exception:
+                        pass
+                    cur_date += timedelta(days=1)
+                if frames:
+                    data = concat(frames, ignore_index=True)
+            return data
+
+        # 尝试主要提供者
+        for provider in self.primary_providers:
+            try:
+                df = _try_provider(provider)
+                if df is not None and not df.empty:
+                    metrics = self._assess_data_quality(df, "market_range", "historical")
+                    if metrics.overall_score >= quality_threshold:
+                        self._set_cache(cache_key, df)
+                        return df
+            except Exception as e:
+                logger.error("Primary provider %s failed in get_market_data_by_date_range: %s", provider.__class__.__name__, e)
+
+        # 尝试备用提供者
+        attempts = 0
+        for provider in self.fallback_providers:
+            if attempts >= max_retries:
+                break
+            try:
+                df = _try_provider(provider)
+                if df is not None and not df.empty:
+                    metrics = self._assess_data_quality(df, "market_range", "historical")
+                    if metrics.overall_score >= quality_threshold * 0.7:
+                        self._set_cache(cache_key, df)
+                        return df
+            except Exception as e:
+                logger.error("Fallback provider %s failed in get_market_data_by_date_range: %s", provider.__class__.__name__, e)
+            attempts += 1
+
+        logger.error("All providers failed to get market data by date range %s~%s", start_date, end_date)
+        return None
+
+    # ... existing code ...
