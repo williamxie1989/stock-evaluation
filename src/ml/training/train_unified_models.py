@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 统一模型训练脚本
@@ -14,6 +13,7 @@ from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Tuple, Any, Union
 import pickle
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import warnings
@@ -47,10 +47,17 @@ logging.getLogger("sklearn").setLevel(logging.WARNING)
 class UnifiedModelTrainer:
     """统一模型训练器，支持分类和回归任务"""
     
-    def __init__(self, enable_feature_selection: bool = True):
+    def __init__(self, enable_feature_selection: bool = True,
+                 feature_cache_dir: str = 'feature_cache',
+                 reuse_feature_selection: bool = True,
+                 refresh_feature_selection: bool = False,
+                 feature_selection_n_jobs: int = -1):
         """初始化统一模型训练器
         Args:
             enable_feature_selection: 是否在数据预处理阶段启用特征选择优化器
+            feature_cache_dir: 特征缓存目录
+            reuse_feature_selection: 是否复用已存在的特征选择结果
+            refresh_feature_selection: 是否强制刷新特征选择结果并覆盖缓存
         """
         # 使用现有的统一数据访问层
         self.data_access = create_unified_data_access()
@@ -58,6 +65,14 @@ class UnifiedModelTrainer:
         self.feature_generator = EnhancedFeatureGenerator()
         # 新增: 特征选择开关
         self.enable_feature_selection = enable_feature_selection
+        # 特征选择缓存相关
+        self.feature_cache_dir = feature_cache_dir
+        os.makedirs(self.feature_cache_dir, exist_ok=True)
+        self.reuse_feature_selection = reuse_feature_selection
+        self.refresh_feature_selection = refresh_feature_selection
+        self.feature_cache_file = os.path.join(self.feature_cache_dir, 'selected_features.json')
+        # 并行核心数
+        self.feature_selection_n_jobs = feature_selection_n_jobs
     
     def prepare_training_data(self, stock_list: List[str] = None, mode: str = 'both', lookback_days: int = 365, 
                             n_stocks: int = 1000, prediction_period: int = 30) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
@@ -276,6 +291,19 @@ class UnifiedModelTrainer:
             logger.info("已关闭特征选择优化，直接返回清洗后的全部特征")
             return X_final, y_reg_final, y_cls_final
 
+        # 若启用缓存且存在且不强制刷新，直接复用
+        if self.reuse_feature_selection and not self.refresh_feature_selection:
+            if os.path.exists(self.feature_cache_file):
+                try:
+                    with open(self.feature_cache_file, 'r') as f:
+                        cached_features = json.load(f)
+                    if isinstance(cached_features, list) and all(f in X_final.columns for f in cached_features):
+                        logger.info(f"加载缓存特征集合，共 {len(cached_features)} 个特征")
+                        X_selected = X_final[cached_features]
+                        return X_selected, y_reg_final, y_cls_final
+                except Exception as e:
+                    logger.warning(f"加载特征缓存失败: {e}")
+
         # 特征选择优化
         logger.info("开始特征选择优化...")
         try:
@@ -288,7 +316,8 @@ class UnifiedModelTrainer:
             if len(np.unique(y_cls_final)) > 1:  # 确保有多于一个类别
                 cls_selector = FeatureSelectorOptimizer(
                     task_type='classification', 
-                    target_n_features=n_features
+                    target_n_features=n_features,
+                    n_jobs=self.feature_selection_n_jobs
                 )
                 cls_results = cls_selector.optimize_feature_selection(
                     X_final, y_cls_final, method='auto'
@@ -301,7 +330,8 @@ class UnifiedModelTrainer:
             # 回归特征选择
             reg_selector = FeatureSelectorOptimizer(
                 task_type='regression', 
-                target_n_features=n_features
+                target_n_features=n_features,
+                n_jobs=self.feature_selection_n_jobs
             )
             reg_results = reg_selector.optimize_feature_selection(
                 X_final, y_reg_final, method='auto'
@@ -315,7 +345,15 @@ class UnifiedModelTrainer:
             
             logger.info(f"特征选择优化完成: 从 {X_final.shape[1]} 个特征中选择 {len(all_selected_features)} 个")
             logger.info(f"特征缩减比例: {(1 - len(all_selected_features)/X_final.shape[1])*100:.1f}%")
-            
+            # 缓存特征集合
+            if self.reuse_feature_selection or self.refresh_feature_selection:
+                try:
+                    with open(self.feature_cache_file, 'w') as f:
+                        json.dump(all_selected_features, f)
+                    logger.info(f"特征集合已缓存至 {self.feature_cache_file}")
+                except Exception as e:
+                    logger.warning(f"写入特征缓存失败: {e}")
+
             return X_selected, y_reg_final, y_cls_final
             
         except Exception as e:
@@ -324,7 +362,8 @@ class UnifiedModelTrainer:
     
     def train_models(self, X: pd.DataFrame, y: Dict[str, pd.Series],
                  mode: str = 'both', use_grid_search: bool = 1,
-                 use_optuna: bool = False, optimization_trials: int = 50) -> Dict[str, Any]:
+                 use_optuna: bool = False, optimization_trials: int = 50,
+                 cls_models: List[str] = None, reg_models: List[str] = None) -> Dict[str, Any]:
         """
         训练模型（多线程优化版本）
         
@@ -351,11 +390,11 @@ class UnifiedModelTrainer:
                 
                 if 'cls' in y:
                     future_to_task[executor.submit(self._train_classification_models, 
-                                                  X, y['cls'], use_grid_search, use_optuna, optimization_trials)] = 'classification'
+                                                  X, y['cls'], use_grid_search, use_optuna, optimization_trials, cls_models)] = 'classification'
                 
                 if 'reg' in y:
                     future_to_task[executor.submit(self._train_regression_models, 
-                                                  X, y['reg'], use_grid_search, use_optuna, optimization_trials)] = 'regression'
+                                                  X, y['reg'], use_grid_search, use_optuna, optimization_trials, reg_models)] = 'regression'
                 
                 # 收集结果
                 for future in as_completed(future_to_task):
@@ -371,12 +410,12 @@ class UnifiedModelTrainer:
             # 单独训练分类或回归模型
             if mode == 'classification' and 'cls' in y:
                 logger.info("训练分类模型...")
-                cls_results = self._train_classification_models(X, y['cls'], use_grid_search, use_optuna, optimization_trials)
+                cls_results = self._train_classification_models(X, y['cls'], use_grid_search, use_optuna, optimization_trials, cls_models)
                 results.update(cls_results)
             
             if mode == 'regression' and 'reg' in y:
                 logger.info("训练回归模型...")
-                reg_results = self._train_regression_models(X, y['reg'], use_grid_search, use_optuna, optimization_trials)
+                reg_results = self._train_regression_models(X, y['reg'], use_grid_search, use_optuna, optimization_trials, reg_models)
                 results.update(reg_results)
         
         return results
@@ -497,14 +536,15 @@ class UnifiedModelTrainer:
 
     def _train_classification_models(self, X: pd.DataFrame, y: pd.Series, 
                                    use_grid_search: bool = 1,
-                                   use_optuna: bool = False, optimization_trials: int = 50) -> Dict[str, Any]:
+                                   use_optuna: bool = False, optimization_trials: int = 50,
+                                   cls_models: List[str] = None) -> Dict[str, Any]:
         """训练分类模型（多线程版本）"""
         # 初始化增强版训练器（用于训练单个分类模型）
         trainer = EnhancedMLTrainer(model_dir="models")
         results = {}
         
-        # 分类模型类型（精简版：选择表现最好的两个）
-        classification_models = ['xgboost', 'logistic']  # xgboost表现最佳，logistic作为简单模型备选
+        # 分类模型类型（可外部指定）
+        classification_models = cls_models if cls_models is not None else ['xgboost', 'logistic']  # 默认使用两种模型
         
         logger.info(f"开始并行训练 {len(classification_models)} 个分类模型...")
         
@@ -560,12 +600,13 @@ class UnifiedModelTrainer:
 
     def _train_regression_models(self, X: pd.DataFrame, y: pd.Series, 
                                use_grid_search: bool = 1,
-                               use_optuna: bool = False, optimization_trials: int = 50) -> Dict[str, Any]:
+                               use_optuna: bool = False, optimization_trials: int = 50,
+                               reg_models: List[str] = None) -> Dict[str, Any]:
         """训练回归模型（多线程版本）"""
         results = {}
         
-        # 回归模型类型（精简版：选择表现最好的两个）
-        regression_models = ['xgboost', 'lightgbm', 'catboost', 'lasso']  # 新增LightGBM和CatBoost
+        # 回归模型类型（可外部指定）
+        regression_models = reg_models if reg_models is not None else ['xgboost', 'lightgbm', 'catboost', 'lasso']  # 默认四种模型
         
         logger.info(f"开始并行训练 {len(regression_models)} 个回归模型...")
         
@@ -990,8 +1031,6 @@ class UnifiedModelTrainer:
             if best_reg_model:
                 logger.info(f"  最佳回归模型: {best_reg_model} (R²={best_reg_r2:.4f})")
 
-import argparse
-
 
 def main():
     """主函数"""
@@ -1005,13 +1044,17 @@ def main():
     parser.add_argument("--optimization_trials", type=int, default=50, help="Optuna/Bayesian优化时的迭代次数 (默认50)")
     # 新增: 关闭特征选择开关
     parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
+    parser.add_argument("--fs-n-jobs", type=int, default=-1, help="特征选择时并行CPU核心数（-1 表示全部）")
     args = parser.parse_args()
 
     logger.info("=== 开始统一模型训练流程 ===")
     logger.info(f"参数: lookback={args.lookback}, n_stocks={args.n_stocks}, prediction_period={args.prediction_period}, mode={args.mode}, grid_search={'off' if args.no_grid_search else 'on'}")
 
     try:
-        trainer = UnifiedModelTrainer(enable_feature_selection=(not args.disable_feature_selection))
+        trainer = UnifiedModelTrainer(enable_feature_selection=(not args.disable_feature_selection),
+                                      reuse_feature_selection=not args.no_feature_cache,
+                                      refresh_feature_selection=args.refresh_feature_selection,
+                                      feature_selection_n_jobs=args.fs_n_jobs)
         if args.disable_feature_selection:
             logger.info("已通过命令行开关关闭特征选择优化")
             
@@ -1043,4 +1086,73 @@ def main():
         logger.error(f"训练流程失败: {e}", exc_info=1)
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="统一模型训练脚本，可通过命令行参数灵活指定分类/回归模型及训练相关配置")
+
+    # 数据准备参数
+    parser.add_argument('--lookback-days', type=int, default=365,
+                        help='回溯天数（默认：365）')
+    parser.add_argument('--n-stocks', type=int, default=1000,
+                        help='参与训练的股票数量上限（默认：1000）')
+    parser.add_argument('--prediction-period', type=int, default=30,
+                        help='标签预测周期，单位：天（默认：30）')
+
+    # 任务模式
+    parser.add_argument('--mode', default='both', choices=['classification', 'regression', 'both'],
+                        help="训练模式：classification / regression / both（默认：both）")
+
+    # 模型列表
+    parser.add_argument('--cls-models', type=str, default=None,
+                        help='要训练的分类模型列表，逗号分隔。例如 "xgboost,logistic"；若为空使用默认')
+    parser.add_argument('--reg-models', type=str, default=None,
+                        help='要训练的回归模型列表，逗号分隔。例如 "lasso,ridge"；若为空使用默认')
+
+    # 训练优化相关
+    parser.add_argument('--use-grid-search', type=int, default=1, choices=[0, 1],
+                        help='是否启用网格搜索（0/1，默认：1）')
+    parser.add_argument('--use-optuna', action='store_true',
+                        help='是否使用 Optuna 进行超参优化（默认：False）')
+    parser.add_argument('--optimization-trials', type=int, default=50,
+                        help='Optuna/Bayesian 优化的 trial 次数（默认：50）')
+
+    # 特征工程
+    parser.add_argument('--disable-feature-selection', action='store_true',
+                        help='关闭特征选择优化（默认开启）'),
+    parser.add_argument('--fs-n-jobs', type=int, default=-1,
+                        help='特征选择时用于并行的CPU核心数（-1 表示全部）')
+    # 新增：特征选择缓存控制
+    parser.add_argument('--refresh-feature-selection', action='store_true',
+                        help='重新运行特征选择并覆盖已有缓存（默认：False）')
+    parser.add_argument('--no-feature-cache', action='store_true',
+                        help='不使用特征选择缓存，始终重新计算特征选择（默认：False）')
+    args = parser.parse_args()
+
+    # 解析模型列表
+    cls_models = [m.strip() for m in args.cls_models.split(',')] if args.cls_models else None
+    reg_models = [m.strip() for m in args.reg_models.split(',')] if args.reg_models else None
+
+    # 初始化 Trainer
+    trainer = UnifiedModelTrainer(enable_feature_selection=not args.disable_feature_selection,
+                                  reuse_feature_selection=not args.no_feature_cache,
+                                  refresh_feature_selection=args.refresh_feature_selection,
+                                  feature_selection_n_jobs=args.fs_n_jobs)
+
+    # 准备数据
+    X, y = trainer.prepare_training_data(
+        mode=args.mode,
+        lookback_days=args.lookback_days,
+        n_stocks=args.n_stocks,
+        prediction_period=args.prediction_period
+    )
+
+    # 训练模型
+    trainer.train_models(
+        X, y,
+        mode=args.mode,
+        use_grid_search=args.use_grid_search,
+        use_optuna=args.use_optuna,
+        optimization_trials=args.optimization_trials,
+        cls_models=cls_models,
+        reg_models=reg_models
+    )

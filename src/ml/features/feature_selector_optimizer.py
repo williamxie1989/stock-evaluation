@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class FeatureSelectorOptimizer:
     """特征选择优化器 - 筛选最具预测力的特征"""
     
-    def __init__(self, task_type: str = 'classification', target_n_features: int = 30):
+    def __init__(self, task_type: str = 'classification', target_n_features: int = 30, n_jobs: int = -1):
         """
         初始化特征选择优化器
         
@@ -46,6 +46,8 @@ class FeatureSelectorOptimizer:
         self.feature_scores_ = {}
         self.feature_importance_ = {}
         self.cv_scores_ = {}
+        # 并行度控制 (-1 使用所有核心)
+        self.n_jobs = n_jobs
         
     def optimize_feature_selection(self, X: pd.DataFrame, y: pd.Series, 
                                  method: str = 'ensemble', 
@@ -149,9 +151,9 @@ class FeatureSelectorOptimizer:
         # 3. 基于模型的特征重要性
         logger.info("执行基于模型的特征重要性分析...")
         if self.task_type == 'classification':
-            model = RandomForestClassifier(n_estimators=100, random_state=random_state)
+            model = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=self.n_jobs)
         else:
-            model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+            model = RandomForestRegressor(n_estimators=100, random_state=random_state, n_jobs=self.n_jobs)
         
         model.fit(X, y)
         importances = model.feature_importances_
