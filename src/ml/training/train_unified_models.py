@@ -99,7 +99,9 @@ class UnifiedModelTrainer:
         if 'symbol' not in stock_list.columns:
             raise ValueError("股票列表缺少 'symbol' 列，请检查数据访问层是否已生成标准化代码")
         symbols = stock_list['symbol'].tolist()
-        logger.info(f"获取到 {len(symbols)} 只股票，使用前 {n_stocks} 只")
+        # 随机打乱股票列表，确保覆盖沪深主板及创业板
+        np.random.shuffle(symbols)
+        logger.info(f"随机打乱后股票总数 {len(symbols)}，将从中抽取 {n_stocks} 只")
         
         # 设置日期范围
         end_date = datetime.now()
@@ -109,51 +111,39 @@ class UnifiedModelTrainer:
         all_features = []
         all_cls_labels = []
         all_reg_labels = []
-        failed_stocks = []  # 记录失败的股票
-        max_consecutive_failures = 3  # 连续失败阈值
-        consecutive_failures = 0
-        
-        # 处理每只股票
-        for i, symbol in enumerate(symbols[:n_stocks]):
-            if i % 10 == 0:
-                logger.info(f"处理第 {i+1}/{min(n_stocks, len(symbols))} 只股票: {symbol}")
-            
-            # 检查是否连续失败过多，跳过当前股票
-            if consecutive_failures >= max_consecutive_failures:
-                logger.warning(f"连续失败过多 ({consecutive_failures})，跳过当前股票 {symbol}")
-                consecutive_failures = 0  # 重置计数器，继续处理下一只股票
-                continue
-            
+        failed_stocks = []  # 记录处理失败或数据不足的股票
+        collected_count = 0  # 成功收集的股票数量
+        insufficient_symbols = []  # 本地数据不足，稍后再尝试 auto_sync 补拉的股票列表
+
+        # ---------------- 第一阶段：仅使用本地数据 ----------------
+        for symbol in symbols:
+            if collected_count >= n_stocks:
+                break
+
+            if collected_count % 10 == 0:
+                logger.info(f"已成功收集 {collected_count} 只股票，当前处理 {symbol}")
+
             try:
-                # 获取股票数据 - 使用统一数据访问层，关闭自动同步以避免循环
+                # 先只用本地数据，auto_sync=False
                 stock_data = self.data_access.get_stock_data(symbol, start_date, end_date, auto_sync=False)
 
-                # 至少保证 prediction_period+15 天的数据用于生成标签，若不足则跳过
-                min_required_len = prediction_period + 15  # 进一步降低要求到15天，适配宽松的特征生成器
+                # 判定数据量是否足够
+                min_required_len = prediction_period + 15
                 if stock_data is None or stock_data.empty or len(stock_data) < min_required_len:
+                    insufficient_symbols.append(symbol)
                     failed_stocks.append(symbol)
-                    consecutive_failures += 1
                     continue
-                
-                # 重置连续失败计数
-                consecutive_failures = 0
-                
-                # 重置索引以确保日期列存在
+
+                # ---------------- 以下与原处理逻辑一致 ----------------
                 stock_data = stock_data.reset_index()
-                
-                # 确保数据类型正确
                 stock_data['date'] = pd.to_datetime(stock_data['date'])
                 numeric_cols = ['open', 'high', 'low', 'close', 'volume']
                 for col in numeric_cols:
                     if col in stock_data.columns:
-                        # 转为 float，避免 Decimal 类型导致后续计算报错
                         stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce').astype(float)
-                
-                # 删除包含NaN的行，仅针对关键数值列，避免因无关列缺失导致数据量骤减
                 required_cols = ['open', 'high', 'low', 'close', 'volume']
                 stock_data = stock_data.dropna(subset=required_cols)
-                
-                # 生成增强特征
+
                 features_df = self.feature_generator.generate_features(stock_data)
                 if features_df.empty:
                     logger.warning(f"{symbol} 生成增强特征失败，尝试基础特征生成器")
@@ -163,83 +153,127 @@ class UnifiedModelTrainer:
                     if features_df.empty:
                         logger.warning(f"{symbol} 基础特征生成也失败，跳过")
                         failed_stocks.append(symbol)
-                        consecutive_failures += 1
                         continue
-                
-                # 检查特征数量，如果太少则尝试生成基础特征
                 if len(features_df.columns) < 10:
                     logger.warning(f"{symbol} 特征数量较少({len(features_df.columns)}个)，尝试生成基础特征")
-                    # 尝试单独生成各类特征
                     tech_features = basic_generator.generate_technical_features(stock_data)
                     if not tech_features.empty:
                         features_df = tech_features
                         logger.info(f"{symbol} 使用技术指标特征({len(features_df.columns)}个)")
-                
-                # 生成标签
+
                 close_prices = stock_data['close'].values
                 reg_labels = []
                 cls_labels = []
-                
                 for j in range(len(close_prices) - prediction_period):
                     current_price = close_prices[j]
                     future_price = close_prices[j + prediction_period]
                     return_rate = (future_price - current_price) / current_price
-                    
                     reg_labels.append(return_rate)
-                    cls_labels.append(1 if return_rate > 0.05 else 0)  # 5%阈值
-                
-                # 对齐特征和标签
+                    cls_labels.append(1 if return_rate > 0.05 else 0)
+
                 aligned_features = features_df.iloc[:-prediction_period].copy()
-                
                 if len(aligned_features) != len(reg_labels):
                     min_len = min(len(aligned_features), len(reg_labels))
                     aligned_features = aligned_features.iloc[:min_len]
                     reg_labels = reg_labels[:min_len]
                     cls_labels = cls_labels[:min_len]
-                
-                # 若对齐后为空则跳过
                 if aligned_features.empty:
                     failed_stocks.append(symbol)
                     continue
-                # 添加股票标识
+
                 aligned_features['symbol'] = symbol
-                
                 all_features.append(aligned_features)
                 all_reg_labels.extend(reg_labels)
                 all_cls_labels.extend(cls_labels)
-                
+                collected_count += 1
             except Exception as e:
                 logger.warning(f"处理股票 {symbol} 失败: {e}")
                 import traceback
                 logger.warning(f"详细错误信息: {traceback.format_exc()}")
                 failed_stocks.append(symbol)
-                consecutive_failures += 1
-        
+
+        # ---------------- 第二阶段：对不足股票启用 auto_sync 再尝试 ----------------
+        if collected_count < n_stocks and insufficient_symbols:
+            logger.info(f"本地数据不足，仅收集到 {collected_count} 只股票，尝试对 {len(insufficient_symbols)} 只股票启用 auto_sync 补拉数据")
+            for symbol in insufficient_symbols:
+                if collected_count >= n_stocks:
+                    break
+                try:
+                    stock_data = self.data_access.get_stock_data(symbol, start_date, end_date, auto_sync=True)
+                    if stock_data is None or stock_data.empty or len(stock_data) < prediction_period + 15:
+                        continue
+                    # 与第一阶段相同的处理流水线 ----------------
+                    stock_data = stock_data.reset_index()
+                    stock_data['date'] = pd.to_datetime(stock_data['date'])
+                    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+                    for col in numeric_cols:
+                        if col in stock_data.columns:
+                            stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce').astype(float)
+                    required_cols = ['open', 'high', 'low', 'close', 'volume']
+                    stock_data = stock_data.dropna(subset=required_cols)
+                    features_df = self.feature_generator.generate_features(stock_data)
+                    if features_df.empty:
+                        from src.ml.features.feature_generator import FeatureGenerator
+                        basic_generator = FeatureGenerator()
+                        features_df = basic_generator.generate_all_features(stock_data)
+                        if features_df.empty:
+                            continue
+                    if len(features_df.columns) < 10:
+                        from src.ml.features.feature_generator import FeatureGenerator
+                        basic_generator = FeatureGenerator()
+                        tech_features = basic_generator.generate_technical_features(stock_data)
+                        if not tech_features.empty:
+                            features_df = tech_features
+
+                    close_prices = stock_data['close'].values
+                    reg_labels = []
+                    cls_labels = []
+                    for j in range(len(close_prices) - prediction_period):
+                        current_price = close_prices[j]
+                        future_price = close_prices[j + prediction_period]
+                        return_rate = (future_price - current_price) / current_price
+                        reg_labels.append(return_rate)
+                        cls_labels.append(1 if return_rate > 0.05 else 0)
+                    aligned_features = features_df.iloc[:-prediction_period].copy()
+                    if len(aligned_features) != len(reg_labels):
+                        min_len = min(len(aligned_features), len(reg_labels))
+                        aligned_features = aligned_features.iloc[:min_len]
+                        reg_labels = reg_labels[:min_len]
+                        cls_labels = cls_labels[:min_len]
+                    if aligned_features.empty:
+                        continue
+                    aligned_features['symbol'] = symbol
+                    all_features.append(aligned_features)
+                    all_reg_labels.extend(reg_labels)
+                    all_cls_labels.extend(cls_labels)
+                    collected_count += 1
+                    logger.info(f"auto_sync 成功补充 {symbol}，已收集 {collected_count}/{n_stocks}")
+                except Exception as e:
+                    logger.warning(f"auto_sync 获取 {symbol} 失败: {e}")
+                    import traceback
+                    logger.warning(f"详细错误信息: {traceback.format_exc()}")
+
+        # ---------------- 数据汇总与返回 ----------------
         if not all_features:
-            logger.error(f"特征生成失败，失败股票数: {len(failed_stocks)}，尝试放宽过滤条件或检查数据源")
             raise ValueError("没有生成任何训练数据")
-        
-        # 合并所有数据
-        X_combined = pd.concat(all_features, ignore_index=1)
+
+        X_combined = pd.concat(all_features, ignore_index=True)
         y_reg = pd.Series(all_reg_labels, name='return_rate')
         y_cls = pd.Series(all_cls_labels, name='label_cls')
-        
-        logger.info(f"总共生成 {len(X_combined)} 个样本，失败股票数: {len(failed_stocks)}")
-        if failed_stocks:
-            logger.info(f"失败股票列表: {failed_stocks}")
-        
+
+        logger.info(f"最终生成 {len(X_combined)} 个样本，成功股票数: {collected_count}，失败股票数: {len(failed_stocks)}")
+
         # 数据预处理
         X_processed, y_reg_processed, y_cls_processed = self._preprocess_data(X_combined, y_reg, y_cls)
-        
-        # 根据模式返回相应的标签
-        y_dict = {}
+
+        y_dict: Dict[str, pd.Series] = {}
         if mode in ['classification', 'both']:
             y_dict['cls'] = y_cls_processed
         if mode in ['regression', 'both']:
             y_dict['reg'] = y_reg_processed
-        
+
         return X_processed, y_dict
-    
+
     def _preprocess_data(self, X: pd.DataFrame, y_reg: pd.Series, y_cls: pd.Series) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
         """数据预处理 - 包含特征选择优化"""
         logger.info("开始数据预处理...")
@@ -495,11 +529,19 @@ class UnifiedModelTrainer:
                     # 若为 XGBoost 则启用早停，监控验证集 logloss/AUC
                     fit_params = {}
                     if model_type == 'xgboost':
-                        eval_set = [(X_train, y_train), (X_test, y_test)]
+                        # XGBoost 对 eval_set 中的特征名与训练输入的特征名要求保持一致。
+                        # 由于训练数据在管道中经过 StandardScaler 后被转换为 numpy.ndarray（无列名），
+                        # 如果直接传入包含列名的 pandas.DataFrame 将导致 “data did not contain feature names” 错误。
+                        eval_set = [
+                            (X_train.values if hasattr(X_train, 'values') else X_train,
+                             y_train.values if hasattr(y_train, 'values') else y_train),
+                            (X_test.values if hasattr(X_test, 'values') else X_test,
+                             y_test.values if hasattr(y_test, 'values') else y_test)
+                        ]
+                        # 将 early_stopping_rounds 设置为模型参数，而非传递给 fit
+                        pipe.set_params(classifier__early_stopping_rounds=50)
                         fit_params = {
                             'classifier__eval_set': eval_set,
-                            'classifier__eval_metric': ['logloss', 'auc'],
-                            'classifier__early_stopping_rounds': 50,
                             'classifier__verbose': False
                         }
                     pipe.fit(X_train, y_train, **fit_params)
@@ -518,11 +560,13 @@ class UnifiedModelTrainer:
                                 extra_metrics['val_logloss'] = float(min(logloss_list))
 
                     result = {
-                        'model': pipe,
-                        'model_type': model_type,
-                        'best_params': best_params,
-                        # 交叉验证指标后续持久化在 metrics 目录下的 CSV
-                        
+                         'model': pipe,
+                         'model_type': model_type,
+                         'best_params': best_params,
+                         # 记录分类器所有参数（含默认值与优化结果）
+                         'all_params': pipe.named_steps['classifier'].get_params(),
+                         # 交叉验证指标后续持久化在 metrics 目录下的 CSV
+
                     'metrics': {
                             'train_accuracy': accuracy_score(y_train, y_train_pred),
                             'test_accuracy': accuracy_score(y_test, y_test_pred),
@@ -573,7 +617,7 @@ class UnifiedModelTrainer:
                 logger.info(f"{model_type} 分类模型性能: 训练准确率={train_acc:.4f}, 测试准确率={test_acc:.4f}, 精确率={test_precision:.4f}, 召回率={test_recall:.4f}, F1={test_f1:.4f}")
                 # ---- 持久化交叉验证各折指标到 CSV ----
                 try:
-                    import os, csv
+                    import csv
                     metrics_dir = 'metrics'
                     os.makedirs(metrics_dir, exist_ok=True)
                     csv_path = os.path.join(metrics_dir, f"{model_type}_classification_cv_scores.csv")
@@ -795,7 +839,9 @@ class UnifiedModelTrainer:
             'model_type': model_type,
             'best_params': best_params if use_grid_search else {},
             'cv_score': best_score if use_grid_search else None,
-            'feature_names': X.columns.tolist(),
++            # 记录回归器所有参数
++            'all_params': pipeline.named_steps['regressor'].get_params(),
+             'feature_names': X.columns.tolist(),
             'feature_importance': feature_importance,
             'metrics': {
                 'train_mse': train_mse,
@@ -813,7 +859,9 @@ class UnifiedModelTrainer:
         }
         
         logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+        logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
         logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
+        logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
         
         return result
     
@@ -891,6 +939,10 @@ class UnifiedModelTrainer:
                     'regressor__subsample': [0.8, 1.0],
                     'regressor__colsample_bytree': [0.8, 1.0]
                 }
+                # 若使用 Optuna，则降级为网格搜索，避免因未正确实现 objective 导致异常
+
+                # 支持 Optuna 搜索（在下方统一实现）
+                
             except ImportError:
                 logger.error("XGBoost未安装，跳过XGBoost训练")
                 return {
@@ -918,16 +970,17 @@ class UnifiedModelTrainer:
             ('regressor', regressor)
         ])
         
+        # ----------------------- 超参数优化 -----------------------
+        # 优先使用 Optuna，其次才使用 GridSearchCV。
         if use_optuna:
             try:
                 import optuna
                 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
                 def objective(trial):
-                    trial_params = {}
-                    # 根据模型类型定义搜索空间
+                    search_params = {}
                     if model_type == 'lightgbm':
-                        trial_params = {
+                        search_params = {
                             'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 400),
                             'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
                             'regressor__max_depth': trial.suggest_int('regressor__max_depth', -1, 10),
@@ -935,67 +988,127 @@ class UnifiedModelTrainer:
                             'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.6, 1.0)
                         }
                     elif model_type == 'catboost':
-                        trial_params = {
+                        search_params = {
                             'regressor__iterations': trial.suggest_int('regressor__iterations', 200, 800),
                             'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
                             'regressor__depth': trial.suggest_int('regressor__depth', 4, 10)
                         }
                     elif model_type == 'randomforest':
-                        trial_params = {
+                        search_params = {
                             'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 300),
                             'regressor__max_depth': trial.suggest_int('regressor__max_depth', 5, 30),
                             'regressor__min_samples_split': trial.suggest_int('regressor__min_samples_split', 2, 10),
                             'regressor__min_samples_leaf': trial.suggest_int('regressor__min_samples_leaf', 1, 5)
                         }
                     elif model_type == 'xgboost':
-                        # XGBoost 回归器搜索空间
-                        trial_params = {
+                        search_params = {
                             'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 300),
                             'regressor__max_depth': trial.suggest_int('regressor__max_depth', 3, 10),
                             'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
                             'regressor__subsample': trial.suggest_float('regressor__subsample', 0.6, 1.0),
                             'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.6, 1.0)
                         }
-                        
-                    y_train_pred = pipe.predict(X_train)
-                    y_test_pred = pipe.predict(X_test)
-                    
-                    # 如果是 XGBoost，记录验证集最佳迭代及 logloss
-                    extra_metrics = {}
-                    if model_type == 'xgboost':
-                        booster = pipe.named_steps['classifier']
-                        if hasattr(booster, 'best_iteration'):
-                            extra_metrics['best_iteration'] = int(booster.best_iteration)
-                        if booster.evals_result_ and 'validation_0' in booster.evals_result_:
-                            logloss_list = booster.evals_result_['validation_0'].get('logloss', [])
-                            if logloss_list:
-                                extra_metrics['val_logloss'] = float(min(logloss_list))
+                    # 设置参数并计算交叉验证分数（负MSE，Optuna目标为最小化MSE）
+                    pipeline.set_params(**search_params)
+                    tscv = TimeSeriesSplit(n_splits=5)
+                    score = cross_val_score(
+                        pipeline, X_train, y_train,
+                        cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1
+                    ).mean()
+                    return -score  # 最小化 MSE
 
-                    result = {
-                        'model': pipe,
-                        'model_type': model_type,
-                        'best_params': best_params,
-                        'metrics': {
-                            'train_mse': train_mse,
-                            'test_mse': test_mse,
-                            'train_mae': train_mae,
-                            'test_mae': test_mae,
-                            'train_r2': train_r2,
-                            'test_r2': test_r2
-                        },
-                        'predictions': {
-                            'X_test': X_test,
-                            'y_test': y_test,
-                            'y_test_pred': y_test_pred
-                        }
-                    }
-                    
-                    logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
-                    logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
-                    
-                    return result
+                study = optuna.create_study(direction='minimize')
+                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
+
+                best_params = study.best_params
+                best_score = -study.best_value
+                logger.info(f"Optuna优化完成: 最佳参数 {best_params}, 最佳CV MSE {best_score:.6f}")
+
+                # 使用最佳参数重新训练
+                pipeline.set_params(**best_params)
             except ImportError:
-                logger.error("Optuna未安装，跳过Optuna搜索")
+                logger.error("Optuna未安装，自动回退到网格搜索")
+                use_optuna = False  # 回退
+
+        if use_grid_search and not use_optuna:
+            grid_search = GridSearchCV(
+                pipeline, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1
+            )
+            grid_search.fit(X_train, y_train)
+            best_params = grid_search.best_params_
+            best_score = -grid_search.best_score_
+            logger.info(f"网格搜索完成: 最佳参数 {best_params}, 最佳CV MSE {best_score:.6f}")
+            # 使用最佳参数重新训练
+            pipeline.set_params(**best_params)
+
+        # ----------------------- 最终模型训练 -----------------------
+        pipeline.fit(X_train, y_train)
+
+        # 预测
+        y_train_pred = pipeline.predict(X_train)
+        y_test_pred = pipeline.predict(X_test)
+
+        # 计算评估指标
+        train_mse = mean_squared_error(y_train, y_train_pred)
+        test_mse = mean_squared_error(y_test, y_test_pred)
+        train_mae = mean_absolute_error(y_train, y_train_pred)
+        test_mae = mean_absolute_error(y_test, y_test_pred)
+        train_r2 = r2_score(y_train, y_train_pred)
+        test_r2 = r2_score(y_test, y_test_pred)
+
+        # 特征重要性（如果模型支持）
+        feature_importance = {}
+        booster = pipeline.named_steps['regressor']
+        if hasattr(booster, 'feature_importances_'):
+            importances = booster.feature_importances_
+            feature_names = X.columns.tolist() if hasattr(X, 'columns') else [f'f{i}' for i in range(len(importances))]
+            for i, imp in enumerate(importances):
+                if i < len(feature_names):
+                    feature_importance[feature_names[i]] = float(imp)
+
+        # 额外指标：针对 XGBoost 记录 best_iteration / val_logloss
+        extra_metrics = {}
+        if model_type == 'xgboost':
+            if hasattr(booster, 'best_iteration'):
+                extra_metrics['best_iteration'] = int(booster.best_iteration)
+            evals = getattr(booster, 'evals_result_', None)
+            if evals and isinstance(evals, dict) and 'validation_0' in evals:
+                logloss_list = evals['validation_0'].get('logloss', [])
+                if logloss_list:
+                    extra_metrics['val_logloss'] = float(min(logloss_list))
+
+        # 构建结果
+        result = {
+            'model': pipeline,
+            'model_type': model_type,
+            'best_params': best_params,
+            'cv_score': best_score,
+            # 记录回归器所有参数
+            'all_params': pipeline.named_steps['regressor'].get_params(),
+            'feature_names': X.columns.tolist() if hasattr(X, 'columns') else [],
+            'feature_importance': feature_importance,
+            'metrics': {
+                'train_mse': train_mse,
+                'test_mse': test_mse,
+                'train_mae': train_mae,
+                'test_mae': test_mae,
+                'train_r2': train_r2,
+                'test_r2': test_r2
+            },
+            'predictions': {
+                'X_test': X_test,
+                'y_test': y_test,
+                'y_test_pred': y_test_pred
+            }
+        }
+        # 合并额外指标
+        result.update(extra_metrics)
+
+        logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+        logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
+        logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
+
+        return result
 
     def _empty_regression_result(self, model_type: str, X: pd.DataFrame):
         """当缺少依赖时返回占位结果"""

@@ -728,9 +728,14 @@ class UnifiedDataAccessLayer:
         min_date = data.index.min().date()
         max_date = data.index.max().date()
     
-        # 允许首尾各 3 天误差（考虑节假日或停牌）
+        # 设置首尾日期允许的最大缺口天数，考虑到长假或停牌等情况
+        tolerance_days = 10  # 过去的 3 天过于严格，放宽到 10 天
+        # 计算首尾缺口
         head_gap = (min_date - start_date.date()).days
-        if head_gap > 3:
+        if head_gap > tolerance_days:
+            return False
+        tail_gap = (end_date.date() - max_date).days
+        if tail_gap > tolerance_days:
             return False
         # 如果尾部缺口<=3天则认为可接受
         tail_gap = (end_date.date() - max_date).days
