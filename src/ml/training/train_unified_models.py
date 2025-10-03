@@ -121,7 +121,7 @@ def information_coefficient(y_true, y_pred, window: int = 120):
 
 # scorer 对象，可直接用于 sklearn 的 cross_val_score / GridSearchCV
 ic_scorer = make_scorer(information_coefficient, greater_is_better=True)
-from ml.evaluation.metrics import sharpe_ratio, information_ratio
+from src.ml.evaluation.metrics import sharpe_ratio, information_ratio
 sharpe_scorer = make_scorer(sharpe_ratio, greater_is_better=True)
 ir_scorer = make_scorer(information_ratio, greater_is_better=True)
 
@@ -623,7 +623,7 @@ class UnifiedModelTrainer:
                             pipe.set_params(**trial_params_no_es)
                             cv = TimeSeriesSplit(n_splits=3)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
-                            return 1 - scores.mean()  # minimize
+                            return scores.mean()  # maximize
                     elif model_type == 'logistic':
                         classifier = LogisticRegression(max_iter=1000, solver='liblinear')
                         def objective(trial):
@@ -634,11 +634,17 @@ class UnifiedModelTrainer:
                             pipe.set_params(**trial_params)
                             cv = TimeSeriesSplit(n_splits=3)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
-                            return 1 - scores.mean()
+                            return scores.mean()
                     else:
                         raise ValueError("不支持的分类模型类型")
 
+                    # 构建包含特征工程的管道: 缺失值填充 → 分位数缩尾 → 跨截面Z分数标准化 → 分类器
+                    from sklearn.impute import SimpleImputer
+                    from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore
                     pipe = Pipeline([
+                            ('imputer', SimpleImputer(strategy='median')),
+                            ('winsorizer', Winsorizer()),
+                            ('zscore', CrossSectionZScore()),
                             ('classifier', classifier)
                         ])
 
@@ -647,7 +653,7 @@ class UnifiedModelTrainer:
                     study = optuna.create_study(direction='maximize')
 
                     # ---------- Optuna 早停策略: 指定连续 early_stop_rounds 次未提升则停止 ----------
-                    early_stop_rounds = 200  # 可视情况调整
+                    early_stop_rounds = 10  # 可视情况调整
                     def early_stopping_callback(study, trial):
                         """当连续 early_stop_rounds 次 trial 未带来提升时停止搜索"""
                         # 获取当前最佳值
@@ -791,7 +797,7 @@ class UnifiedModelTrainer:
                     )
                 # ---- 持久化交叉验证各折指标到 CSV ----
                 try:
-                    from ml.evaluation.metrics_io import save_cv_metrics
+                    from src.ml.evaluation.metrics_io import save_cv_metrics
                     metrics_dir = 'metrics'
                     os.makedirs(metrics_dir, exist_ok=True)
                     csv_path = os.path.join(metrics_dir, f"{model_type}_classification_cv_scores.csv")
@@ -962,7 +968,7 @@ class UnifiedModelTrainer:
             }
             # 追加新评估指标
             try:
-                from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+                from src.ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
                 metrics.update({
                     'rank_ic': float(rank_ic(y_test, y_pred)),
                     'top_decile_spread': float(top_decile_spread(y_test, y_pred)),
@@ -978,7 +984,7 @@ class UnifiedModelTrainer:
             # ================ 保存交叉验证各折指标 ================
             try:
                 from sklearn.model_selection import cross_validate
-                from ml.evaluation.metrics_io import save_cv_metrics
+                from src.ml.evaluation.metrics_io import save_cv_metrics
                 cv = get_cv(n_splits=5, embargo=60)
                 scoring = {
                     'ic': ic_scorer,
@@ -1183,8 +1189,12 @@ class UnifiedModelTrainer:
         # 移除树模型的Optuna优化逻辑，这些逻辑应该在 _train_tree_regression_model 中处理
 
         # 创建管线
+        from sklearn.impute import SimpleImputer
+        from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore
         pipeline = Pipeline([
-            ('scaler', StandardScaler()),
+            ('imputer', SimpleImputer(strategy='median')),
+            ('winsor', Winsorizer()),
+            ('zscore', CrossSectionZScore()),
             ('regressor', regressor)
         ])
         
@@ -1221,7 +1231,7 @@ class UnifiedModelTrainer:
         
         # 新增金融评估指标 (RankIC, Top Decile Spread, Hit Rate)
         try:
-            from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+            from src.ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
             train_rank_ic = rank_ic(y_train, y_train_pred)
             test_rank_ic = rank_ic(y_test, y_test_pred)
             train_top_decile_spread = top_decile_spread(y_train, y_train_pred)
@@ -1288,7 +1298,7 @@ class UnifiedModelTrainer:
         # ================= 保存交叉验证各折指标 =================
         try:
             from sklearn.model_selection import cross_validate
-            from ml.evaluation.metrics_io import save_cv_metrics
+            from src.ml.evaluation.metrics_io import save_cv_metrics
             cv = get_cv(n_splits=5, embargo=60)
             scoring = {
                 'ic': ic_scorer,
@@ -1571,7 +1581,7 @@ class UnifiedModelTrainer:
 
         # 新增金融评估指标 (RankIC, Top Decile Spread, Hit Rate)
         try:
-            from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+            from src.ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
             train_rank_ic = rank_ic(y_train, y_train_pred)
             test_rank_ic = rank_ic(y_test, y_test_pred)
             train_top_decile_spread = top_decile_spread(y_train, y_train_pred)
@@ -1648,7 +1658,7 @@ class UnifiedModelTrainer:
         # ================ 保存交叉验证各折指标 ================
         try:
             from sklearn.model_selection import cross_validate
-            from ml.evaluation.metrics_io import save_cv_metrics
+            from src.ml.evaluation.metrics_io import save_cv_metrics
             cv = get_cv(n_splits=5, embargo=60)
             scoring = {
                 'ic': ic_scorer,
@@ -1676,6 +1686,74 @@ class UnifiedModelTrainer:
             logger.warning(f"保存交叉验证指标失败: {err}")
 
         return result
+
+    def nested_cv(self, X: pd.DataFrame, y: pd.Series, mode: str = 'regression',
+                 reg_models: List[str] = None, outer_splits: int = 5, inner_splits: int = 3,
+                 use_optuna: bool = False, optimization_trials: int = 50) -> Dict[str, Any]:
+        """基于 PurgedKFoldWithEmbargo 的 Nested Cross-Validation
+
+        目前仅针对回归任务实现，返回每个模型在外层测试集上的 IC 指标列表与均值/标准差。
+        Args:
+            X: 特征 DataFrame
+            y: 标签 Series
+            mode: 当前仅允许 'regression'
+            reg_models: 指定需要评估的回归模型列表
+            outer_splits: 外层折数 (默认5)
+            inner_splits: 内层折数 (当前参数预留，内部调用 _train_single_regression_model 时通过 Optuna/网格搜索实现)
+            use_optuna: 是否在内层使用 Optuna
+            optimization_trials: Optuna trial 数
+        Returns:
+            summary: {model_type: {outer_fold_scores: List[float], mean_ic: float, std_ic: float}}
+        """
+        if mode != 'regression':
+            raise NotImplementedError("nested_cv 目前仅支持回归任务")
+
+        if reg_models is None:
+            reg_models = ['xgboost', 'lightgbm', 'catboost', 'lasso']
+
+        # 初始化结果容器
+        outer_results: Dict[str, List[float]] = {m: [] for m in reg_models}
+        outer_cv = get_cv(n_splits=outer_splits)
+
+        logger.info(f"[NestedCV] 开始 Nested CV: outer_splits={outer_splits}, inner_splits={inner_splits}, models={reg_models}")
+        for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X)):
+            logger.info(f"[NestedCV] Outer Fold {fold_idx + 1}/{outer_splits}: 训练 {len(train_idx)} 样本, 测试 {len(test_idx)} 样本")
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            for model_type in reg_models:
+                try:
+                    # 内层搜索由 _train_single_regression_model 内部完成
+                    model_type_key, result = self._train_single_regression_model(
+                        X_train, y_train,
+                        model_type=model_type,
+                        use_grid_search=0 if use_optuna else 1,
+                        use_optuna=use_optuna,
+                        optimization_trials=optimization_trials
+                    )
+                    if result is None:
+                        logger.warning(f"[NestedCV] {model_type} 在 Outer Fold {fold_idx + 1} 训练失败，跳过")
+                        continue
+                    trained_model = result['model']
+                    y_pred = trained_model.predict(X_test)
+                    ic_val = information_coefficient(y_test, y_pred)
+                    outer_results[model_type].append(ic_val)
+                    logger.info(f"[NestedCV] Outer {fold_idx + 1} - {model_type}: IC={ic_val:.4f}")
+                except Exception as err:
+                    logger.error(f"[NestedCV] {model_type} 在 Outer Fold {fold_idx + 1} 异常: {err}")
+
+        # 汇总
+        summary: Dict[str, Any] = {}
+        for model_type, scores in outer_results.items():
+            if not scores:
+                continue
+            summary[model_type] = {
+                'outer_fold_scores': scores,
+                'mean_ic': float(np.mean(scores)),
+                'std_ic': float(np.std(scores))
+            }
+        logger.info(f"[NestedCV] 完成 Nested CV 评估: {summary}")
+        return summary
 
     def _empty_regression_result(self, model_type: str, X: pd.DataFrame):
         """当缺少依赖时返回占位结果"""
@@ -1751,6 +1829,10 @@ def main():
     parser.add_argument("--mode", choices=['classification', 'regression', 'both'], default='both', help="训练模式")
     parser.add_argument("--no_grid_search", action="store_true", help="禁用网格搜索以加快速度")
     parser.add_argument("--use_optuna", action="store_true", help="使用Optuna进行超参数优化（优先级高于网格搜索）")
+    # Nested CV 参数
+    parser.add_argument("--nested-cv", action="store_true", dest="nested_cv", help="启用 Nested Cross-Validation 评估")
+    parser.add_argument("--outer-splits", type=int, default=5, help="Nested CV 外层折数 (默认5)")
+    parser.add_argument("--inner-splits", type=int, default=3, help="Nested CV 内层折数 (默认3)")
     parser.add_argument("--optimization_trials", type=int, default=50, help="Optuna/Bayesian优化时的迭代次数 (默认50)")
     # 新增: 关闭特征选择开关
     parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
@@ -1806,6 +1888,18 @@ def main():
         
         logger.info(f"最终训练数据: {X.shape[0]} 样本, {X.shape[1]} 特征")
         
+        # 若启用 Nested CV，则先进行 Nested CV 评估
+        if getattr(args, "nested_cv", False):
+            logger.info("启用 Nested Cross-Validation 评估模式 …")
+            nested_summary = trainer.nested_cv(
+                X, y['reg'] if isinstance(y, dict) else y,
+                mode='regression',
+                outer_splits=args.outer_splits,
+                inner_splits=args.inner_splits,
+                use_optuna=args.use_optuna,
+                optimization_trials=args.optimization_trials
+            )
+            logger.info(f"Nested CV 评估结果: {nested_summary}")
         # 训练所有模型
         results = trainer.train_models(
             X,
@@ -1847,6 +1941,10 @@ if __name__ == "__main__":
     parser.add_argument('--reg-models', type=str, default=None,
                         help='要训练的回归模型列表，逗号分隔。例如 "lasso,ridge"；若为空使用默认')
 
+    # 训练优化相关
+    parser.add_argument('--nested-cv', action='store_true', dest='nested_cv', help='启用 Nested Cross-Validation 评估')
+    parser.add_argument('--outer-splits', type=int, default=5, help='Nested CV 外层折数 (默认5)')
+    parser.add_argument('--inner-splits', type=int, default=3, help='Nested CV 内层折数 (默认3)')
     # 训练优化相关
     parser.add_argument('--use-grid-search', type=int, default=1, choices=[0, 1],
                         help='是否启用网格搜索（0/1，默认：1）')
