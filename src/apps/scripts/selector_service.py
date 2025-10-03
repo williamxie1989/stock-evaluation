@@ -8,7 +8,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import joblib
 import os
 # 新增 json 导入
@@ -85,7 +85,8 @@ class IntelligentStockSelector:
             logger.debug(f"替换匿名特征名失败: {e}")
     
     def __init__(self, db_manager: UnifiedDatabaseManager = None, use_enhanced_features: bool = 1, 
-                 use_enhanced_preprocessing: bool = 1, preprocessing_complexity: str = 'medium'):
+                 use_enhanced_preprocessing: bool = 1, preprocessing_complexity: str = 'medium',
+                 model_config_path: str = 'config/selector_models.json'):
         """
         初始化智能选股器
         """
@@ -117,6 +118,9 @@ class IntelligentStockSelector:
         self.cls_preprocessor = None
         self.reg_preprocessor = None
         
+        # 模型配置文件路径（支持通过外部文件/环境变量指定模型位置）
+        self.model_config_path = model_config_path
+
         if self.use_enhanced_preprocessing:
             # 初始化预处理配置
             self.cls_preprocessing_config = create_enhanced_preprocessing_config('classification', preprocessing_complexity)
@@ -203,6 +207,58 @@ class IntelligentStockSelector:
             logger.error(f"模型加载失败: {e}")
             return 0
     
+    # ========= 新增方法：获取模型路径（环境变量优先，其次配置文件） =========
+    def _get_config_model_paths(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        根据环境变量或 JSON 配置文件获取分类与回归模型路径
+
+        优先级：
+        1. 环境变量 SELECTOR_CLS_MODEL_PATH、SELECTOR_REG_MODEL_PATH
+        2. JSON 配置文件 self.model_config_path，格式示例：
+           {
+               "classification": "/abs/path/to/cls_model.pkl",
+               "regression": "/abs/path/to/reg_model.pkl"
+           }
+
+        Returns
+        -------
+        Tuple[Optional[str], Optional[str]]
+            (cls_model_path, reg_model_path)
+        """
+        cls_path = os.getenv('SELECTOR_CLS_MODEL_PATH')
+        reg_path = os.getenv('SELECTOR_REG_MODEL_PATH')
+
+        # 处理相对路径 -> 绝对路径
+        if cls_path and not os.path.isabs(cls_path):
+            cls_path = os.path.abspath(cls_path)
+        if reg_path and not os.path.isabs(reg_path):
+            reg_path = os.path.abspath(reg_path)
+
+        # 如果任意一个路径缺失或文件不存在，则尝试读取配置文件
+        need_config = (not cls_path or not os.path.exists(cls_path)) or (not reg_path or not os.path.exists(reg_path))
+        if need_config and self.model_config_path and os.path.exists(self.model_config_path):
+            try:
+                with open(self.model_config_path, 'r', encoding='utf-8') as cf:
+                    cfg = json.load(cf)
+                if (not cls_path or not os.path.exists(cls_path)):
+                    cls_candidate = cfg.get('classification') or cfg.get('cls')
+                    if cls_candidate:
+                        cls_candidate = os.path.abspath(cls_candidate)
+                        if os.path.exists(cls_candidate):
+                            cls_path = cls_candidate
+                if (not reg_path or not os.path.exists(reg_path)):
+                    reg_candidate = cfg.get('regression') or cfg.get('reg')
+                    if reg_candidate:
+                        reg_candidate = os.path.abspath(reg_candidate)
+                        if os.path.exists(reg_candidate):
+                            reg_path = reg_candidate
+            except Exception as e:
+                logger.debug(f"解析模型配置文件失败: {e}")
+
+        # 最终返回存在的路径，否则返回 None
+        return (cls_path if cls_path and os.path.exists(cls_path) else None,
+                reg_path if reg_path and os.path.exists(reg_path) else None)
+
     # 新增：同时加载30d的分类与回归模型
     def load_models(self, period: str = '30d') -> bool:
         try:
@@ -251,6 +307,40 @@ class IntelligentStockSelector:
                 except Exception as e:
                     logger.debug(f"读取模型失败 {fpath}: {e}")
                     continue
+            # ========= 新增: 优先使用配置文件/环境变量指定模型 =========
+            cls_cfg_path, reg_cfg_path = self._get_config_model_paths()
+            cfg_loaded = False
+            if cls_cfg_path and os.path.exists(cls_cfg_path):
+                try:
+                    with open(cls_cfg_path, 'rb') as f:
+                        self.cls_model_data = pickle.load(f)
+                    logger.info(f"已根据配置加载分类模型: {cls_cfg_path}")
+                    cfg_loaded = True
+                    # 处理特征名
+                    if isinstance(self.cls_model_data, dict):
+                        self.cls_feature_names = self.cls_model_data.get('feature_names') or []
+                    else:
+                        if hasattr(self.cls_model_data, 'feature_names_in_'):
+                            self.cls_feature_names = list(self.cls_model_data.feature_names_in_)
+                except Exception as e:
+                    logger.warning(f"配置的分类模型加载失败: {e}")
+            if reg_cfg_path and os.path.exists(reg_cfg_path):
+                try:
+                    with open(reg_cfg_path, 'rb') as f:
+                        self.reg_model_data = pickle.load(f)
+                    logger.info(f"已根据配置加载回归模型: {reg_cfg_path}")
+                    cfg_loaded = True
+                    if isinstance(self.reg_model_data, dict):
+                        self.reg_feature_names = self.reg_model_data.get('feature_names') or []
+                    else:
+                        if hasattr(self.reg_model_data, 'feature_names_in_'):
+                            self.reg_feature_names = list(self.reg_model_data.feature_names_in_)
+                except Exception as e:
+                    logger.warning(f"配置的回归模型加载失败: {e}")
+            if cfg_loaded:
+                # 若已通过配置成功加载任一模型，则直接返回
+                return bool(self.cls_model_data or self.reg_model_data)
+            # ========= 结束新增优先逻辑 =========
             if cls_candidates:
                 # 优先选择xgboost模型，如果没有则选择最新模型
                 xgboost_candidates = [(fname, data) for fname, data in cls_candidates if 'xgboost' in fname.lower()]
@@ -644,15 +734,26 @@ class IntelligentStockSelector:
                     elif scaler_r is not None:
                         Xr_input = scaler_r.transform(Xr)
                     else:
-                        # 在线标准化，避免数值尺度问题
+                        # stacking 回归模型，禁用在线标准化回退逻辑，保持与训练阶段一致。
+                        is_stacking_model = False
                         try:
-                            col_std = Xr.std().replace(0, 1e-6)
-                            Xr_norm = (Xr - Xr.mean()) / col_std
-                            Xr_input = Xr_norm.clip(-5, 5).fillna(0)
-                            logger.info("回归模型未找到标准化器，已对特征进行在线标准化处理")
+                            meta = self.reg_model_data.get('metadata', {}) if self.reg_model_data else {}
+                            is_stacking_model = (meta.get('model_type') == 'stacking')
                         except Exception:
-                            logger.warning("回归模型在线标准化失败，退回原始特征")
+                            pass
+                        if is_stacking_model:
                             Xr_input = Xr
+                            logger.info("检测到 stacking 回归模型且无外部 scaler，已跳过在线标准化")
+                        else:
+                            # 在线标准化，避免数值尺度问题
+                            try:
+                                col_std = Xr.std().replace(0, 1e-6)
+                                Xr_norm = (Xr - Xr.mean()) / col_std
+                                Xr_input = Xr_norm.clip(-5, 5).fillna(0)
+                                logger.info("回归模型未找到标准化器，已对特征进行在线标准化处理")
+                            except Exception:
+                                logger.warning("回归模型在线标准化失败，退回原始特征")
+                                Xr_input = Xr
                 
                 exp_returns = model_r.predict(Xr_input)
                 logger.info(f"回归模型预测成功，样本数: {len(exp_returns)}")
@@ -1079,7 +1180,7 @@ class IntelligentStockSelector:
                     else:
                         logger.info("已使用旧模型接口")
         
-            # 获取所有股票代码（仅A股主板/创业板，排除BJ）
+            # 获取所有股票代码（仅A股主板/创业板，excludeBJ）
             symbols_data = self.db.list_symbols(markets=['SH','SZ'])
             symbols = [s.get('symbol') for s in symbols_data if s.get('symbol')]
         
@@ -1090,7 +1191,7 @@ class IntelligentStockSelector:
                     'data': {'picks': []}
                 }
             
-            # 在候选池阶段过滤无效股票（排除None.*、000000、格式不规范等），并记录统计
+            # 在候选池阶段过滤无效股票（excludeNone.*、000000、格式不规范等），并记录统计
             invalid_pattern_count = 0
             filtered_by_status = 0
             valid_symbols = []

@@ -1195,6 +1195,7 @@ class UnifiedModelTrainer:
             ('imputer', SimpleImputer(strategy='median')),
             ('winsor', Winsorizer()),
             ('zscore', CrossSectionZScore()),
+            ('scaler', StandardScaler()),
             ('regressor', regressor)
         ])
         
