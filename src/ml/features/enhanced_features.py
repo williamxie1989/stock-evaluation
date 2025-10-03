@@ -40,10 +40,9 @@ class EnhancedFeatureGenerator:
             'momentum_periods': [5, 10, 15, 20],  # 4个周期 = 4个特征
             'stochastic_periods': [9, 12, 14, 21],  # 4个周期 × 2个特征 = 8个特征
             'williams_periods': [10, 14, 20],  # 3个周期 = 3个特征
-            
             # 波动率指标配置
             'atr_periods': [10, 14, 20, 25],  # 4个周期 = 4个特征
-            'volatility_periods': [5, 8, 10, 15, 20, 30],  # 6个周期 = 6个特征
+            'volatility_periods': [5, 8, 10, 15, 20, 30, 252],  # 7个周期, 新增252日历史波动率
             
             # 成交量指标配置
             'volume_ma_periods': [5, 8, 10, 15, 20, 30],  # 6个周期 = 6个特征

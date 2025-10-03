@@ -30,6 +30,116 @@ from src.core.unified_data_access_factory import create_unified_data_access
 from src.ml.features.enhanced_features import EnhancedFeatureGenerator
 from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from src.ml.training.enhanced_ml_trainer import EnhancedMLTrainer
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV, cross_val_score
+from sklearn.metrics import make_scorer
+from sklearn.model_selection import BaseCrossValidator
+
+# ---------------- 滚动时间窗交叉验证 ----------------
+class RollingWindowSplit(BaseCrossValidator):
+    """按滚动时间窗进行交叉验证。例如设 n_splits=5, window=120, horizon=20:
+    第1折: 0~119 训练, 120~139 验证
+    第2折: 20~139 训练, 140~159 验证
+    以此类推。
+    参数
+    ------
+    window: 训练集窗口长度
+    horizon: 测试集长度
+    step: 窗口滚动步长
+    """
+    def __init__(self, n_splits: int = 5, window: int = 120, horizon: int = 20, step: int = 20):
+        self.n_splits = n_splits
+        self.window = window
+        self.horizon = horizon
+        self.step = step
+
+    def split(self, X, y=None, groups=None):
+        n_samples = len(X)
+        start = 0
+        for i in range(self.n_splits):
+            train_start = start
+            train_end = train_start + self.window  # exclusive
+            test_start = train_end
+            test_end = test_start + self.horizon
+            if test_end > n_samples:
+                break
+            train_idx = np.arange(train_start, train_end)
+            test_idx = np.arange(test_start, test_end)
+            yield (train_idx, test_idx)
+            start += self.step
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        """根据数据长度动态返回实际可用的折数，避免 \n        当样本不足时 self.n_splits 大于实际生成的折数，导致交叉验证报错"""
+        if X is None:
+            # 如果无法获知样本数，则保守返回 self.n_splits
+            return self.n_splits
+        n_samples = len(X)
+        # 计算在给定 window/horizon/step 下，最多可以生成多少折
+        max_possible = (n_samples - self.window - self.horizon) // self.step + 1
+        max_possible = max_possible if max_possible > 0 else 0
+        return min(self.n_splits, max_possible)
+
+# ---------- 使用改进的 PurgedKFoldWithEmbargo 统一交叉验证 ----------
+from src.ml.evaluation.cv_utils import PurgedKFoldWithEmbargo
+# 将 RollingWindowSplit 指向 PurgedKFoldWithEmbargo，以在后续代码统一使用
+RollingWindowSplit = PurgedKFoldWithEmbargo
+
+def get_cv(n_splits: int = 5, embargo: int = 60):
+    """统一返回交叉验证分割器，便于后续替换实现。"""
+    return PurgedKFoldWithEmbargo(n_splits=n_splits, embargo=embargo)
+
+# ---------------- 加权信息系数(IC)评估器 ----------------
+
+import numpy as np
+
+def _recency_weights(length: int, window: int = 120):
+    """生成指数衰减权重，使最近 window 个样本权重更高"""
+    if length <= 0:
+        return np.array([])
+    idx = np.arange(length)
+    rel = (idx - idx.min()) / max(1, length - 1)  # 归一化到 [0,1]
+    tau = max(window, 1)
+    w = np.exp(rel * tau / window)
+    return w
+
+
+def information_coefficient(y_true, y_pred, window: int = 120):
+    """加权 Pearson IC，使用最近样本加权 (window=120)"""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = len(y_true)
+    if n <= 1 or np.allclose(np.std(y_true), 0):
+        return 0.0
+    w = _recency_weights(n, window)
+    w /= w.sum()
+    mu_y = np.sum(w * y_true)
+    mu_p = np.sum(w * y_pred)
+    cov = np.sum(w * (y_true - mu_y) * (y_pred - mu_p))
+    var_y = np.sum(w * (y_true - mu_y) ** 2)
+    var_p = np.sum(w * (y_pred - mu_p) ** 2)
+    denom = np.sqrt(var_y * var_p)
+    return float(cov / denom) if denom > 0 else 0.0
+
+# scorer 对象，可直接用于 sklearn 的 cross_val_score / GridSearchCV
+ic_scorer = make_scorer(information_coefficient, greater_is_better=True)
+from ml.evaluation.metrics import sharpe_ratio, information_ratio
+sharpe_scorer = make_scorer(sharpe_ratio, greater_is_better=True)
+ir_scorer = make_scorer(information_ratio, greater_is_better=True)
+
+# ================= 新增: 加权 MSE 评估器 (Weighted MSE) =================
+
+def weighted_mse(y_true, y_pred, window: int = 120):
+    """加权均方误差 (窗口内最近样本权重更高, 越小越好)"""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+    w = _recency_weights(n, window)
+    w /= w.sum()
+    return float(np.sum(w * (y_true - y_pred) ** 2))
+
+# scorer: greater_is_better=False 代表 Optuna/网格搜索将最小化该分数
+weighted_mse_scorer = make_scorer(weighted_mse, greater_is_better=False)
 
 # 配置日志
 logging.basicConfig(
@@ -98,7 +208,8 @@ class UnifiedModelTrainer:
         
         if 'symbol' not in stock_list.columns:
             raise ValueError("股票列表缺少 'symbol' 列，请检查数据访问层是否已生成标准化代码")
-        symbols = stock_list['symbol'].tolist()
+        symbols_info = stock_list.set_index('symbol')
+        symbols = symbols_info.index.tolist()
         # 随机打乱股票列表，确保覆盖沪深主板及创业板
         np.random.shuffle(symbols)
         logger.info(f"随机打乱后股票总数 {len(symbols)}，将从中抽取 {n_stocks} 只")
@@ -181,6 +292,11 @@ class UnifiedModelTrainer:
                     failed_stocks.append(symbol)
                     continue
 
+                # 行业 One-Hot 和市值特征
+                industry = symbols_info.loc[symbol, 'industry'] if 'industry' in symbols_info.columns else None
+                market_cap = symbols_info.loc[symbol, 'market_cap'] if 'market_cap' in symbols_info.columns else None
+                aligned_features['industry'] = industry
+                aligned_features['market_cap_log'] = np.log1p(market_cap) if market_cap is not None else np.nan
                 aligned_features['symbol'] = symbol
                 all_features.append(aligned_features)
                 all_reg_labels.extend(reg_labels)
@@ -277,6 +393,11 @@ class UnifiedModelTrainer:
     def _preprocess_data(self, X: pd.DataFrame, y_reg: pd.Series, y_cls: pd.Series) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
         """数据预处理 - 包含特征选择优化"""
         logger.info("开始数据预处理...")
+        
+        # 行业One-Hot编码
+        if 'industry' in X.columns:
+            industry_dummies = pd.get_dummies(X['industry'], prefix='ind', dummy_na=True)
+            X = pd.concat([X.drop(columns=['industry']), industry_dummies], axis=1)
         
         # 移除非数值列
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
@@ -457,12 +578,15 @@ class UnifiedModelTrainer:
         """训练单个分类模型（用于多线程）"""
         try:
             logger.info(f"开始训练 {model_type} 分类模型...")
+            # 初始化占位变量，确保后续逻辑在未触发 Optuna/网格搜索时也能安全引用
+            best_params = {}
+            cv_score = None
             
             # 如果启用Optuna且安装optuna，则进行贝叶斯优化
             if use_optuna:
                 try:
                     import optuna
-                    from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score, GridSearchCV
+                    # 已在模块顶部统一导入 TimeSeriesSplit 与 cross_val_score，删除局部导入避免作用域问题
                     from sklearn.preprocessing import StandardScaler
                     from sklearn.pipeline import Pipeline
                     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -482,15 +606,21 @@ class UnifiedModelTrainer:
                             raise ImportError
                         def objective(trial):
                             trial_params = {
-                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 50, 300),
-                                'classifier__max_depth': trial.suggest_int('classifier__max_depth', 3, 10),
-                                'classifier__learning_rate': trial.suggest_float('classifier__learning_rate', 0.01, 0.3, log=True),
-                                'classifier__subsample': trial.suggest_float('classifier__subsample', 0.6, 1.0),
-                                'classifier__colsample_bytree': trial.suggest_float('classifier__colsample_bytree', 0.6, 1.0),
-                                'classifier__reg_lambda': trial.suggest_float('classifier__reg_lambda', 0.0, 5.0),
-                                'classifier__reg_alpha': trial.suggest_float('classifier__reg_alpha', 0.0, 5.0)
+                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 200, 2000),
+                                'classifier__max_depth': trial.suggest_int('classifier__max_depth', 3, 12),
+                                'classifier__learning_rate': trial.suggest_float('classifier__learning_rate', 0.01, 0.2, log=True),
+                                'classifier__subsample': trial.suggest_float('classifier__subsample', 0.5, 1.0),
+                                'classifier__colsample_bytree': trial.suggest_float('classifier__colsample_bytree', 0.5, 1.0),
+                                'classifier__min_child_weight': trial.suggest_int('classifier__min_child_weight', 1, 10),
+                                'classifier__gamma': trial.suggest_float('classifier__gamma', 0.0, 5.0),
+                                'classifier__max_delta_step': trial.suggest_int('classifier__max_delta_step', 0, 10),
+                                'classifier__grow_policy': trial.suggest_categorical('classifier__grow_policy', ['depthwise', 'lossguide']),
+                                'classifier__reg_lambda': trial.suggest_float('classifier__reg_lambda', 0.0, 10.0),
+                                'classifier__reg_alpha': trial.suggest_float('classifier__reg_alpha', 0.0, 10.0)
                             }
-                            pipe.set_params(**trial_params)
+                            # 关闭 early stopping 防止交叉验证报缺少验证集错误
+                            trial_params_no_es = {k: v for k, v in trial_params.items()}
+                            pipe.set_params(**trial_params_no_es)
                             cv = TimeSeriesSplit(n_splits=3)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
                             return 1 - scores.mean()  # minimize
@@ -509,16 +639,44 @@ class UnifiedModelTrainer:
                         raise ValueError("不支持的分类模型类型")
 
                     pipe = Pipeline([
-                        ('scaler', StandardScaler()),
-                        ('classifier', classifier)
-                    ])
+                            ('classifier', classifier)
+                        ])
 
-                    study = optuna.create_study(direction='minimize')
-                    study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
+                    pipe.set_params(classifier__n_estimators=800)
+
+                    study = optuna.create_study(direction='maximize')
+
+                    # ---------- Optuna 早停策略: 指定连续 early_stop_rounds 次未提升则停止 ----------
+                    early_stop_rounds = 200  # 可视情况调整
+                    def early_stopping_callback(study, trial):
+                        """当连续 early_stop_rounds 次 trial 未带来提升时停止搜索"""
+                        # 获取当前最佳值
+                        best_value = study.best_value
+                        # 第一次调用时初始化
+                        if 'no_improve_count' not in study.user_attrs:
+                            study.set_user_attr('no_improve_count', 0)
+                            study.set_user_attr('best_value_snap', best_value)
+                            return
+                        # 检查是否有提升
+                        direction = study.direction
+                        improved = (best_value < study.user_attrs['best_value_snap']) if direction.name == 'MINIMIZE' else (best_value > study.user_attrs['best_value_snap'])
+                        if improved:
+                            study.set_user_attr('no_improve_count', 0)
+                            study.set_user_attr('best_value_snap', best_value)
+                        else:
+                            cnt = study.user_attrs['no_improve_count'] + 1
+                            study.set_user_attr('no_improve_count', cnt)
+                            if cnt >= early_stop_rounds:
+                                logger.info(f"Optuna: 连续 {early_stop_rounds} 次未提升, 提前停止搜索")
+                                study.stop()
+
+                    study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False,
+                                    callbacks=[early_stopping_callback])
 
                     best_params = study.best_params
                     logger.info(f"Optuna完成: 最佳参数 {best_params}")
 
+                    # 使用最佳参数先执行交叉验证评估
                     pipe.set_params(**best_params)
                     # 基于时间序列切分再次交叉验证并记录各折指标
                     cv = TimeSeriesSplit(n_splits=3)
@@ -528,25 +686,27 @@ class UnifiedModelTrainer:
                     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
                     # 若为 XGBoost 则启用早停，监控验证集 logloss/AUC
                     fit_params = {}
+                    # 默认使用原始 DataFrame
+                    X_train_in, X_test_in = X_train, X_test
                     if model_type == 'xgboost':
-                        # XGBoost 对 eval_set 中的特征名与训练输入的特征名要求保持一致。
-                        # 由于训练数据在管道中经过 StandardScaler 后被转换为 numpy.ndarray（无列名），
-                        # 如果直接传入包含列名的 pandas.DataFrame 将导致 “data did not contain feature names” 错误。
+                        # XGBoost 对 eval_set 中的特征名与训练输入的特征名要求保持一致，
+                        # 因此将训练/验证特征统一转换为 numpy.ndarray，避免 "data did not contain feature names" 错误。
+                        X_train_in = X_train.values if hasattr(X_train, 'values') else X_train
+                        X_test_in = X_test.values if hasattr(X_test, 'values') else X_test
                         eval_set = [
-                            (X_train.values if hasattr(X_train, 'values') else X_train,
-                             y_train.values if hasattr(y_train, 'values') else y_train),
-                            (X_test.values if hasattr(X_test, 'values') else X_test,
-                             y_test.values if hasattr(y_test, 'values') else y_test)
+                            (X_train_in, y_train.values if hasattr(y_train, 'values') else y_train),
+                            (X_test_in, y_test.values if hasattr(y_test, 'values') else y_test)
                         ]
-                        # 将 early_stopping_rounds 设置为模型参数，而非传递给 fit
+                        # 为最终拟合重新启用早停（不影响 Optuna 交叉验证）
                         pipe.set_params(classifier__early_stopping_rounds=50)
+                        # 通过 fit_params 仅传递 eval_set 与 verbose
                         fit_params = {
                             'classifier__eval_set': eval_set,
                             'classifier__verbose': False
                         }
-                    pipe.fit(X_train, y_train, **fit_params)
-                    y_train_pred = pipe.predict(X_train)
-                    y_test_pred = pipe.predict(X_test)
+                    pipe.fit(X_train_in, y_train, **fit_params)
+                    y_train_pred = pipe.predict(X_train_in)
+                    y_test_pred = pipe.predict(X_test_in)
 
                     # 如果是 XGBoost，记录验证集最佳迭代及 logloss
                     extra_metrics = {}
@@ -554,11 +714,15 @@ class UnifiedModelTrainer:
                         booster = pipe.named_steps['classifier']
                         if hasattr(booster, 'best_iteration'):
                             extra_metrics['best_iteration'] = int(booster.best_iteration)
-                        if booster.evals_result_ and 'validation_0' in booster.evals_result_:
-                            logloss_list = booster.evals_result_['validation_0'].get('logloss', [])
-                            if logloss_list:
-                                extra_metrics['val_logloss'] = float(min(logloss_list))
-
+                        if booster.evals_result_:
+                            # XGBoost 将训练集命名为 validation_0，验证集为 validation_1
+                            val_logloss = booster.evals_result_.get('validation_1', {}).get('logloss', [])
+                            val_auc = booster.evals_result_.get('validation_1', {}).get('auc', [])
+                            if val_logloss:
+                                extra_metrics['val_logloss'] = float(min(val_logloss))
+                            if val_auc:
+                                # AUC 越大越好，记录最大值
+                                extra_metrics['val_auc'] = float(max(val_auc))
                     result = {
                          'model': pipe,
                          'model_type': model_type,
@@ -615,19 +779,25 @@ class UnifiedModelTrainer:
                 test_recall = metrics.get('test_recall', 0)
                 test_f1 = metrics.get('test_f1', 0)
                 logger.info(f"{model_type} 分类模型性能: 训练准确率={train_acc:.4f}, 测试准确率={test_acc:.4f}, 精确率={test_precision:.4f}, 召回率={test_recall:.4f}, F1={test_f1:.4f}")
+                # 如果包含早停相关指标，额外输出
+                best_iter = metrics.get('best_iteration') if isinstance(metrics, dict) else None
+                if best_iter is not None:
+                    val_logloss = metrics.get('val_logloss', None)
+                    val_auc = metrics.get('val_auc', None)
+                    logger.info(
+                        f"{model_type} 早停结果: best_iteration={best_iter}, "
+                        f"val_logloss={val_logloss if val_logloss is not None else 'NA'}, "
+                        f"val_auc={val_auc if val_auc is not None else 'NA'}"
+                    )
                 # ---- 持久化交叉验证各折指标到 CSV ----
                 try:
-                    import csv
+                    from ml.evaluation.metrics_io import save_cv_metrics
                     metrics_dir = 'metrics'
                     os.makedirs(metrics_dir, exist_ok=True)
                     csv_path = os.path.join(metrics_dir, f"{model_type}_classification_cv_scores.csv")
                     cv_scores = metrics.get('cv_scores') if isinstance(metrics, dict) else None
                     if cv_scores is not None:
-                        with open(csv_path, 'w', newline='') as f_csv:
-                            writer = csv.writer(f_csv)
-                            writer.writerow(['fold', 'accuracy'])
-                            for idx, score in enumerate(cv_scores, start=1):
-                                writer.writerow([idx, score])
+                        save_cv_metrics({'accuracy': cv_scores}, csv_path)
                         logger.info(f"交叉验证指标已保存到: {csv_path}")
                 except Exception as err:
                     logger.warning(f"保存交叉验证指标失败: {err}")
@@ -641,6 +811,220 @@ class UnifiedModelTrainer:
         except Exception as e:
             logger.error(f"训练 {model_type} 分类模型失败: {e}")
             return model_type, None
+
+    def _train_stacking_regression_model(self, X: pd.DataFrame, y: pd.Series,
+                                       use_grid_search: bool = 1,
+                                       use_optuna: bool = False, optimization_trials: int = 50):
+        """训练 stacking 回归器 (LightGBM + XGBoost + Ridge -> XGBoost 元学习器)"""
+        try:
+            # 初始化变量，确保在任何返回路径中都有定义
+            best_params = {}
+            cv_score = None
+            
+            from sklearn.model_selection import train_test_split
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.pipeline import Pipeline
+            from sklearn.linear_model import Ridge
+            from sklearn.ensemble import StackingRegressor
+            import numpy as np
+
+            # 检查依赖库
+            try:
+                from lightgbm import LGBMRegressor
+            except ImportError:
+                logger.warning("LightGBM 未安装, stacking 回归器跳过")
+                return None
+            try:
+                from xgboost import XGBRegressor
+            except ImportError:
+                logger.warning("XGBoost 未安装, stacking 回归器跳过")
+                return None
+
+            # 分割数据
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+            # 基学习器
+            estimators = [
+                ('lgbm', LGBMRegressor(objective='huber', random_state=42, n_jobs=-1, verbosity=-1)),
+                ('xgb', XGBRegressor(objective='reg:squarederror', random_state=42, n_estimators=300, learning_rate=0.05, max_depth=6,
+                                      subsample=0.8, colsample_bytree=0.8, n_jobs=-1)),
+                ('ridge', Pipeline([('scaler', StandardScaler()), ('reg', Ridge(alpha=1.0))]))
+            ]
+
+            # 元学习器
+            final_estimator = XGBRegressor(objective='reg:squarederror', random_state=42, n_estimators=300, learning_rate=0.05,
+                                           max_depth=4, subsample=0.8, colsample_bytree=0.8, n_jobs=-1)
+
+            # 交叉验证策略
+            # 使用统一封装的 get_cv() (PurgedKFoldWithEmbargo) 以确保时序无泄漏且满足 cross_val_predict 要求
+            n_splits = min(5, max(2, len(X_train) // 200))  # 至少 2 折，样本足够时最多 5 折
+            cv_strategy = get_cv(n_splits=n_splits, embargo=60)
+
+            stacking_model = StackingRegressor(
+                estimators=estimators,
+                final_estimator=final_estimator,
+                passthrough=False,
+                n_jobs=-1,
+                cv=cv_strategy
+            )
+
+            # ---------------------------
+            # 超参数优化
+            # ---------------------------
+            best_params = {}
+            cv_score = None
+            if use_optuna:
+                try:
+                    import optuna
+                    from sklearn.model_selection import cross_val_score
+
+                    def objective(trial):
+                        params = {
+                            'final_estimator__n_estimators': trial.suggest_int('final_n_estimators', 100, 600),
+                            'final_estimator__learning_rate': trial.suggest_float('final_learning_rate', 0.01, 0.3, log=True),
+                            'final_estimator__max_depth': trial.suggest_int('final_max_depth', 3, 8),
+                            'lgbm__n_estimators': trial.suggest_int('lgb_n_estimators', 100, 600),
+                            'xgb__n_estimators': trial.suggest_int('xgb_n_estimators', 100, 600)
+                        }
+                        stacking_model.set_params(**params)
+                        score = cross_val_score(
+                            stacking_model, X_train, y_train, cv=cv_strategy, scoring='neg_mean_squared_error', n_jobs=-1
+                        ).mean()
+                        return score
+
+                    study = optuna.create_study(direction='maximize')
+                    study.optimize(objective, n_trials=optimization_trials, n_jobs=1)
+                    best_params = study.best_params
+                    # 将 Optuna 参数名称映射回 set_params 所需格式
+                    param_mapping = {
+                        'final_n_estimators': 'final_estimator__n_estimators',
+                        'final_learning_rate': 'final_estimator__learning_rate',
+                        'final_max_depth': 'final_estimator__max_depth',
+                        'lgb_n_estimators': 'lgbm__n_estimators',
+                        'xgb_n_estimators': 'xgb__n_estimators'
+                    }
+                    translated_params = {param_mapping[k]: v for k, v in best_params.items()}
+                    stacking_model.set_params(**translated_params)
+                    cv_score = study.best_value
+                    # 需要最终再 fit 一次
+                    stacking_model.fit(X_train, y_train)
+                except Exception as e_opt:
+                    logger.warning(f"Optuna 优化失败，使用默认参数: {e_opt}")
+                    stacking_model.fit(X_train, y_train)
+            elif use_grid_search:
+                from sklearn.model_selection import GridSearchCV
+                param_grid = {
+                    'final_estimator__n_estimators': [100, 300, 500],
+                    'final_estimator__learning_rate': [0.03, 0.05, 0.1],
+                    'final_estimator__max_depth': [3, 4, 6]
+                }
+                grid = GridSearchCV(
+                    estimator=stacking_model,
+                    param_grid=param_grid,
+                    cv=cv_strategy,
+                    scoring='neg_mean_squared_error',
+                    n_jobs=-1
+                )
+                grid.fit(X_train, y_train)
+                stacking_model = grid.best_estimator_
+                best_params = grid.best_params_
+                cv_score = grid.best_score_
+            else:
+                stacking_model.fit(X_train, y_train)
+
+            # 评估
+            from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+            # 确保模型已拟合（部分情况下 GridSearchCV / Optuna 可能未在完整训练集上 refit）
+            try:
+                _ = stacking_model.predict(X_train[:5])
+            except Exception:
+                stacking_model.fit(X_train, y_train)
+
+            # 生成预测值
+            y_train_pred = stacking_model.predict(X_train)
+            y_pred = stacking_model.predict(X_test)
+
+            # 计算 IC / R2 / MSE 等指标
+            train_ic = information_coefficient(y_train, y_train_pred)
+            test_ic = information_coefficient(y_test, y_pred)
+            metrics = {
+                'train_ic': float(train_ic),
+                'test_ic': float(test_ic),
+                'train_mse': float(mean_squared_error(y_train, y_train_pred)),
+                'test_mse': float(mean_squared_error(y_test, y_pred)),
+                'train_rmse': float(np.sqrt(mean_squared_error(y_train, y_train_pred))),
+                'test_rmse': float(np.sqrt(mean_squared_error(y_test, y_pred))),
+                'train_mae': float(mean_absolute_error(y_train, y_train_pred)),
+                'test_mae': float(mean_absolute_error(y_test, y_pred)),
+                'train_r2': float(r2_score(y_train, y_train_pred)),
+                'test_r2': float(r2_score(y_test, y_pred))
+            }
+            # 追加新评估指标
+            try:
+                from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+                metrics.update({
+                    'rank_ic': float(rank_ic(y_test, y_pred)),
+                    'top_decile_spread': float(top_decile_spread(y_test, y_pred)),
+                    'hit_rate': float(hit_rate(y_test, y_pred))
+                })
+            except Exception as e_metric:
+                logger.warning(f"计算新增指标失败: {e_metric}")
+
+            logger.info(
+                f"stacking 回归器 训练集 IC={metrics['train_ic']:.4f}, R²={metrics['train_r2']:.4f}, MSE={metrics['train_mse']:.6f}; "
+                f"测试集 IC={metrics['test_ic']:.4f}, R²={metrics['test_r2']:.4f}, MSE={metrics['test_mse']:.6f}")
+
+            # ================ 保存交叉验证各折指标 ================
+            try:
+                from sklearn.model_selection import cross_validate
+                from ml.evaluation.metrics_io import save_cv_metrics
+                cv = get_cv(n_splits=5, embargo=60)
+                scoring = {
+                    'ic': ic_scorer,
+                    'r2': 'r2',
+                    'mse': 'neg_mean_squared_error',
+                    'mae': 'neg_mean_absolute_error',
+                    'sharpe': sharpe_scorer,
+                    'ir': ir_scorer
+                }
+                cv_results = cross_validate(stacking_model, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+                metrics_dict = {
+                    'ic': cv_results['test_ic'],
+                    'r2': cv_results['test_r2'],
+                    'mse': -cv_results['test_mse'],
+                    'mae': -cv_results['test_mae'],
+                    'sharpe': cv_results['test_sharpe'],
+                    'ir': cv_results['test_ir']
+                }
+                metrics_dir = 'metrics'
+                os.makedirs(metrics_dir, exist_ok=True)
+                csv_path = os.path.join(metrics_dir, "stacking_regression_cv_scores.csv")
+                save_cv_metrics(metrics_dict, csv_path)
+                logger.info(f"交叉验证指标已保存到: {csv_path}")
+            except Exception as err:
+                logger.warning(f"保存交叉验证指标失败: {err}")
+
+            result = {
+                'model': stacking_model,
+                'model_type': 'stacking',
+                'best_params': best_params,
+                'cv_score': cv_score,
+                'metrics': metrics,
+                'feature_names': X.columns.tolist(),
+                'predictions': {
+                    'X_train': X_train,
+                    'y_train': y_train,
+                    'y_train_pred': y_train_pred,
+                    'X_test': X_test,
+                    'y_test': y_test,
+                    'y_test_pred': y_pred
+                }
+            }
+            return result
+        except Exception as e:
+            logger.error(f"训练 stacking 回归模型失败: {e}")
+            return None
 
     def _train_classification_models(self, X: pd.DataFrame, y: pd.Series, 
                                    use_grid_search: bool = 1,
@@ -683,13 +1067,25 @@ class UnifiedModelTrainer:
         try:
             logger.info(f"开始训练 {model_type} 回归模型...")
             
-            if model_type in ['ridge', 'lasso', 'elasticnet']:
+            if model_type == 'stacking':
+                # Stacking 回归模型
+                result = self._train_stacking_regression_model(
+                    X, y,
+                    use_grid_search=use_grid_search,
+                    use_optuna=use_optuna,
+                    optimization_trials=optimization_trials
+                )
+            elif model_type in ['ridge', 'lasso', 'elasticnet']:
                 # 线性模型
                 result = self._train_linear_model(X, y, model_type, use_grid_search)
             else:
                 # 树模型
                 result = self._train_tree_regression_model(X, y, model_type, use_grid_search, use_optuna, optimization_trials)
             
+            if result is None:
+                logger.error(f"{model_type} 回归模型训练返回 None，跳过保存与指标记录")
+                return model_type, None
+
             # 保存模型
             feature_names = list(X.columns) if hasattr(X, 'columns') else None
             save_obj = {
@@ -708,7 +1104,7 @@ class UnifiedModelTrainer:
             
             # 记录性能指标
             metrics = result['metrics']
-            logger.info(f"{model_type} 性能: R²={metrics.get('test_r2', 0):.4f}, MSE={metrics.get('test_mse', 0):.6f}")
+            logger.info(f"{model_type} 性能: IC={metrics.get('test_ic', 0):.4f}, R²={metrics.get('test_r2', 0):.4f}, MSE={metrics.get('test_mse', 0):.6f}")
             
             return model_type, result
             
@@ -724,7 +1120,7 @@ class UnifiedModelTrainer:
         results = {}
         
         # 回归模型类型（可外部指定）
-        regression_models = reg_models if reg_models is not None else ['xgboost', 'lightgbm', 'catboost', 'lasso']  # 默认四种模型
+        regression_models = reg_models if reg_models is not None else ['xgboost', 'lightgbm', 'catboost', 'lasso', 'stacking']  # 默认模型 + stacking
         
         logger.info(f"开始并行训练 {len(regression_models)} 个回归模型...")
         
@@ -762,7 +1158,7 @@ class UnifiedModelTrainer:
         
         # 分割数据
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+            X, y, test_size=0.2, shuffle=False
         )
         
         logger.info(f"训练{model_type}回归模型: 训练集 {len(X_train)} 样本, 测试集 {len(X_test)} 样本")
@@ -795,7 +1191,7 @@ class UnifiedModelTrainer:
         if use_grid_search:
             # 网格搜索优化
             grid_search = GridSearchCV(
-                pipeline, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1
+                pipeline, param_grid, cv=get_cv(n_splits=5, embargo=60), scoring=ic_scorer, n_jobs=-1
             )
             grid_search.fit(X_train, y_train)
             
@@ -814,12 +1210,30 @@ class UnifiedModelTrainer:
         y_test_pred = pipeline.predict(X_test)
         
         # 计算评估指标
+        train_ic = information_coefficient(y_train, y_train_pred)
+        test_ic = information_coefficient(y_test, y_test_pred)
         train_mse = mean_squared_error(y_train, y_train_pred)
         test_mse = mean_squared_error(y_test, y_test_pred)
         train_mae = mean_absolute_error(y_train, y_train_pred)
         test_mae = mean_absolute_error(y_test, y_test_pred)
         train_r2 = r2_score(y_train, y_train_pred)
         test_r2 = r2_score(y_test, y_test_pred)
+        
+        # 新增金融评估指标 (RankIC, Top Decile Spread, Hit Rate)
+        try:
+            from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+            train_rank_ic = rank_ic(y_train, y_train_pred)
+            test_rank_ic = rank_ic(y_test, y_test_pred)
+            train_top_decile_spread = top_decile_spread(y_train, y_train_pred)
+            test_top_decile_spread = top_decile_spread(y_test, y_test_pred)
+            train_hit_rate = hit_rate(y_train, y_train_pred)
+            test_hit_rate = hit_rate(y_test, y_test_pred)
+        except Exception as err:
+            logger.warning(f"计算新增金融指标失败: {err}")
+            import numpy as np
+            train_rank_ic = test_rank_ic = np.nan
+            train_top_decile_spread = test_top_decile_spread = np.nan
+            train_hit_rate = test_hit_rate = np.nan
         
         # 获取特征重要性（系数绝对值）
         feature_importance = {}
@@ -839,17 +1253,25 @@ class UnifiedModelTrainer:
             'model_type': model_type,
             'best_params': best_params if use_grid_search else {},
             'cv_score': best_score if use_grid_search else None,
-+            # 记录回归器所有参数
-+            'all_params': pipeline.named_steps['regressor'].get_params(),
+            # 记录回归器所有参数
+            'all_params': pipeline.named_steps['regressor'].get_params(),
              'feature_names': X.columns.tolist(),
             'feature_importance': feature_importance,
             'metrics': {
+                'train_ic': train_ic,
+                'test_ic': test_ic,
                 'train_mse': train_mse,
                 'test_mse': test_mse,
                 'train_mae': train_mae,
                 'test_mae': test_mae,
                 'train_r2': train_r2,
-                'test_r2': test_r2
+                'test_r2': test_r2,
+                'train_rank_ic': train_rank_ic,
+                'test_rank_ic': test_rank_ic,
+                'train_top_decile_spread': train_top_decile_spread,
+                'test_top_decile_spread': test_top_decile_spread,
+                'train_hit_rate': train_hit_rate,
+                'test_hit_rate': test_hit_rate
             },
             'predictions': {
                 'X_test': X_test,
@@ -858,10 +1280,40 @@ class UnifiedModelTrainer:
             }
         }
         
-        logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+        logger.info(f"{model_type}回归模型训练完成: 训练集IC={train_ic:.4f}, 测试集IC={test_ic:.4f}, 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
         logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
         logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
         logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
+
+        # ================= 保存交叉验证各折指标 =================
+        try:
+            from sklearn.model_selection import cross_validate
+            from ml.evaluation.metrics_io import save_cv_metrics
+            cv = get_cv(n_splits=5, embargo=60)
+            scoring = {
+                'ic': ic_scorer,
+                'r2': 'r2',
+                'mse': 'neg_mean_squared_error',
+                'mae': 'neg_mean_absolute_error',
+                'sharpe': sharpe_scorer,
+                'ir': ir_scorer
+            }
+            cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+            metrics_dict = {
+                'ic': cv_results['test_ic'],
+                'r2': cv_results['test_r2'],
+                'mse': -cv_results['test_mse'],  # 取正值
+                'mae': -cv_results['test_mae'],
+                'sharpe': cv_results['test_sharpe'],
+                'ir': cv_results['test_ir']
+            }
+            metrics_dir = 'metrics'
+            os.makedirs(metrics_dir, exist_ok=True)
+            csv_path = os.path.join(metrics_dir, f"{model_type}_regression_cv_scores.csv")
+            save_cv_metrics(metrics_dict, csv_path)
+            logger.info(f"交叉验证指标已保存到: {csv_path}")
+        except Exception as err:
+            logger.warning(f"保存交叉验证指标失败: {err}")
         
         return result
     
@@ -877,7 +1329,7 @@ class UnifiedModelTrainer:
         
         # 分割数据
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+            X, y, test_size=0.2, shuffle=False
         )
         
         logger.info(f"训练{model_type}回归模型: 训练集 {len(X_train)} 样本, 测试集 {len(X_test)} 样本")
@@ -931,7 +1383,7 @@ class UnifiedModelTrainer:
         elif model_type == 'xgboost':
             try:
                 from xgboost import XGBRegressor
-                regressor = XGBRegressor(random_state=42, n_jobs=-1)
+                regressor = XGBRegressor(random_state=42, n_jobs=-1, eval_metric='rmse')
                 param_grid = {
                     'regressor__n_estimators': [50, 100],
                     'regressor__max_depth': [3, 6, 9],
@@ -975,17 +1427,28 @@ class UnifiedModelTrainer:
         if use_optuna:
             try:
                 import optuna
-                from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+                # 已在模块顶部统一导入 TimeSeriesSplit 与 cross_val_score
 
                 def objective(trial):
                     search_params = {}
                     if model_type == 'lightgbm':
+                        # 扩展 LightGBM 搜索空间，使其与 XGBoost 优化思路保持一致
                         search_params = {
-                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 400),
-                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
-                            'regressor__max_depth': trial.suggest_int('regressor__max_depth', -1, 10),
-                            'regressor__subsample': trial.suggest_float('regressor__subsample', 0.6, 1.0),
-                            'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.6, 1.0)
+                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 200, 3000),
+                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.005, 0.2, log=True),
+                            # -1 表示不限制深度，LightGBM 会根据 num_leaves 推断；当为 -1 时，max_depth 不生效
+                            'regressor__max_depth': trial.suggest_int('regressor__max_depth', -1, 12),
+                            # 与 subsample/colsample_bytree 类似的参数
+                            'regressor__subsample': trial.suggest_float('regressor__subsample', 0.5, 1.0),
+                            'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.5, 1.0),
+                            # LightGBM 额外的重要正则化与结构参数
+                            'regressor__num_leaves': trial.suggest_int('regressor__num_leaves', 31, 256),
+                            'regressor__min_child_samples': trial.suggest_int('regressor__min_child_samples', 5, 50),
+                            'regressor__reg_alpha': trial.suggest_float('regressor__reg_alpha', 0.0, 10.0),
+                            'regressor__reg_lambda': trial.suggest_float('regressor__reg_lambda', 0.0, 10.0),
+                            'regressor__max_bin': trial.suggest_int('regressor__max_bin', 200, 500),
+                            'regressor__min_split_gain': trial.suggest_float('regressor__min_split_gain', 0.0, 1.0),
+                            'regressor__bagging_freq': trial.suggest_int('regressor__bagging_freq', 0, 10)
                         }
                     elif model_type == 'catboost':
                         search_params = {
@@ -1001,27 +1464,56 @@ class UnifiedModelTrainer:
                             'regressor__min_samples_leaf': trial.suggest_int('regressor__min_samples_leaf', 1, 5)
                         }
                     elif model_type == 'xgboost':
+                        # 扩展搜索空间，与分类侧保持一致
                         search_params = {
-                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 50, 300),
-                            'regressor__max_depth': trial.suggest_int('regressor__max_depth', 3, 10),
-                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
-                            'regressor__subsample': trial.suggest_float('regressor__subsample', 0.6, 1.0),
-                            'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.6, 1.0)
+                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 200, 2000),
+                            'regressor__max_depth': trial.suggest_int('regressor__max_depth', 3, 12),
+                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.2, log=True),
+                            'regressor__subsample': trial.suggest_float('regressor__subsample', 0.5, 1.0),
+                            'regressor__colsample_bytree': trial.suggest_float('regressor__colsample_bytree', 0.5, 1.0),
+                            'regressor__min_child_weight': trial.suggest_int('regressor__min_child_weight', 1, 10),
+                            'regressor__gamma': trial.suggest_float('regressor__gamma', 0.0, 5.0),
+                            'regressor__max_delta_step': trial.suggest_int('regressor__max_delta_step', 0, 10),
+                            'regressor__grow_policy': trial.suggest_categorical('regressor__grow_policy', ['depthwise', 'lossguide']),
+                            'regressor__reg_lambda': trial.suggest_float('regressor__reg_lambda', 0.0, 10.0),
+                            'regressor__reg_alpha': trial.suggest_float('regressor__reg_alpha', 0.0, 10.0)
                         }
                     # 设置参数并计算交叉验证分数（负MSE，Optuna目标为最小化MSE）
                     pipeline.set_params(**search_params)
-                    tscv = TimeSeriesSplit(n_splits=5)
+                    tscv = get_cv(n_splits=5, embargo=60)
                     score = cross_val_score(
                         pipeline, X_train, y_train,
-                        cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1
+                        cv=tscv, scoring=ic_scorer, n_jobs=-1
                     ).mean()
-                    return -score  # 最小化 MSE
+                    return score  # 最大化 IC
 
-                study = optuna.create_study(direction='minimize')
-                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
+                study = optuna.create_study(direction='maximize')
+
+                # ---------------- Optuna 早停：连续 early_stop_rounds 次无提升停止 ----------------
+                early_stop_rounds = 10
+                def early_stopping_callback(study, trial):
+                    best_value = study.best_value
+                    if 'no_improve_count' not in study.user_attrs:
+                        study.set_user_attr('no_improve_count', 0)
+                        study.set_user_attr('best_value_snap', best_value)
+                        return
+                    tol = 5e-4  # 容忍度
+                    improved = (best_value - study.user_attrs['best_value_snap']) > tol
+                    if improved:
+                        study.set_user_attr('no_improve_count', 0)
+                        study.set_user_attr('best_value_snap', best_value)
+                    else:
+                        cnt = study.user_attrs['no_improve_count'] + 1
+                        study.set_user_attr('no_improve_count', cnt)
+                        if cnt >= early_stop_rounds:
+                            logger.info(f"Optuna: 连续 {early_stop_rounds} 次未提升, 提前停止搜索")
+                            study.stop()
+
+                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False,
+                                callbacks=[early_stopping_callback])
 
                 best_params = study.best_params
-                best_score = -study.best_value
+                best_score = study.best_value
                 logger.info(f"Optuna优化完成: 最佳参数 {best_params}, 最佳CV MSE {best_score:.6f}")
 
                 # 使用最佳参数重新训练
@@ -1032,7 +1524,7 @@ class UnifiedModelTrainer:
 
         if use_grid_search and not use_optuna:
             grid_search = GridSearchCV(
-                pipeline, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1
+                pipeline, param_grid, cv=get_cv(n_splits=5), scoring=ic_scorer, n_jobs=-1
             )
             grid_search.fit(X_train, y_train)
             best_params = grid_search.best_params_
@@ -1042,7 +1534,28 @@ class UnifiedModelTrainer:
             pipeline.set_params(**best_params)
 
         # ----------------------- 最终模型训练 -----------------------
-        pipeline.fit(X_train, y_train)
+        fit_params = {}
+        if model_type in ['xgboost', 'lightgbm']:
+            # 为基于树的Boosting模型(XGBoost/LightGBM)启用早停，监控验证集；
+            eval_set = [
+                (X_train.values if hasattr(X_train, 'values') else X_train,
+                 y_train.values if hasattr(y_train, 'values') else y_train),
+                (X_test.values if hasattr(X_test, 'values') else X_test,
+                 y_test.values if hasattr(y_test, 'values') else y_test)
+            ]
+            # XGBoost 与 LightGBM 参数命名保持一致使用 regressor__early_stopping_rounds
+            pipeline.set_params(regressor__early_stopping_rounds=50)
+            # LightGBM 某些版本不支持 verbose 关键字，区分处理
+            if model_type == 'xgboost':
+                fit_params = {
+                    'regressor__eval_set': eval_set,
+                    'regressor__verbose': False
+                }
+            else:  # lightgbm
+                fit_params = {
+                    'regressor__eval_set': eval_set
+                }
+        pipeline.fit(X_train, y_train, **fit_params)
 
         # 预测
         y_train_pred = pipeline.predict(X_train)
@@ -1055,6 +1568,22 @@ class UnifiedModelTrainer:
         test_mae = mean_absolute_error(y_test, y_test_pred)
         train_r2 = r2_score(y_train, y_train_pred)
         test_r2 = r2_score(y_test, y_test_pred)
+
+        # 新增金融评估指标 (RankIC, Top Decile Spread, Hit Rate)
+        try:
+            from ml.evaluation.metrics import rank_ic, top_decile_spread, hit_rate
+            train_rank_ic = rank_ic(y_train, y_train_pred)
+            test_rank_ic = rank_ic(y_test, y_test_pred)
+            train_top_decile_spread = top_decile_spread(y_train, y_train_pred)
+            test_top_decile_spread = top_decile_spread(y_test, y_test_pred)
+            train_hit_rate = hit_rate(y_train, y_train_pred)
+            test_hit_rate = hit_rate(y_test, y_test_pred)
+        except Exception as err:
+            logger.warning(f"计算新增金融指标失败: {err}")
+            import numpy as np
+            train_rank_ic = test_rank_ic = np.nan
+            train_top_decile_spread = test_top_decile_spread = np.nan
+            train_hit_rate = test_hit_rate = np.nan
 
         # 特征重要性（如果模型支持）
         feature_importance = {}
@@ -1073,9 +1602,9 @@ class UnifiedModelTrainer:
                 extra_metrics['best_iteration'] = int(booster.best_iteration)
             evals = getattr(booster, 'evals_result_', None)
             if evals and isinstance(evals, dict) and 'validation_0' in evals:
-                logloss_list = evals['validation_0'].get('logloss', [])
-                if logloss_list:
-                    extra_metrics['val_logloss'] = float(min(logloss_list))
+                rmse_list = evals['validation_0'].get('rmse', []) or evals['validation_0'].get('mae', [])
+                if rmse_list:
+                    extra_metrics['val_rmse'] = float(min(rmse_list))
 
         # 构建结果
         result = {
@@ -1088,12 +1617,20 @@ class UnifiedModelTrainer:
             'feature_names': X.columns.tolist() if hasattr(X, 'columns') else [],
             'feature_importance': feature_importance,
             'metrics': {
+                'train_ic': information_coefficient(y_train, y_train_pred),
+                'test_ic': information_coefficient(y_test, y_test_pred),
                 'train_mse': train_mse,
                 'test_mse': test_mse,
                 'train_mae': train_mae,
                 'test_mae': test_mae,
                 'train_r2': train_r2,
-                'test_r2': test_r2
+                'test_r2': test_r2,
+                'train_rank_ic': train_rank_ic,
+                'test_rank_ic': test_rank_ic,
+                'train_top_decile_spread': train_top_decile_spread,
+                'test_top_decile_spread': test_top_decile_spread,
+                'train_hit_rate': train_hit_rate,
+                'test_hit_rate': test_hit_rate
             },
             'predictions': {
                 'X_test': X_test,
@@ -1104,9 +1641,39 @@ class UnifiedModelTrainer:
         # 合并额外指标
         result.update(extra_metrics)
 
-        logger.info(f"{model_type}回归模型训练完成: 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
+        logger.info(f"{model_type}回归模型训练完成: 训练集IC={information_coefficient(y_train, y_train_pred):.4f}, 测试集IC={information_coefficient(y_test, y_test_pred):.4f}, 训练集R²={train_r2:.4f}, 测试集R²={test_r2:.4f}")
         logger.info(f"训练集MSE={train_mse:.6f}, 测试集MSE={test_mse:.6f}")
         logger.info(f"{model_type} 回归模型全部参数: {result['all_params']}")
+
+        # ================ 保存交叉验证各折指标 ================
+        try:
+            from sklearn.model_selection import cross_validate
+            from ml.evaluation.metrics_io import save_cv_metrics
+            cv = get_cv(n_splits=5, embargo=60)
+            scoring = {
+                'ic': ic_scorer,
+                'r2': 'r2',
+                'mse': 'neg_mean_squared_error',
+                'mae': 'neg_mean_absolute_error',
+                'sharpe': sharpe_scorer,
+                'ir': ir_scorer
+            }
+            cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+            metrics_dict = {
+                'ic': cv_results['test_ic'],
+                'r2': cv_results['test_r2'],
+                'mse': -cv_results['test_mse'],
+                'mae': -cv_results['test_mae'],
+                'sharpe': cv_results['test_sharpe'],
+                'ir': cv_results['test_ir']
+            }
+            metrics_dir = 'metrics'
+            os.makedirs(metrics_dir, exist_ok=True)
+            csv_path = os.path.join(metrics_dir, f"{model_type}_regression_cv_scores.csv")
+            save_cv_metrics(metrics_dict, csv_path)
+            logger.info(f"交叉验证指标已保存到: {csv_path}")
+        except Exception as err:
+            logger.warning(f"保存交叉验证指标失败: {err}")
 
         return result
 
@@ -1188,7 +1755,36 @@ def main():
     # 新增: 关闭特征选择开关
     parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
     parser.add_argument("--fs-n-jobs", type=int, default=-1, help="特征选择时并行CPU核心数（-1 表示全部）")
+    # 兼容性补充：快速测试及特征缓存控制
+    parser.add_argument("--quick-test", action="store_true", help="启用快速验证模式：自动缩小数据规模、禁用耗时操作")
+    parser.add_argument("--no-feature-cache", action="store_true", help="不使用特征选择缓存，始终重新计算特征选择（默认：False）")
+    parser.add_argument("--refresh-feature-selection", action="store_true", help="强制刷新并覆盖已有的特征选择结果缓存")
     args = parser.parse_args()
+
+    # -------------------- quick-test 参数覆写 --------------------
+    if getattr(args, "quick_test", False):
+        logger.info("[quick-test] 启用快速验证模式，自动缩小数据规模并关闭耗时功能 …")
+        # 缩短回溯窗口与股票数量
+        if hasattr(args, "lookback"):
+            args.lookback = min(args.lookback, 90)
+        if hasattr(args, "lookback_days"):
+            args.lookback_days = min(args.lookback_days, 90)
+        args.n_stocks = min(args.n_stocks, 200)
+        # 禁用网格搜索与 Optuna
+        if hasattr(args, "no_grid_search"):
+            args.no_grid_search = True
+        if hasattr(args, "use_grid_search"):
+            args.use_grid_search = 0
+        args.use_optuna = 0
+        args.optimization_trials = 5
+        # 禁用特征选择并限制并行
+        args.disable_feature_selection = True
+        args.fs_n_jobs = 1
+        logger.info(
+            f"[quick-test] 覆写后参数: lookback_days={getattr(args,'lookback_days',getattr(args,'lookback',None))}, "
+            f"n_stocks={args.n_stocks}, grid_search=off, optuna=off, feature_selection=off, trials={args.optimization_trials}"
+        )
+    # -------------------------------------------------------------
 
     logger.info("=== 开始统一模型训练流程 ===")
     logger.info(f"参数: lookback={args.lookback}, n_stocks={args.n_stocks}, prediction_period={args.prediction_period}, mode={args.mode}, grid_search={'off' if args.no_grid_search else 'on'}")
@@ -1254,8 +1850,11 @@ if __name__ == "__main__":
     # 训练优化相关
     parser.add_argument('--use-grid-search', type=int, default=1, choices=[0, 1],
                         help='是否启用网格搜索（0/1，默认：1）')
-    parser.add_argument('--use-optuna', action='store_true',
+    # 支持两种写法 --use-optuna / --use_optuna，统一映射到 use_optuna
+    parser.add_argument('--use-optuna', action='store_true', dest='use_optuna',
                         help='是否使用 Optuna 进行超参优化（默认：False）')
+    parser.add_argument('--use_optuna', action='store_true', dest='use_optuna',
+                        help='(兼容) 等同于 --use-optuna')
     parser.add_argument('--optimization-trials', type=int, default=50,
                         help='Optuna/Bayesian 优化的 trial 次数（默认：50）')
 
@@ -1264,12 +1863,27 @@ if __name__ == "__main__":
                         help='关闭特征选择优化（默认开启）'),
     parser.add_argument('--fs-n-jobs', type=int, default=-1,
                         help='特征选择时用于并行的CPU核心数（-1 表示全部）')
-    # 新增：特征选择缓存控制
-    parser.add_argument('--refresh-feature-selection', action='store_true',
-                        help='重新运行特征选择并覆盖已有缓存（默认：False）')
+    # 快速测试模式
+    parser.add_argument('--quick-test', action='store_true',
+                        help='启用快速验证模式：自动缩小数据规模、禁用耗时操作')
     parser.add_argument('--no-feature-cache', action='store_true',
-                        help='不使用特征选择缓存，始终重新计算特征选择（默认：False）')
+                         help='不使用特征选择缓存，始终重新计算特征选择（默认：False）')
+    parser.add_argument('--refresh-feature-selection', action='store_true',
+                        help='强制刷新并覆盖已有的特征选择结果缓存')
     args = parser.parse_args()
+
+    # -------------------- quick-test 参数覆写 --------------------
+    if getattr(args, 'quick_test', False):
+        logger.info('[quick-test] 启用快速验证模式，自动缩小数据规模并关闭耗时功能 …')
+        args.lookback_days = min(args.lookback_days, 380)
+        args.n_stocks = min(args.n_stocks, 600)
+        args.use_grid_search = 0
+        args.n_estimators = 600
+        args.use_optuna = 0
+        args.optimization_trials = 5
+        args.disable_feature_selection = True
+        args.fs_n_jobs = 1
+    # -------------------------------------------------------------
 
     # 解析模型列表
     cls_models = [m.strip() for m in args.cls_models.split(',')] if args.cls_models else None

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 # XGBoost支持 - 可选
@@ -408,7 +408,6 @@ class EnhancedMLTrainer:
         if model_type == 'logistic':
             classifier = LogisticRegression(max_iter=1000, n_jobs=-1, solver='lbfgs')
             pipeline = Pipeline([
-                ('scaler', StandardScaler()),
                 ('clf', classifier)
             ])
             if use_optimization:
@@ -435,7 +434,7 @@ class EnhancedMLTrainer:
             scale_pos_weight = neg_cnt / pos_cnt if pos_cnt > 0 else 1.0
 
             base_params = dict(
-                n_estimators=200,
+                n_estimators=1200,
                 learning_rate=0.1,
                 max_depth=6,
                 subsample=0.8,
@@ -448,9 +447,18 @@ class EnhancedMLTrainer:
             )
             classifier = XGBClassifier(**base_params)
 
+            # 创建包含标准化和分类器的管线
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.pipeline import Pipeline
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('clf', classifier)
+            ])
+
             from sklearn.model_selection import TimeSeriesSplit
             tscv = TimeSeriesSplit(n_splits=5)
 
+            # ---------------------- 超参数优化 ----------------------
             if use_optimization:
                 param_grid = {
                     'clf__n_estimators': [200, 400],
@@ -463,7 +471,7 @@ class EnhancedMLTrainer:
                     'clf__reg_lambda': [1, 5, 10],
                 }
                 grid = GridSearchCV(
-                    classifier,
+                    pipeline,
                     param_grid,
                     cv=tscv,
                     scoring='f1',
@@ -474,31 +482,31 @@ class EnhancedMLTrainer:
                 model = grid.best_estimator_
                 best_params = grid.best_params_
                 best_score = grid.best_score_
-            else:
-                classifier.fit(X_train, y_train)
-                model = classifier
 
-            # 交叉验证每折评估并记录日志
-            fold_metrics = []
-            for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
-                X_tr, X_val = X_train.iloc[tr_idx], X_train.iloc[val_idx]
-                y_tr, y_val = y_train.iloc[tr_idx], y_train.iloc[val_idx]
-                model_fold = XGBClassifier(**model.get_params())
-                model_fold.fit(X_tr, y_tr)
-                y_val_pred = model_fold.predict(X_val)
-                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-                fm = {
-                    'fold': fold + 1,
-                    'accuracy': accuracy_score(y_val, y_val_pred),
-                    'precision': precision_score(y_val, y_val_pred, zero_division=0),
-                    'recall': recall_score(y_val, y_val_pred, zero_division=0),
-                    'f1': f1_score(y_val, y_val_pred, zero_division=0),
-                }
-                fold_metrics.append(fm)
-                logger.info(
-                    f"XGBoost 时序CV 第{fm['fold']}折: acc={fm['accuracy']:.4f}, "
-                    f"precision={fm['precision']:.4f}, recall={fm['recall']:.4f}, f1={fm['f1']:.4f}"
-                )
+                # 使用最佳参数重新训练并加入 Early Stopping
+                eval_set = [
+                    (X_train.values if hasattr(X_train, 'values') else X_train,
+                     y_train.values if hasattr(y_train, 'values') else y_train),
+                    (X_test.values if hasattr(X_test, 'values') else X_test,
+                     y_test.values if hasattr(y_test, 'values') else y_test)
+                ]
+                model.set_params(clf__early_stopping_rounds=50)
+                model.fit(X_train, y_train,
+                          clf__eval_set=eval_set,
+                          clf__verbose=False)
+            else:
+                # ---------------------- 直接训练并早停 ----------------------
+                eval_set = [
+                    (X_train.values if hasattr(X_train, 'values') else X_train,
+                     y_train.values if hasattr(y_train, 'values') else y_train),
+                    (X_test.values if hasattr(X_test, 'values') else X_test,
+                     y_test.values if hasattr(y_test, 'values') else y_test)
+                ]
+                pipeline.set_params(clf__early_stopping_rounds=50)
+                pipeline.fit(X_train, y_train,
+                             clf__eval_set=eval_set,
+                             clf__verbose=False)
+                model = pipeline
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
 
@@ -514,6 +522,25 @@ class EnhancedMLTrainer:
             'test_f1': f1_score(y_test, y_pred_test, zero_division=0)
         }
 
+        # 如果是 XGBoost，提取早停相关信息
+        if model_type == 'xgboost':
+            booster = model.named_steps['clf'] if hasattr(model, 'named_steps') else None
+            if booster is not None:
+                extra_metrics = {}
+                if hasattr(booster, 'best_iteration') and booster.best_iteration is not None:
+                    extra_metrics['best_iteration'] = int(booster.best_iteration)
+                # evals_result_ 在调用 fit 且设置 eval_set 后才会生成
+                evals_res = getattr(booster, 'evals_result_', {})
+                if evals_res:
+                    val_logloss = evals_res.get('validation_1', {}).get('logloss', [])
+                    val_auc = evals_res.get('validation_1', {}).get('auc', [])
+                    if val_logloss:
+                        extra_metrics['val_logloss'] = float(min(val_logloss))
+                    if val_auc:
+                        extra_metrics['val_auc'] = float(max(val_auc))
+                # 合并到主 metrics
+                metrics.update(extra_metrics)
+
         result = {
             'model': model,
             'metrics': metrics
@@ -522,6 +549,13 @@ class EnhancedMLTrainer:
             result['best_params'] = best_params
         if best_score is not None:
             result['best_score'] = best_score
+
+        # 如包含早停信息，额外输出日志
+        if model_type == 'xgboost' and 'best_iteration' in metrics:
+            logger.info(
+                f"{model_type} 早停结果: best_iteration={metrics.get('best_iteration')}, "
+                f"val_logloss={metrics.get('val_logloss', 'NA')}, val_auc={metrics.get('val_auc', 'NA')}"
+            )
 
         logger.info(f"{model_type} 训练完成: 测试准确率={metrics['test_accuracy']:.4f}")
         return result
@@ -550,7 +584,7 @@ class EnhancedMLTrainer:
 
         # 分割数据
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y if len(set(y)) > 1 else None
+            X, y, test_size=0.2, random_state=42, shuffle=False
         )
 
         best_params = {}
@@ -567,7 +601,7 @@ class EnhancedMLTrainer:
                     'clf__C': [0.01, 0.1, 1.0, 10.0, 100.0],
                     'clf__penalty': ['l2']
                 }
-                grid = GridSearchCV(pipeline, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
+                grid = GridSearchCV(pipeline, param_grid, cv=TimeSeriesSplit(n_splits=5), scoring='accuracy', n_jobs=-1)
                 grid.fit(X_train, y_train)
                 pipeline = grid.best_estimator_
                 best_params = grid.best_params_
@@ -599,6 +633,14 @@ class EnhancedMLTrainer:
             )
             classifier = XGBClassifier(**base_params)
 
+            # 创建包含标准化和分类器的管线
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.pipeline import Pipeline
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('clf', classifier)
+            ])
+
             from sklearn.model_selection import TimeSeriesSplit
             tscv = TimeSeriesSplit(n_splits=5)
 
@@ -609,9 +651,9 @@ class EnhancedMLTrainer:
                     'clf__max_depth': [3, 6, 9],
                     'clf__subsample': [0.7, 0.8, 1.0],
                     'clf__colsample_bytree': [0.7, 0.8, 1.0],
-                    'gamma': [0, 1],
-                    'reg_alpha': [0, 0.1, 0.5],
-                    'reg_lambda': [1, 5, 10],
+                    'clf__gamma': [0, 1],
+                    'clf__reg_alpha': [0, 0.1, 0.5],
+                    'clf__reg_lambda': [1, 5, 10],
                 }
                 grid = GridSearchCV(
                     pipeline,
