@@ -220,6 +220,25 @@ class MySQLDatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
             
+            # predictions 表 - 股票预测结果
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    date DATE NOT NULL,
+                    prob_up_30d DECIMAL(6,4),
+                    expected_return_30d DECIMAL(10,6),
+                    confidence DECIMAL(6,2),
+                    score DECIMAL(8,2),
+                    sentiment VARCHAR(20),
+                    prediction TINYINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY unique_symbol_date (symbol, date),
+                    INDEX idx_predictions_symbol (symbol),
+                    INDEX idx_predictions_date (date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            
             conn.commit()
             self.logger.info("数据库表结构初始化完成")
     

@@ -359,6 +359,36 @@ class UnifiedDatabaseManager:
             self.logger.error(f"获取表行数失败: {e}")
             return 0
     
+    def _ensure_tables_exist(self):
+        """
+        确保核心业务表存在。目前仅创建 tests 依赖的 predictions 表。
+
+        该方法主要用于单元测试或轻量级应用场景，在生产环境应由迁移脚本或
+        ORM 管理表结构。
+        """
+        try:
+            create_sql = (
+                """
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INTEGER PRIMARY KEY {} ,
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    prob_up_30d REAL,
+                    expected_return_30d REAL,
+                    confidence REAL,
+                    score REAL,
+                    sentiment TEXT,
+                    prediction INTEGER,
+                    UNIQUE(symbol, date)
+                )
+                """
+            ).format("AUTO_INCREMENT" if self.db_type == "mysql" else "AUTOINCREMENT")
+
+            self.execute_update(create_sql)
+            logger.info("确保 predictions 表存在")
+        except Exception as e:
+            logger.error(f"确保表存在失败: {e}")
+    
     def get_table_info(self, table_name: str) -> List[Dict[str, Any]]:
         """
         获取表结构信息

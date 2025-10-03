@@ -1219,6 +1219,24 @@ class UnifiedModelTrainer:
         # 预测
         y_train_pred = pipeline.predict(X_train)
         y_test_pred = pipeline.predict(X_test)
+
+        # ===== 计算训练/验证预测分布统计量，保存为metadata =====
+        import numpy as np
+        def _calc_dist_stats(arr):
+            arr = np.asarray(arr).flatten()
+            if arr.size == 0:
+                return {}
+            return {
+                'mean': float(np.mean(arr)),
+                'std': float(np.std(arr)),
+                'min': float(np.min(arr)),
+                'q25': float(np.percentile(arr, 25)),
+                'median': float(np.percentile(arr, 50)),
+                'q75': float(np.percentile(arr, 75)),
+                'max': float(np.max(arr))
+            }
+        train_pred_stats = _calc_dist_stats(y_train_pred)
+        val_pred_stats = _calc_dist_stats(y_test_pred)
         
         # 计算评估指标
         train_ic = information_coefficient(y_train, y_train_pred)
@@ -1284,6 +1302,10 @@ class UnifiedModelTrainer:
                 'train_hit_rate': train_hit_rate,
                 'test_hit_rate': test_hit_rate
             },
+            'prediction_distribution': {
+                'train': train_pred_stats,
+                'val': val_pred_stats
+            },
             'predictions': {
                 'X_test': X_test,
                 'y_test': y_test,
@@ -1310,6 +1332,15 @@ class UnifiedModelTrainer:
                 'ir': ir_scorer
             }
             cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+            # 将交叉验证各折指标保存到结果，供后续selector加载
+            result['cv_metrics'] = {
+                'ic': cv_results['test_ic'].tolist(),
+                'r2': cv_results['test_r2'].tolist(),
+                'mse': (-cv_results['test_mse']).tolist(),
+                'mae': (-cv_results['test_mae']).tolist(),
+                'sharpe': cv_results['test_sharpe'].tolist(),
+                'ir': cv_results['test_ir'].tolist()
+            }
             metrics_dict = {
                 'ic': cv_results['test_ic'],
                 'r2': cv_results['test_r2'],

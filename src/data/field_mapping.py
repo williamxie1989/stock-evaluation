@@ -25,11 +25,23 @@ class FieldMapper:
             'volume': ['volume', 'Volume', 'VOLUME', 'vol', 'Vol', 'turnover', 'amount', '成交量'],
             'symbol': ['symbol', 'Symbol', 'SYMBOL', 'code', 'Code', 'CODE', 'stock_code', 'ts_code', '股票代码']
         }
+        ,
+        'predictions': {
+            'symbol': ['symbol', 'code'],
+            'date': ['date', 'prediction_date', 'predict_date'],
+            'prob_up_30d': ['prob_up_30d', 'probability', 'prob'],
+            'expected_return_30d': ['expected_return_30d', 'expected_return', 'exp_ret'],
+            'confidence': ['confidence'],
+            'score': ['score'],
+            'sentiment': ['sentiment'],
+            'prediction': ['prediction', 'pred']
+        }
     }
     
     # 必需字段定义
     REQUIRED_FIELDS = {
-        'prices_daily': ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+        'prices_daily': ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol'],
+        'predictions': ['symbol', 'date', 'prob_up_30d', 'expected_return_30d']
     }
     
     @classmethod
@@ -151,17 +163,18 @@ class FieldMapper:
         
         for field in required_fields:
             if field == 'date' and field not in df.columns:
-                # date 字段由索引提供，无需进一步检查
-                continue
+                continue  # date 字段由索引提供
             if field in df.columns:
                 series = df[field]
-                # 尝试将字符串数字列转换为数值，提升容错性
-                if field in ['open', 'high', 'low', 'close', 'volume'] and series.dtype == 'object':
+                # 若未定义类型检查规则，默认通过
+                checker = type_checks.get(field, None)
+                # 尝试将字符串数字列转换为数值
+                if field not in ['symbol', 'date'] and series.dtype == 'object':
                     try:
                         series = pd.to_numeric(series)
                     except Exception:
                         pass
-                if not type_checks[field](series):
+                if checker and not checker(series):
                     logger.error(f"数据结构验证失败 - 字段 {field} 类型不符合要求")
                     return False
         

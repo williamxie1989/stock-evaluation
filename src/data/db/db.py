@@ -122,6 +122,22 @@ class DatabaseManager:
                 )
             """)
             
+            # predictions 表 - 股票预测结果
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    prob_up_30d REAL,
+                    expected_return_30d REAL,
+                    confidence REAL,
+                    score REAL,
+                    sentiment TEXT,
+                    prediction INTEGER,
+                    UNIQUE(symbol, date)
+                )
+            """)
+            
             # 执行迁移并提交
             self._migrate_database(cur)
             conn.commit()

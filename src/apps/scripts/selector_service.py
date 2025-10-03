@@ -915,6 +915,10 @@ class IntelligentStockSelector:
         # 优先按预期收益排序，其次按概率
         results.sort(key=lambda x: (x.get('expected_return_30d', 0), x.get('prob_up_30d', 0)), reverse=1)
         
+        # ---- 统计当前批次 expected_return_30d 分布并与验证集对比 ----
+        self._compare_expected_return_distribution(results)
+        # ---- 分布统计完成 ----
+        
         # 过滤无效股票（退市、ST、停牌等）
         valid_results = []
         for result in results:
@@ -936,8 +940,72 @@ class IntelligentStockSelector:
         
         logger.info(f"股票过滤: 原始{len(results)}只 -> 有效{len(valid_results)}只")
         
+        # ---------------- 将预测结果写入数据库 ----------------
+        try:
+            if valid_results:
+                import pandas as pd, datetime as _dt
+                df_preds = pd.DataFrame(valid_results)
+                # 仅保留标准字段，若存在额外列也一并写入
+                today_str = _dt.datetime.now().strftime('%Y-%m-%d')
+                df_preds['date'] = today_str
+                self.db.insert_dataframe(df_preds, 'predictions')
+        except Exception as e:
+            logger.warning(f"写入predictions表失败: {e}")
+        # ---------------------------------------------------
+        
         return valid_results[:top_n]
-    
+
+    def _compare_expected_return_distribution(self, results):
+        """比较当前批次 expected_return_30d 分布与验证集分布，并输出日志。"""
+        try:
+            if not results:
+                logger.info("当前批次结果为空，跳过 expected_return_30d 分布对比")
+                return
+            vals = [r.get('expected_return_30d') for r in results if r.get('expected_return_30d') is not None]
+            if not vals:
+                logger.info("结果缺少 expected_return_30d 字段，跳过分布对比")
+                return
+            import numpy as np
+            cur_stats = {
+                'mean': float(np.mean(vals)),
+                'std': float(np.std(vals)),
+                'min': float(np.min(vals)),
+                'max': float(np.max(vals)),
+            }
+            # 获取验证集分布
+            val_stats = None
+            try:
+                if getattr(self, 'reg_model_data', None):
+                    val_stats = (
+                        self.reg_model_data.get('metadata', {})
+                        .get('prediction_distribution', {})
+                        .get('val')
+                    )
+            except Exception:
+                val_stats = None
+            if not val_stats:
+                logger.info("模型元数据缺少验证集 expected_return_30d 分布信息，跳过对比")
+                return
+            parts = []
+            for key in ('mean', 'std', 'min', 'max'):
+                cur = cur_stats.get(key)
+                ref = val_stats.get(key)
+                if ref is None:
+                    continue
+                abs_diff = cur - ref
+                rel_diff = abs_diff / (abs(ref) + 1e-9)
+                # 逐项输出日志，方便测试断言
+                logger.info(
+                    f"expected_return_30d {key} 当前={cur:.4f} | 验证={ref:.4f} | Δ={abs_diff:+.4f} | Δ%={rel_diff*100:+.1f}%"
+                )
+                parts.append(f"{key}: 当前={cur:.4f} | 验证={ref:.4f} | Δ={abs_diff:+.4f} | Δ%={rel_diff*100:+.1f}%")
+                if abs(rel_diff) > 1.0:
+                    logger.warning(f"expected_return_30d {key} 相对差异超过100% (当前={cur:.4f}, 验证={ref:.4f})")
+            logger.info("expected_return_30d 分布对比 -> " + " ; ".join(parts))
+        except Exception as e:
+            logger.warning(f"expected_return_30d 分布对比失败: {e}")
+
+        
     def _calibrate_probabilities(self, probs: np.ndarray, predictions: np.ndarray = None, 
                                expected_returns: np.ndarray = None) -> np.ndarray:
         """
@@ -1400,3 +1468,4 @@ if __name__ == "__main__":
     result = selector.get_stock_picks(top_n=5)
     print("选股结果:")
     print(result)
+
