@@ -95,3 +95,75 @@ class CrossSectionZScore(BaseEstimator, TransformerMixin):
             return pd.DataFrame(X)
         else:
             raise ValueError("CrossSectionZScore 仅支持 DataFrame 或 ndarray 输入")
+
+
+class IndustryMarketCapTransformer(BaseEstimator, TransformerMixin):
+    """将行业列 one-hot 编码且对市值列取对数/截断。
+
+    Parameters
+    ----------
+    industry_col : str, default 'industry'
+        行业字段名称。
+    market_cap_col : str, default 'market_cap'
+        市值字段名称。
+    winsor_quantile : float, default 0.99
+        对数市值截断上侧分位数，避免极端值。
+    """
+
+    def __init__(self, industry_col: str = 'industry', market_cap_col: str = 'market_cap', winsor_quantile: float = 0.99):
+        self.industry_col = industry_col
+        self.market_cap_col = market_cap_col
+        self.winsor_quantile = winsor_quantile
+        self._industry_levels: Optional[list[str]] = None
+        self._cap_upper: Optional[float] = None
+
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y=None):  # noqa: N803
+        X_df = self._to_dataframe(X)
+        # 收集行业类别
+        if self.industry_col in X_df.columns:
+            self._industry_levels = (
+                X_df[self.industry_col]
+                .fillna('NA')
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+        else:
+            self._industry_levels = []
+        # 计算市值上侧阈值
+        if self.market_cap_col in X_df.columns:
+            caps = np.log1p(X_df[self.market_cap_col].astype(float).replace({np.inf: np.nan, -np.inf: np.nan}))
+            self._cap_upper = caps.quantile(self.winsor_quantile)
+        return self
+
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]):  # noqa: N803
+        X_df = self._to_dataframe(X).copy()
+
+        # 处理行业 one-hot
+        if self.industry_col in X_df.columns and self._industry_levels is not None:
+            inds = X_df[self.industry_col].fillna('NA').astype(str)
+            dummies = pd.get_dummies(inds, prefix='ind', dummy_na=False)
+            # 确保列顺序一致
+            for level in self._industry_levels:
+                col = f"ind_{level}"
+                if col not in dummies.columns:
+                    dummies[col] = 0
+            dummies = dummies[[f"ind_{lvl}" for lvl in self._industry_levels]]
+            X_df = pd.concat([X_df.drop(columns=[self.industry_col]), dummies], axis=1)
+
+        # 处理市值对数及截断
+        if self.market_cap_col in X_df.columns and self._cap_upper is not None:
+            cap_log = np.log1p(X_df[self.market_cap_col].astype(float))
+            cap_log_clipped = cap_log.clip(upper=self._cap_upper)
+            X_df[self.market_cap_col] = cap_log_clipped
+
+        return X_df.values if isinstance(X, np.ndarray) else X_df
+
+    @staticmethod
+    def _to_dataframe(X):
+        if isinstance(X, pd.DataFrame):
+            return X
+        elif isinstance(X, np.ndarray):
+            return pd.DataFrame(X)
+        else:
+            raise ValueError("IndustryMarketCapTransformer 仅支持 DataFrame 或 ndarray 输入")
