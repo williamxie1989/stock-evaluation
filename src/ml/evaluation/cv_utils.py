@@ -37,7 +37,7 @@ class PurgedKFoldWithEmbargo(BaseCrossValidator):
     本实现假设输入样本已按时间顺序排序（递增）。当样本存在重复时间戳时，只要排序正确即可。
     """
 
-    def __init__(self, n_splits: int = 5, embargo: int = 0, purge_window: int = 0):
+    def __init__(self, n_splits: int = 5, embargo: int = 0, purge_window: int = 0, allow_future: bool = True):
         if n_splits < 2:
             raise ValueError("n_splits 必须 >= 2")
         if embargo < 0 or purge_window < 0:
@@ -45,6 +45,7 @@ class PurgedKFoldWithEmbargo(BaseCrossValidator):
         self.n_splits = n_splits
         self.embargo = embargo
         self.purge_window = purge_window
+        self.allow_future = allow_future  # 是否允许训练集包含测试集之后的数据
 
     def get_n_splits(self, X=None, y=None, groups=None):  # noqa: D401
         """Return the number of splitting iterations in the cross-validator."""
@@ -72,11 +73,21 @@ class PurgedKFoldWithEmbargo(BaseCrossValidator):
             train_right_start = min(n_samples, test_end + self.embargo)
             train_right = indices[train_right_start:]
 
-            train_indices = np.concatenate((train_left, train_right))
+            if self.allow_future:
+                train_indices = np.concatenate((train_left, train_right))
+            else:
+                # 严格禁止未来样本，仅使用测试集之前的数据。
+                # 若当前测试窗口导致 train_left 为空，则向右平移测试窗口直至 train_left 非空，
+                # 以避免 cross_val_predict 因跳过折而报错。
+                if len(train_left) == 0:
+                    # 若满足无未来样本的训练集为空，则直接跳过该折，
+                    # 保证各折 test_indices 不重叠，满足 cross_val_predict 的 partition 要求。
+                    continue
+                train_indices = train_left
             yield train_indices, test_indices
 
     def __repr__(self):
         return (
             f"PurgedKFoldWithEmbargo(n_splits={self.n_splits}, "
-            f"embargo={self.embargo}, purge_window={self.purge_window})"
+            f"embargo={self.embargo}, purge_window={self.purge_window}, allow_future={self.allow_future})"
         )

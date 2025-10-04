@@ -15,7 +15,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Ridge, Lasso, ElasticNet
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import joblib
 import pickle
@@ -220,7 +220,7 @@ class UnifiedTrainer:
             best_model = max(results.keys(), key=lambda k: results[k]['performance']['auc'])
             best_result = results[best_model]
             
-            logger.info(f"选择最佳分类模型: {best_model}, AUC: {best_result['performance']['auc']:.4f}")
+            logger.info(f"选择最佳分类模型: {best_model}, AUC: {best_result['performance']['auc']:.4f}, PR-AUC: {best_result['performance'].get('pr_auc', float('nan')):.4f}")
             
             return {
                 'best_model': best_model,
@@ -332,18 +332,23 @@ class UnifiedTrainer:
             
             if y_pred_proba is not None:
                 performance['auc'] = float(roc_auc_score(y_test, y_pred_proba))
+                performance['pr_auc'] = float(average_precision_score(y_test, y_pred_proba))
             
             # 交叉验证
             cv_scores = cross_val_score(best_model, X_train, y_train, cv=5, scoring='accuracy')
             performance['cv_accuracy_mean'] = float(cv_scores.mean())
             performance['cv_accuracy_std'] = float(cv_scores.std())
+            # PR-AUC cross-validation
+            cv_pr_scores = cross_val_score(best_model, X_train, y_train, cv=5, scoring='average_precision')
+            performance['cv_pr_auc_mean'] = float(cv_pr_scores.mean())
+            performance['cv_pr_auc_std'] = float(cv_pr_scores.std())
             
             # 保存模型
             model_path = os.path.join(self.model_dir, f"{model_name}_classifier.pkl")
             with open(model_path, 'wb') as f:
                 pickle.dump(best_model, f)
             
-            logger.info(f"{model_name} 分类模型训练完成，准确率: {performance['accuracy']:.4f}")
+            logger.info(f"{model_name} 分类模型训练完成，准确率: {performance['accuracy']:.4f}, AUC: {performance.get('auc', float('nan')):.4f}, PR-AUC: {performance.get('pr_auc', float('nan')):.4f}")
             
             return {
                 'model_name': model_name,

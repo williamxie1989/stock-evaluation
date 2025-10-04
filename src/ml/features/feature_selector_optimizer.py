@@ -24,6 +24,22 @@ try:
     import seaborn as sns
 except ImportError:
     sns = None
+try:
+    from joblib import Parallel, delayed
+except ImportError:
+    Parallel = None
+    delayed = None
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+except ImportError:
+    XGBClassifier = None
+    XGBRegressor = None
+
+try:
+    from lightgbm import LGBMClassifier, LGBMRegressor
+except ImportError:
+    LGBMClassifier = None
+    LGBMRegressor = None
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,13 +48,15 @@ logger = logging.getLogger(__name__)
 class FeatureSelectorOptimizer:
     """特征选择优化器 - 筛选最具预测力的特征"""
     
-    def __init__(self, task_type: str = 'classification', target_n_features: int = 30, n_jobs: int = -1):
+    def __init__(self, task_type: str = 'classification', target_n_features: int = 30, n_jobs: int = -1,
+                 importance_model: str = 'rf'):
         """
         初始化特征选择优化器
         
         Args:
             task_type: 任务类型 ('classification' 或 'regression')
             target_n_features: 目标特征数量
+            importance_model: 计算特征重要性的模型 (rf / xgb / lgb / auto)
         """
         self.task_type = task_type
         self.target_n_features = target_n_features
@@ -48,6 +66,7 @@ class FeatureSelectorOptimizer:
         self.cv_scores_ = {}
         # 并行度控制 (-1 使用所有核心)
         self.n_jobs = n_jobs
+        self.importance_model = importance_model
         
     def optimize_feature_selection(self, X: pd.DataFrame, y: pd.Series, 
                                  method: str = 'ensemble', 
@@ -203,16 +222,49 @@ class FeatureSelectorOptimizer:
                                     cv_folds: int, random_state: int) -> Dict[str, Any]:
         """基于特征重要性的选择"""
         logger.info("执行基于特征重要性的特征选择...")
-        
-        # 训练随机森林获取特征重要性
-        if self.task_type == 'classification':
-            model = RandomForestClassifier(n_estimators=200, random_state=random_state)
+        model_type = self.importance_model
+        if model_type == 'auto':
+            # 简易规则：树模型任务多用 xgb，线性任务 rf
+            model_type = 'xgb' if (XGBClassifier is not None) else 'rf'
+
+        model = None
+        # 训练模型获取特征重要性
+        if model_type == 'rf':
+            if self.task_type == 'classification':
+                model = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=self.n_jobs)
+            else:
+                model = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=self.n_jobs)
+        elif model_type == 'xgb' and (XGBClassifier is not None):
+            if self.task_type == 'classification':
+                model = XGBClassifier(n_estimators=300, learning_rate=0.1, max_depth=6,
+                                      n_jobs=self.n_jobs, random_state=random_state, verbosity=0)
+            else:
+                model = XGBRegressor(n_estimators=300, learning_rate=0.1, max_depth=6,
+                                     n_jobs=self.n_jobs, random_state=random_state, verbosity=0)
+        elif model_type == 'lgb' and (LGBMClassifier is not None):
+            if self.task_type == 'classification':
+                model = LGBMClassifier(n_estimators=300, learning_rate=0.05, max_depth=-1,
+                                       n_jobs=self.n_jobs, random_state=random_state)
+            else:
+                model = LGBMRegressor(n_estimators=300, learning_rate=0.05, max_depth=-1,
+                                      n_jobs=self.n_jobs, random_state=random_state)
         else:
-            model = RandomForestRegressor(n_estimators=200, random_state=random_state)
-        
+            logger.warning(f"importance_model={model_type} 无法使用，回退随机森林")
+            if self.task_type == 'classification':
+                model = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=self.n_jobs)
+            else:
+                model = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=self.n_jobs)
+
         model.fit(X, y)
-        importances = model.feature_importances_
-        
+        # XGBoost / LGB 统一获取 feature importance
+        if hasattr(model, 'feature_importances_'):
+            importances = model.feature_importances_
+        else:
+            booster = model.get_booster()
+            # ‘gain’ 更稳定
+            score_dict = booster.get_score(importance_type='gain')
+            importances = np.array([score_dict.get(f, 0.0) for f in booster.feature_names])
+
         # 按重要性排序
         importance_dict = dict(zip(X.columns, importances))
         sorted_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
@@ -298,6 +350,8 @@ class FeatureSelectorOptimizer:
                        cv_folds: int, random_state: int) -> Dict[str, Any]:
         """自动选择最佳方法和特征数量"""
         logger.info("执行自动特征选择...")
+        # 保存调用前的目标特征数，以便方法结束后恢复
+        original_target = self.target_n_features
         
         best_results = None
         best_score = -np.inf
@@ -305,34 +359,52 @@ class FeatureSelectorOptimizer:
         # 尝试不同的方法和特征数量
         methods = ['ensemble', 'importance', 'stability']
         feature_counts = [20, 30, 50, 70, 100]
+        importance_models = ['rf', 'xgb', 'lgb']
         
-        original_target = self.target_n_features
-        
-        for method in methods:
-            for n_features in feature_counts:
-                self.target_n_features = n_features
-                
-                try:
-                    if method == 'ensemble':
-                        results = self._ensemble_selection(X, y, cv_folds, random_state)
-                    elif method == 'importance':
-                        results = self._importance_based_selection(X, y, cv_folds, random_state)
-                    elif method == 'stability':
-                        results = self._stability_selection(X, y, cv_folds, random_state)
-                    
-                    current_score = results['cv_score']
-                    
-                    logger.info(f"方法: {method}, 特征数: {n_features}, CV得分: {current_score:.4f}")
-                    
-                    if current_score > best_score:
-                        best_score = current_score
-                        best_results = results.copy()
-                        best_results['best_method'] = method
-                        best_results['best_n_features'] = n_features
-                
-                except Exception as e:
-                    logger.warning(f"方法 {method} 特征数 {n_features} 失败: {e}")
-                    continue
+        combos = []
+        for m in methods:
+            for n in feature_counts:
+                if m == 'importance':
+                    for im in importance_models:
+                        combos.append((m, n, im))
+                else:
+                    combos.append((m, n, None))
+
+        def _evaluate_combo(method: str, n_features: int, imp_model: str):
+            """评估单个 (method, n_features[, importance_model]) 组合的性能"""
+            tmp_selector = FeatureSelectorOptimizer(
+                task_type=self.task_type,
+                target_n_features=n_features,
+                n_jobs=self.n_jobs,
+                importance_model=imp_model or self.importance_model
+            )
+            if method == 'ensemble':
+                return tmp_selector._ensemble_selection(X, y, cv_folds, random_state)
+            elif method == 'importance':
+                return tmp_selector._importance_based_selection(X, y, cv_folds, random_state)
+            elif method == 'stability':
+                return tmp_selector._stability_selection(X, y, cv_folds, random_state)
+            else:
+                raise ValueError(f"不支持的方法: {method}")
+
+        if Parallel is not None and self.n_jobs != 1:
+            logger.info(f"使用并行计算 auto 网格搜索 (n_jobs={self.n_jobs}) ...")
+            results_list = Parallel(n_jobs=self.n_jobs)(
+                delayed(_evaluate_combo)(m, n, im) for m, n, im in combos
+            )
+        else:
+            logger.info("使用串行计算 auto 网格搜索 ...")
+            results_list = [_evaluate_combo(m, n, im) for m, n, im in combos]
+
+        for res in results_list:
+            current_score = res['cv_score']
+            method = res['method']
+            n_features = res['n_selected_features']
+            if current_score > best_score:
+                best_score = current_score
+                best_results = res.copy()
+                best_results['best_method'] = method
+                best_results['best_n_features'] = n_features
         
         # 恢复原始目标特征数
         self.target_n_features = original_target
@@ -374,11 +446,11 @@ class FeatureSelectorOptimizer:
             if self.task_type == 'classification':
                 model = RandomForestClassifier(n_estimators=100, random_state=random_state)
                 cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='roc_auc')
+                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='roc_auc', n_jobs=self.n_jobs)
             else:
                 model = RandomForestRegressor(n_estimators=100, random_state=random_state)
                 cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='neg_mean_squared_error')
+                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='neg_mean_squared_error', n_jobs=self.n_jobs)
                 scores = -scores  # 转换为正数，越小越好
             
             return float(np.mean(scores))

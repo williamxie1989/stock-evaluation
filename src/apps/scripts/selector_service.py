@@ -943,9 +943,11 @@ class IntelligentStockSelector:
         # ---------------- 将预测结果写入数据库 ----------------
         try:
             if valid_results:
-                import pandas as pd, datetime as _dt
+                import datetime as _dt
                 df_preds = pd.DataFrame(valid_results)
-                # 仅保留标准字段，若存在额外列也一并写入
+                # 保留与表结构一致的列
+                allowed_cols = ['symbol', 'prob_up_30d', 'expected_return_30d', 'confidence', 'score', 'sentiment', 'prediction']
+                df_preds = df_preds[[c for c in allowed_cols if c in df_preds.columns]]
                 today_str = _dt.datetime.now().strftime('%Y-%m-%d')
                 df_preds['date'] = today_str
                 self.db.insert_dataframe(df_preds, 'predictions')

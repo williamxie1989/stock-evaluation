@@ -72,7 +72,13 @@ class UnifiedDatabaseManager:
         
         self._connection_pool = None
         self._init_connection_pool()
-        
+
+        # 初始化后确保核心业务表存在，避免运行时因缺失表导致错误
+        try:
+            self._ensure_tables_exist()
+        except Exception as e:
+            logger.warning(f"确保核心表存在时出错: {e}")
+
         logger.info(f"统一数据库管理器初始化完成，类型: {self.db_type}")
     
     def _init_connection_pool(self):
@@ -367,23 +373,40 @@ class UnifiedDatabaseManager:
         ORM 管理表结构。
         """
         try:
-            create_sql = (
-                """
-                CREATE TABLE IF NOT EXISTS predictions (
-                    id INTEGER PRIMARY KEY {} ,
-                    symbol TEXT NOT NULL,
-                    date TEXT NOT NULL,
-                    prob_up_30d REAL,
-                    expected_return_30d REAL,
-                    confidence REAL,
-                    score REAL,
-                    sentiment TEXT,
-                    prediction INTEGER,
-                    UNIQUE(symbol, date)
+            if self.db_type == 'mysql':
+                create_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS predictions (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        symbol VARCHAR(32) NOT NULL,
+                        date DATE NOT NULL,
+                        prob_up_30d DOUBLE,
+                        expected_return_30d DOUBLE,
+                        confidence DOUBLE,
+                        score DOUBLE,
+                        sentiment VARCHAR(32),
+                        prediction INT,
+                        UNIQUE KEY idx_symbol_date (symbol, date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
                 )
-                """
-            ).format("AUTO_INCREMENT" if self.db_type == "mysql" else "AUTOINCREMENT")
-
+            else:
+                create_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS predictions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        prob_up_30d REAL,
+                        expected_return_30d REAL,
+                        confidence REAL,
+                        score REAL,
+                        sentiment TEXT,
+                        prediction INTEGER,
+                        UNIQUE(symbol, date)
+                    )
+                    """
+                )
             self.execute_update(create_sql)
             logger.info("确保 predictions 表存在")
         except Exception as e:
