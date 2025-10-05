@@ -162,7 +162,8 @@ class UnifiedModelTrainer:
                  reuse_feature_selection: bool = True,
                  refresh_feature_selection: bool = False,
                  feature_selection_n_jobs: int = -1,
-                 importance_model: str = 'rf'):
+                 importance_model: str = 'rf',
+                 random_seed: int = 42):
         """初始化统一模型训练器
         Args:
             enable_feature_selection: 是否在数据预处理阶段启用特征选择优化器
@@ -185,6 +186,9 @@ class UnifiedModelTrainer:
         # 并行核心数
         self.feature_selection_n_jobs = feature_selection_n_jobs
         self.importance_model = importance_model
+        # 设置随机种子，保证结果可复现
+        self.random_seed = random_seed
+        np.random.seed(self.random_seed)
     
     def prepare_training_data(self, stock_list: List[str] = None, mode: str = 'both', lookback_days: int = 365, 
                             n_stocks: int = 1000, prediction_period: int = 30,
@@ -208,13 +212,23 @@ class UnifiedModelTrainer:
         stock_list = self.data_access.get_all_stock_list()
         if stock_list is None or stock_list.empty:
             raise ValueError("无法获取股票列表")
+
+        # 过滤掉北交所、科创板和 B 股，只保留沪深 A 股主板及创业板
+        try:
+            if 'board_type' in stock_list.columns:
+                stock_list = stock_list[~stock_list['board_type'].isin(['北交所', '科创板'])]
+            if 'market' in stock_list.columns:
+                stock_list = stock_list[stock_list['market'] != 'B股']
+        except Exception as e:
+            logger.warning(f"过滤板块类型时出错: {e}")
         
         if 'symbol' not in stock_list.columns:
             raise ValueError("股票列表缺少 'symbol' 列，请检查数据访问层是否已生成标准化代码")
         symbols_info = stock_list.set_index('symbol')
         symbols = symbols_info.index.tolist()
         # 随机打乱股票列表，确保覆盖沪深主板及创业板
-        np.random.shuffle(symbols)
+        rng = np.random.default_rng(self.random_seed)
+        rng.shuffle(symbols)
         logger.info(f"随机打乱后股票总数 {len(symbols)}，将从中抽取 {n_stocks} 只")
         
         # 设置日期范围 (支持 as_of_date + 交易日校正)
@@ -462,6 +476,11 @@ class UnifiedModelTrainer:
         logger.info(f"收益率范围: {y_reg_final.min():.3f} 到 {y_reg_final.max():.3f}")
         logger.info(f"收益率均值: {y_reg_final.mean():.6f}, 标准差: {y_reg_final.std():.6f}")
         logger.info(f"正样本比例: {y_cls_final.mean():.3f}")
+        # 数据质量分析
+        try:
+            self.analyze_data_quality(X_final, y_reg_final)
+        except Exception as e:
+            logger.warning(f"数据质量分析失败: {e}")
         
         # 保留可读特征名，避免预测阶段列名不一致问题
         
@@ -470,16 +489,25 @@ class UnifiedModelTrainer:
             logger.info("已关闭特征选择优化，直接返回清洗后的全部特征")
             return X_final, y_reg_final, y_cls_final
 
-        # 若启用缓存且存在且不强制刷新，直接复用
+        # 若启用缓存且存在且不强制刷新，尽量复用
         if self.reuse_feature_selection and not self.refresh_feature_selection:
             if os.path.exists(self.feature_cache_file):
                 try:
                     with open(self.feature_cache_file, 'r') as f:
                         cached_features = json.load(f)
-                    if isinstance(cached_features, list) and all(f in X_final.columns for f in cached_features):
-                        logger.info(f"加载缓存特征集合，共 {len(cached_features)} 个特征")
-                        X_selected = X_final[cached_features]
-                        return X_selected, y_reg_final, y_cls_final
+                    if isinstance(cached_features, list):
+                        available_features = [feat for feat in cached_features if feat in X_final.columns]
+                        missing_features = [feat for feat in cached_features if feat not in X_final.columns]
+                        if missing_features:
+                            logger.warning(
+                                f"特征缓存中有 {len(missing_features)} 个特征在当前数据集中缺失，仅展示前10个: {missing_features[:10]}")
+                        # 复用策略：至少 10 个且不低于原缓存的一半
+                        if len(available_features) >= 10 and len(available_features) >= len(cached_features) * 0.5:
+                            logger.info(f"加载缓存特征集合，可用 {len(available_features)}/{len(cached_features)} 个特征")
+                            X_selected = X_final[available_features]
+                            return X_selected, y_reg_final, y_cls_final
+                        else:
+                            logger.info("可用缓存特征不足，重新执行特征选择 …")
                 except Exception as e:
                     logger.warning(f"加载特征缓存失败: {e}")
 
@@ -617,7 +645,7 @@ class UnifiedModelTrainer:
                     # 已在模块顶部统一导入 TimeSeriesSplit 与 cross_val_score，删除局部导入避免作用域问题
                     from sklearn.preprocessing import StandardScaler
                     from sklearn.impute import SimpleImputer
-                    from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore
+                    from src.ml.features.preprocessing import IndustryMarketCapTransformer
                     from sklearn.pipeline import Pipeline
                     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
                     from sklearn.linear_model import LogisticRegression
@@ -670,9 +698,10 @@ class UnifiedModelTrainer:
 
                     # 构建包含特征工程的管道: 缺失值填充 → 分位数缩尾 → 跨截面Z分数标准化 → 分类器
                     from sklearn.impute import SimpleImputer
-                    from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore
+                    from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore, IndustryMarketCapTransformer
                     pipe = Pipeline([
                             ('imputer', SimpleImputer(strategy='median')),
+                            ('industry_cap', IndustryMarketCapTransformer()),
                             ('winsorizer', Winsorizer()),
                             ('zscore', CrossSectionZScore()),
                             ('classifier', classifier)
@@ -1203,7 +1232,24 @@ class UnifiedModelTrainer:
                     'sharpe': sharpe_scorer,
                     'ir': ir_scorer
                 }
-                cv_results = cross_validate(stacking_model, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+                from sklearn.base import clone
+                cv_stacking = clone(stacking_model)
+                # 遍历并关闭内部早停
+                def _recursive_disable_es(est):
+                    if hasattr(est, 'get_params') and 'early_stopping_rounds' in est.get_params():
+                        try:
+                            est.set_params(early_stopping_rounds=None)
+                        except ValueError:
+                            pass
+                    # 如果是管线或 stacking, 递归处理子估计器
+                    if hasattr(est, 'estimators_'):
+                        for sub in est.estimators_:
+                            _recursive_disable_es(sub)
+                    if hasattr(est, 'named_steps'):
+                        for sub in est.named_steps.values():
+                            _recursive_disable_es(sub)
+                _recursive_disable_es(cv_stacking)
+                cv_results = cross_validate(cv_stacking, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
                 metrics_dict = {
                     'ic': cv_results['test_ic'],
                     'r2': cv_results['test_r2'],
@@ -1403,9 +1449,10 @@ class UnifiedModelTrainer:
 
         # 创建管线
         from sklearn.impute import SimpleImputer
-        from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore
+        from src.ml.features.preprocessing import Winsorizer, CrossSectionZScore, IndustryMarketCapTransformer
         pipeline = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
+            ('industry_cap', IndustryMarketCapTransformer()),
             ('winsor', Winsorizer()),
             ('zscore', CrossSectionZScore()),
             ('scaler', StandardScaler()),
@@ -1448,8 +1495,42 @@ class UnifiedModelTrainer:
                 'q75': float(np.percentile(arr, 75)),
                 'max': float(np.max(arr))
             }
-        train_pred_stats = _calc_dist_stats(y_train_pred)
-        val_pred_stats = _calc_dist_stats(y_test_pred)
+
+    # ---------------- 数据质量分析辅助 ----------------
+    def analyze_data_quality(self, X: pd.DataFrame, y_reg: pd.Series, report_dir: str = "reports") -> None:
+        """输出缺失率、收益率分布并保存直方图"""
+        import os, matplotlib
+        os.makedirs(report_dir, exist_ok=True)
+        # 缺失率统计
+        na_rate = X.isna().mean().sort_values(ascending=False)
+        logger.info("缺失率 Top20:\n" + na_rate.head(20).to_string())
+        # 标签描述
+        logger.info("收益率描述:\n" + y_reg.describe().to_string())
+        try:
+            import scipy.stats as st
+            logger.info(f"收益率偏度: {st.skew(y_reg):.4f}, 峰度: {st.kurtosis(y_reg):.4f}")
+        except Exception as e:
+            logger.warning(f"偏度/峰度计算失败: {e}")
+        # 直方图
+        try:
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            try:
+                import seaborn as sns
+                plt.figure(figsize=(6,4))
+                sns.histplot(y_reg, bins=100, kde=True)
+            except ImportError:
+                plt.figure(figsize=(6,4))
+                plt.hist(y_reg, bins=100, alpha=0.7)
+            plt.title("Return Distribution")
+            plt.tight_layout()
+            fig_path = os.path.join(report_dir, "return_distribution.png")
+            plt.savefig(fig_path)
+            plt.close()
+            logger.info(f"直方图保存于 {fig_path}")
+        except Exception as e:
+            logger.warning(f"绘图失败: {e}")
+        return  # 分析函数结束
         
         # 计算评估指标
         train_ic = information_coefficient(y_train, y_train_pred)
@@ -1544,7 +1625,27 @@ class UnifiedModelTrainer:
                 'sharpe': sharpe_scorer,
                 'ir': ir_scorer
             }
-            cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+            # 若为 Boosting 模型，克隆并移除 early_stopping_rounds 以避免无验证集时报错
+            from sklearn.base import clone
+            cv_pipeline = clone(pipeline)
+            # 递归关闭所有 early_stopping_rounds
+            def _disable_es(est):
+                 if hasattr(est, 'get_params'):
+                     params = est.get_params(deep=False)
+                     if 'early_stopping_rounds' in params and params['early_stopping_rounds'] not in [None, 0]:
+                         try:
+                             est.set_params(early_stopping_rounds=None)
+                         except ValueError:
+                             pass
+                 # 处理子估计器
+                 if hasattr(est, 'estimators_') and est.estimators_:
+                     for sub in est.estimators_:
+                         _disable_es(sub)
+                 if hasattr(est, 'named_steps'):
+                     for sub in est.named_steps.values():
+                         _disable_es(sub)
+            _disable_es(cv_pipeline)
+            cv_results = cross_validate(cv_pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
             # 将交叉验证各折指标保存到结果，供后续selector加载
             result['cv_metrics'] = {
                 'ic': cv_results['test_ic'].tolist(),
@@ -1671,9 +1772,14 @@ class UnifiedModelTrainer:
         else:
             raise ValueError(f"不支持的树回归模型类型: {model_type}")
         
+        # 确保 SimpleImputer 已导入
+        from sklearn.impute import SimpleImputer
+        from src.ml.features.preprocessing import IndustryMarketCapTransformer, Winsorizer, CrossSectionZScore
+        
         # 创建管线
         pipeline = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
+            ('industry_cap', IndustryMarketCapTransformer()),
             ('winsor', Winsorizer()),
             ('zscore', CrossSectionZScore()),
             ('scaler', StandardScaler()),
@@ -1916,7 +2022,25 @@ class UnifiedModelTrainer:
                 'sharpe': sharpe_scorer,
                 'ir': ir_scorer
             }
-            cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+            # 克隆管线并递归关闭 early_stopping_rounds，避免交叉验证时报缺少验证集
+            from sklearn.base import clone
+            cv_pipeline = clone(pipeline)
+            def _recursive_disable_es(est):
+                if hasattr(est, 'get_params') and 'early_stopping_rounds' in est.get_params():
+                    try:
+                        est.set_params(early_stopping_rounds=None)
+                    except Exception:
+                        pass
+                # 处理子估计器集合
+                if hasattr(est, 'estimators_') and est.estimators_:
+                    for sub in est.estimators_:
+                        _recursive_disable_es(sub)
+                if hasattr(est, 'named_steps'):
+                    for sub in est.named_steps.values():
+                        _recursive_disable_es(sub)
+            _recursive_disable_es(cv_pipeline)
+
+            cv_results = cross_validate(cv_pipeline, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
             metrics_dict = {
                 'ic': cv_results['test_ic'],
                 'r2': cv_results['test_r2'],
@@ -2106,6 +2230,7 @@ def main():
     parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
     parser.add_argument("--fs-n-jobs", type=int, default=-1, help="特征选择时并行CPU核心数（-1 表示全部）")
     parser.add_argument("--importance_model", type=str, default='rf', choices=['rf','xgb','lgb','auto'], help="特征选择时使用的重要性模型（默认rf）")
+    parser.add_argument("--enable_interaction_features", action="store_true", help="启用自动交互特征生成（默认关闭）")
     # 兼容性补充：快速测试及特征缓存控制
     parser.add_argument("--quick-test", action="store_true", help="启用快速验证模式：自动缩小数据规模、禁用耗时操作")
     parser.add_argument("--no-feature-cache", action="store_true", help="不使用特征选择缓存，始终重新计算特征选择（默认：False）")
@@ -2146,6 +2271,9 @@ def main():
                                       refresh_feature_selection=args.refresh_feature_selection,
                                       feature_selection_n_jobs=args.fs_n_jobs,
                                       importance_model=args.importance_model)
+        if getattr(args, "enable_interaction_features", False):
+            trainer.feature_generator.feature_config['interaction']['enabled'] = True
+            logger.info("已启用自动交互特征生成")
         if args.disable_feature_selection:
             logger.info("已通过命令行开关关闭特征选择优化")
             
@@ -2236,6 +2364,8 @@ if __name__ == "__main__":
                         help='特征选择时用于并行的CPU核心数（-1 表示全部）')
     parser.add_argument('--importance-model', type=str, default='rf', choices=['rf', 'xgb', 'lgb', 'auto'],
                         help='特征选择时使用的重要性模型（默认：rf，可选：rf/xgb/lgb/auto）')
+    parser.add_argument('--enable-interaction-features', action='store_true', dest='enable_interaction_features',
+                        help='启用自动交互特征生成（默认关闭）')
     # 快速测试模式
     parser.add_argument('--quick-test', action='store_true',
                         help='启用快速验证模式：自动缩小数据规模、禁用耗时操作')
@@ -2268,6 +2398,10 @@ if __name__ == "__main__":
                                   refresh_feature_selection=args.refresh_feature_selection,
                                   feature_selection_n_jobs=args.fs_n_jobs,
                                   importance_model=args.importance_model)
+
+    if getattr(args, 'enable_interaction_features', False):
+        trainer.feature_generator.feature_config['interaction']['enabled'] = True
+        logger.info('已启用自动交互特征生成')
 
     # 准备数据
     X, y = trainer.prepare_training_data(

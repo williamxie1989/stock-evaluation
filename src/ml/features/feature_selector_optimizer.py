@@ -18,6 +18,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Ridge, Lasso
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import roc_auc_score, mean_squared_error
 import matplotlib.pyplot as plt
 try:
@@ -306,18 +307,27 @@ class FeatureSelectorOptimizer:
             
             # 训练模型获取特征重要性
             if self.task_type == 'classification':
-                model = RandomForestClassifier(n_estimators=100, random_state=random_state + i)
+                model = RandomForestClassifier(n_estimators=100, random_state=random_state + i, n_jobs=1)
             else:
-                model = RandomForestRegressor(n_estimators=100, random_state=random_state + i)
+                model = RandomForestRegressor(n_estimators=100, random_state=random_state + i, n_jobs=1)
             
             model.fit(X_sample, y_sample)
-            importances = model.feature_importances_
+            # 使用 permutation_importance 替代内置 feature_importances_，可减少模型偏置且支持一致接口
+            perm_result = permutation_importance(
+                model, X_sample, y_sample,
+                n_repeats=5,
+                random_state=random_state + i,
+                n_jobs=self.n_jobs
+            )
+            importances = perm_result.importances_mean
             
             # 记录每个特征的重要性
             for feature, importance in zip(X.columns, importances):
                 if feature not in feature_stability:
                     feature_stability[feature] = []
                 feature_stability[feature].append(importance)
+            
+            logger.info(f"[Stability] Iteration {i+1}/{n_iterations} completed.")
         
         # 计算稳定性得分（平均值 / 标准差）
         stability_scores = {}
@@ -330,6 +340,7 @@ class FeatureSelectorOptimizer:
         sorted_features = sorted(stability_scores.items(), key=lambda x: x[1], reverse=True)
         selected_features = [f[0] for f in sorted_features[:self.target_n_features]]
         
+        logger.info("[Stability] All iterations complete. Starting CV validation...")
         # 交叉验证验证
         cv_score = self._validate_features(X[selected_features], y, cv_folds, random_state)
         
@@ -444,15 +455,16 @@ class FeatureSelectorOptimizer:
         """验证选择的特征"""
         try:
             if self.task_type == 'classification':
-                model = RandomForestClassifier(n_estimators=100, random_state=random_state)
+                model = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=1)
                 cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='roc_auc', n_jobs=self.n_jobs)
+                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='roc_auc', n_jobs=1)
             else:
-                model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+                model = RandomForestRegressor(n_estimators=100, random_state=random_state, n_jobs=1)
                 cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='neg_mean_squared_error', n_jobs=self.n_jobs)
+                scores = cross_val_score(model, X_selected, y, cv=cv, scoring='neg_mean_squared_error', n_jobs=1)
                 scores = -scores  # 转换为正数，越小越好
             
+            logger.info(f"交叉验证完成，平均得分={float(np.mean(scores)):.6f}")
             return float(np.mean(scores))
         
         except Exception as e:

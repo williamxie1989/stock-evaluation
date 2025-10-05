@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
+import itertools
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,13 @@ class EnhancedFeatureGenerator:
             'volume_ma_periods': [5, 8, 10, 15, 20, 30],  # 6个周期 = 6个特征
             'volume_roc_periods': [5, 8, 10, 15, 20],  # 5个周期 = 5个特征
             'obv_periods': [10, 20],  # 2个周期 = 2个特征
-            'vwap_periods': [5, 10, 20]  # 3个周期 = 3个特征
+            'vwap_periods': [5, 10, 20],  # 3个周期 = 3个特征
+            # 交互特征开关与参数
+            'interaction': {
+                'enabled': False,  # 默认关闭，避免维度爆炸
+                'methods': ['product', 'ratio'],  # 支持乘积、比值
+                'max_pairs': 100  # 最多生成多少组交互特征，防止生成过多
+            }
         }
     
     def generate_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
@@ -89,6 +96,13 @@ class EnhancedFeatureGenerator:
                 volatility_features,
                 volume_features
             ], axis=1)
+            
+            # ---------------- 交互特征生成 ----------------
+            interaction_cfg = self.feature_config.get('interaction', {})
+            if interaction_cfg.get('enabled', False):
+                interaction_feats = self._generate_interaction_features(all_features, interaction_cfg)
+                all_features = pd.concat([all_features, interaction_feats], axis=1)
+            # ------------------------------------------------
             
             # 特征选择
             if target is not None and self.feature_config.get('feature_selection', {}).get('enabled', False):
@@ -463,3 +477,34 @@ class EnhancedFeatureGenerator:
         """重置增强特征生成器"""
         self.feature_cache.clear()
         logger.info("增强特征生成器已重置")
+
+    def _generate_interaction_features(self, feats: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
+        """根据配置自动生成交互特征（乘积/比值）"""
+        try:
+            methods = cfg.get('methods', ['product', 'ratio'])
+            max_pairs = cfg.get('max_pairs', 100)
+            numeric_cols = feats.select_dtypes(include=[np.number]).columns.tolist()
+
+            # 仅使用方差最大的前 N 列，避免无用列组合
+            col_variances = feats[numeric_cols].var().sort_values(ascending=False)
+            top_cols = col_variances.head(30).index.tolist()  # 取前30列方差最大的特征
+
+            pairs = list(itertools.combinations(top_cols, 2))[:max_pairs]
+            inter_df = pd.DataFrame(index=feats.index)
+
+            for col_a, col_b in pairs:
+                if 'product' in methods:
+                    inter_df[f'{col_a}_x_{col_b}'] = feats[col_a] * feats[col_b]
+                if 'ratio' in methods:
+                    # 避免除以零
+                    inter_df[f'{col_a}_div_{col_b}'] = feats[col_a] / feats[col_b].replace(0, np.nan)
+
+            # 处理可能出现的无穷与缺失
+            inter_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            inter_df = inter_df.fillna(inter_df.median())
+
+            logger.info(f"生成 {inter_df.shape[1]} 个交互特征")
+            return inter_df
+        except Exception as e:
+            logger.error(f"交互特征生成失败: {e}")
+            return pd.DataFrame()
