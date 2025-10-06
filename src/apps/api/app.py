@@ -333,7 +333,7 @@ async def refresh_data(max_symbols: int = 50, full: bool = 0, batch_size: int = 
         return {"success": 0, "error": str(e)}
 
 @app.get("/api/stock-picks")
-async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 500, force_refresh: bool = 0, debug: int = 0):
+async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, force_refresh: bool = 0, debug: int = 0):
     """
     获取智能选股推荐
     可选 limit_symbols 用于限制参与预测的股票数量，以便快速联调与验证。
