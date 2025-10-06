@@ -18,6 +18,51 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import warnings
 
+# ---------------- Optuna Study 辅助函数 ----------------
+try:
+    import optuna
+    from optuna.pruners import PatientPruner, MedianPruner
+
+    def create_study_with_pruner(direction: str = "maximize", patience: int = 10, threshold: float | None = None, **kwargs):
+        """创建带有 PatientPruner 的 Optuna Study。
+
+        Args:
+            direction: 优化方向，"maximize" 或 "minimize"。
+            patience: 允许连续多少次 trial 未提升后才触发剪枝。
+            threshold: 可选阈值，指定 improvement 必须超过该阈值才视为提升。
+            **kwargs: 透传给 optuna.create_study 的其他关键字参数，例如 sampler。
+        Returns:
+            optuna.Study 对象，已配置好 pruner。
+        """
+        base_pruner = MedianPruner(n_warmup_steps=10)  # 预热步数可按需调整
+        # 兼容不同 Optuna 版本：部分版本 PatientPruner 不支持 threshold 参数
+        try:
+            pruner = PatientPruner(base_pruner, patience=patience, threshold=threshold)
+        except TypeError:
+            pruner = PatientPruner(base_pruner, patience=patience)
+
+        study = optuna.create_study(direction=direction, pruner=pruner, **kwargs)
+
+        # --------- 统计并输出 pruner 剪枝信息 ----------
+        from optuna.trial import TrialState  # 延迟导入避免非必要依赖
+        def _log_pruner_stats(s):
+            pruned_cnt = sum(1 for t in s.trials if t.state == TrialState.PRUNED)
+            if pruned_cnt:
+                logger.info(f"PatientPruner 触发次数: {pruned_cnt} / {len(s.trials)} trials 已被剪枝")
+
+        # 包装原 optimize 方法，使每次调用后自动记录剪枝信息
+        _orig_optimize = study.optimize
+        def _optimize_wrapper(*args, **kwargs):
+            _orig_optimize(*args, **kwargs)
+            _log_pruner_stats(study)
+        study.optimize = _optimize_wrapper  # type: ignore
+        return study
+except ImportError:
+    # 如果环境中未安装optuna，保持占位实现以避免导入错误
+    def create_study_with_pruner(*args, **kwargs):  # type: ignore
+        raise ImportError("Optuna 未安装，无法创建带 pruner 的 Study")
+
+
 # 添加项目根目录到路径
 # 将项目根目录添加到系统路径
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -664,7 +709,7 @@ class UnifiedModelTrainer:
                             raise ImportError
                         def objective(trial):
                             trial_params = {
-                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 200, 2000),
+                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 200, 4000),
                                 'classifier__max_depth': trial.suggest_int('classifier__max_depth', 3, 12),
                                 'classifier__learning_rate': trial.suggest_float('classifier__learning_rate', 0.01, 0.2, log=True),
                                 'classifier__subsample': trial.suggest_float('classifier__subsample', 0.5, 1.0),
@@ -679,9 +724,55 @@ class UnifiedModelTrainer:
                             # 关闭 early stopping 防止交叉验证报缺少验证集错误
                             trial_params_no_es = {k: v for k, v in trial_params.items()}
                             pipe.set_params(**trial_params_no_es)
-                            cv = TimeSeriesSplit(n_splits=3)
+                            cv = get_cv(n_splits=5, embargo=60)
                             scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
                             return scores.mean()  # maximize
+                    elif model_type == 'lightgbm':
+                        try:
+                            from lightgbm import LGBMClassifier
+                            # 计算类别不平衡比并动态设置 scale_pos_weight
+                            pos_cnt = int((y == 1).sum())
+                            neg_cnt = int((y == 0).sum())
+                            scale_pos_weight = (neg_cnt / pos_cnt) if pos_cnt > 0 else 1.0
+                            classifier = LGBMClassifier(random_state=42, n_jobs=-1, objective='binary', metric='binary_logloss',
+                                                        scale_pos_weight=scale_pos_weight)
+                        except ImportError:
+                            logger.warning("LightGBM 未安装, 回退使用 trainer 默认实现")
+                            raise ImportError
+                        def objective(trial):
+                            trial_params = {
+                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 200, 3000),
+                                'classifier__learning_rate': trial.suggest_float('classifier__learning_rate', 0.005, 0.3, log=True),
+                                'classifier__num_leaves': trial.suggest_int('classifier__num_leaves', 31, 512),
+                                # -1 表示不限制深度
+                                'classifier__max_depth': trial.suggest_int('classifier__max_depth', -1, 12),
+                                'classifier__subsample': trial.suggest_float('classifier__subsample', 0.5, 1.0),
+                                'classifier__colsample_bytree': trial.suggest_float('classifier__colsample_bytree', 0.5, 1.0),
+                                'classifier__min_child_samples': trial.suggest_int('classifier__min_child_samples', 5, 50),
+                                'classifier__reg_lambda': trial.suggest_float('classifier__reg_lambda', 0.0, 10.0),
+                                'classifier__reg_alpha': trial.suggest_float('classifier__reg_alpha', 0.0, 10.0)
+                            }
+                            pipe.set_params(**trial_params)
+                            cv = get_cv(n_splits=5, embargo=60)
+                            scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
+                            return scores.mean()
+
+                    elif model_type == 'randomforest':
+                        from sklearn.ensemble import RandomForestClassifier
+                        classifier = RandomForestClassifier(random_state=42, n_jobs=-1)
+                        def objective(trial):
+                            trial_params = {
+                                'classifier__n_estimators': trial.suggest_int('classifier__n_estimators', 100, 2000),
+                                'classifier__max_depth': trial.suggest_int('classifier__max_depth', 3, 20),
+                                'classifier__min_samples_split': trial.suggest_int('classifier__min_samples_split', 2, 10),
+                                'classifier__min_samples_leaf': trial.suggest_int('classifier__min_samples_leaf', 1, 5),
+                                'classifier__max_features': trial.suggest_categorical('classifier__max_features', ['sqrt', 'log2', None])
+                            }
+                            pipe.set_params(**trial_params)
+                            cv = TimeSeriesSplit(n_splits=3)
+                            scores = cross_val_score(pipe, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
+                            return scores.mean()
+
                     elif model_type == 'logistic':
                         classifier = LogisticRegression(max_iter=1000, solver='liblinear')
                         def objective(trial):
@@ -709,34 +800,12 @@ class UnifiedModelTrainer:
 
                     pipe.set_params(classifier__n_estimators=800)
 
-                    study = optuna.create_study(direction='maximize')
+                    # 使用 Optuna PatientPruner 替代自定义早停回调
+                    early_stop_rounds = 10  # pruner patience，可根据需求调整
+                    study = create_study_with_pruner(direction='maximize', patience=early_stop_rounds)
 
-                    # ---------- Optuna 早停策略: 指定连续 early_stop_rounds 次未提升则停止 ----------
-                    early_stop_rounds = 10  # 可视情况调整
-                    def early_stopping_callback(study, trial):
-                        """当连续 early_stop_rounds 次 trial 未带来提升时停止搜索"""
-                        # 获取当前最佳值
-                        best_value = study.best_value
-                        # 第一次调用时初始化
-                        if 'no_improve_count' not in study.user_attrs:
-                            study.set_user_attr('no_improve_count', 0)
-                            study.set_user_attr('best_value_snap', best_value)
-                            return
-                        # 检查是否有提升
-                        direction = study.direction
-                        improved = (best_value < study.user_attrs['best_value_snap']) if direction.name == 'MINIMIZE' else (best_value > study.user_attrs['best_value_snap'])
-                        if improved:
-                            study.set_user_attr('no_improve_count', 0)
-                            study.set_user_attr('best_value_snap', best_value)
-                        else:
-                            cnt = study.user_attrs['no_improve_count'] + 1
-                            study.set_user_attr('no_improve_count', cnt)
-                            if cnt >= early_stop_rounds:
-                                logger.info(f"Optuna: 连续 {early_stop_rounds} 次未提升, 提前停止搜索")
-                                study.stop()
-
-                    study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False,
-                                    callbacks=[early_stopping_callback])
+                    # 进行超参数优化
+                    study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
 
                     best_params = study.best_params
                     logger.info(f"Optuna完成: 最佳参数 {best_params}")
@@ -1000,11 +1069,15 @@ class UnifiedModelTrainer:
 
                     def objective(trial):
                         meta_params = {
-                            'n_estimators': trial.suggest_int('n_estimators', 100, 600),
-                            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                            'max_depth': trial.suggest_int('max_depth', 3, 8),
+                            'n_estimators': trial.suggest_int('n_estimators', 200, 4000),
+                            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
+                            'max_depth': trial.suggest_int('max_depth', 3, 12),
                             'subsample': trial.suggest_float('subsample', 0.5, 1.0),
                             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+                            'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+                            'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
                         }
                         meta_learner_trial = XGBRegressor(
                             objective='reg:squarederror',
@@ -1022,7 +1095,7 @@ class UnifiedModelTrainer:
                         )
                         return -mean_squared_error(y_train_cv, train_pred_trial)
 
-                    study = optuna.create_study(direction='maximize')
+                    study = create_study_with_pruner(direction='maximize', patience=10)
                     study.optimize(objective, n_trials=optimization_trials, n_jobs=1)
                     best_params = study.best_params
                     cv_score = study.best_value
@@ -1131,7 +1204,7 @@ class UnifiedModelTrainer:
                         ).mean()
                         return score
 
-                    study = optuna.create_study(direction='maximize')
+                    study = create_study_with_pruner(direction='maximize', patience=10)
                     study.optimize(objective, n_trials=optimization_trials, n_jobs=1)
                     best_params = study.best_params
                     # 将 Optuna 参数名称映射回 set_params 所需格式
@@ -1668,6 +1741,19 @@ class UnifiedModelTrainer:
             csv_path = os.path.join(metrics_dir, f"{model_type}_regression_cv_scores.csv")
             save_cv_metrics(metrics_dict, csv_path)
             logger.info(f"交叉验证指标已保存到: {csv_path}")
+
+            # ===== 新增：输出交叉验证整体(反变换)指标 =====
+            try:
+                from sklearn.model_selection import cross_val_predict
+                # 对全数据进行分折预测，保持与交叉验证相同的折划分
+                cv_pred = cross_val_predict(cv_pipeline, X, y, cv=cv, n_jobs=-1)
+                cv_ic_full = information_coefficient(y, cv_pred)
+                cv_mse_full = mean_squared_error(y, cv_pred)
+                cv_r2_full = r2_score(y, cv_pred)
+                logger.info(
+                    f"交叉验证整体(反变换)指标: IC={cv_ic_full:.4f}, R²={cv_r2_full:.4f}, MSE={cv_mse_full:.6f}")
+            except Exception as e:
+                logger.warning(f"计算/输出反变换后的交叉验证整体指标失败: {e}")
         except Exception as err:
             logger.warning(f"保存交叉验证指标失败: {err}")
         
@@ -1815,10 +1901,16 @@ class UnifiedModelTrainer:
                             'regressor__bagging_freq': trial.suggest_int('regressor__bagging_freq', 0, 10)
                         }
                     elif model_type == 'catboost':
+                        # 扩展 CatBoost 搜索空间，覆盖更多正则化与结构超参数
                         search_params = {
-                            'regressor__iterations': trial.suggest_int('regressor__iterations', 200, 800),
-                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.3, log=True),
-                            'regressor__depth': trial.suggest_int('regressor__depth', 4, 10)
+                            'regressor__iterations': trial.suggest_int('regressor__iterations', 200, 2000),
+                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.005, 0.3, log=True),
+                            'regressor__depth': trial.suggest_int('regressor__depth', 4, 12),
+                            'regressor__l2_leaf_reg': trial.suggest_float('regressor__l2_leaf_reg', 1.0, 10.0),
+                            'regressor__bagging_temperature': trial.suggest_float('regressor__bagging_temperature', 0.0, 1.0),
+                            'regressor__random_strength': trial.suggest_float('regressor__random_strength', 0.0, 2.0),
+                            'regressor__subsample': trial.suggest_float('regressor__subsample', 0.5, 1.0),
+                            'regressor__grow_policy': trial.suggest_categorical('regressor__grow_policy', ['Depthwise', 'Lossguide'])
                         }
                     elif model_type == 'randomforest':
                         search_params = {
@@ -1830,7 +1922,7 @@ class UnifiedModelTrainer:
                     elif model_type == 'xgboost':
                         # 扩展搜索空间，与分类侧保持一致
                         search_params = {
-                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 200, 2000),
+                            'regressor__n_estimators': trial.suggest_int('regressor__n_estimators', 200, 4000),
                             'regressor__max_depth': trial.suggest_int('regressor__max_depth', 3, 12),
                             'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.2, log=True),
                             'regressor__subsample': trial.suggest_float('regressor__subsample', 0.5, 1.0),
@@ -1851,30 +1943,9 @@ class UnifiedModelTrainer:
                     ).mean()
                     return score  # 最大化 IC
 
-                study = optuna.create_study(direction='maximize')
-
-                # ---------------- Optuna 早停：连续 early_stop_rounds 次无提升停止 ----------------
                 early_stop_rounds = 10
-                def early_stopping_callback(study, trial):
-                    best_value = study.best_value
-                    if 'no_improve_count' not in study.user_attrs:
-                        study.set_user_attr('no_improve_count', 0)
-                        study.set_user_attr('best_value_snap', best_value)
-                        return
-                    tol = 5e-4  # 容忍度
-                    improved = (best_value - study.user_attrs['best_value_snap']) > tol
-                    if improved:
-                        study.set_user_attr('no_improve_count', 0)
-                        study.set_user_attr('best_value_snap', best_value)
-                    else:
-                        cnt = study.user_attrs['no_improve_count'] + 1
-                        study.set_user_attr('no_improve_count', cnt)
-                        if cnt >= early_stop_rounds:
-                            logger.info(f"Optuna: 连续 {early_stop_rounds} 次未提升, 提前停止搜索")
-                            study.stop()
-
-                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False,
-                                callbacks=[early_stopping_callback])
+                study = create_study_with_pruner(direction='maximize', patience=early_stop_rounds)
+                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
 
                 best_params = study.best_params
                 best_score = study.best_value
@@ -2224,12 +2295,12 @@ def main():
     parser.add_argument("--nested-cv", action="store_true", dest="nested_cv", help="启用 Nested Cross-Validation 评估")
     parser.add_argument("--outer-splits", type=int, default=5, help="Nested CV 外层折数 (默认5)")
     parser.add_argument("--inner-splits", type=int, default=3, help="Nested CV 内层折数 (默认3)")
-    parser.add_argument("--optimization_trials", type=int, default=50, help="Optuna/Bayesian优化时的迭代次数 (默认50)")
+    parser.add_argument("--optimization_trials", type=int, default=100, help="Optuna/Bayesian优化时的迭代次数 (默认100)")
     parser.add_argument("--meta-learning-rate", type=float, default=0.05, help="Stacking 元学习器默认学习率 (未使用 Optuna 时生效)")
     # 新增: 关闭特征选择开关
     parser.add_argument("--disable_feature_selection", action="store_true", help="关闭特征选择优化，加快训练速度")
     parser.add_argument("--fs-n-jobs", type=int, default=-1, help="特征选择时并行CPU核心数（-1 表示全部）")
-    parser.add_argument("--importance_model", type=str, default='rf', choices=['rf','xgb','lgb','auto'], help="特征选择时使用的重要性模型（默认rf）")
+    parser.add_argument("--importance_model", type=str, default='auto', choices=['rf','xgb','lgb','auto'], help="特征选择时使用的重要性模型（默认rf）")
     parser.add_argument("--enable_interaction_features", action="store_true", help="启用自动交互特征生成（默认关闭）")
     # 兼容性补充：快速测试及特征缓存控制
     parser.add_argument("--quick-test", action="store_true", help="启用快速验证模式：自动缩小数据规模、禁用耗时操作")
@@ -2352,7 +2423,7 @@ if __name__ == "__main__":
                         help='是否使用 Optuna 进行超参优化（默认：False）')
     parser.add_argument('--use_optuna', action='store_true', dest='use_optuna',
                         help='(兼容) 等同于 --use-optuna')
-    parser.add_argument('--optimization-trials', type=int, default=50,
+    parser.add_argument('--optimization-trials', type=int, default=100,
                         help='Optuna/Bayesian 优化的 trial 次数（默认：50）')
     parser.add_argument('--meta-learning-rate', type=float, default=0.05,
                         help='Stacking 元学习器默认学习率 (未使用 Optuna 时生效)')
