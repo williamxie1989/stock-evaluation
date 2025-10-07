@@ -15,6 +15,10 @@ import os
 import json
 from sklearn.calibration import CalibratedClassifierCV
 from ...data.db.unified_database_manager import UnifiedDatabaseManager
+from src.core.unified_data_access_factory import (
+    create_unified_data_access,
+    get_unified_data_access,
+)
 from .features import FeatureGenerator
 from ...ml.features.enhanced_features import EnhancedFeatureGenerator
 from ...trading.signals.signal_generator import SignalGenerator
@@ -91,6 +95,15 @@ class IntelligentStockSelector:
         初始化智能选股器
         """
         self.db = db_manager or UnifiedDatabaseManager(db_type='mysql')
+        self.data_access = get_unified_data_access()
+        if self.data_access is None:
+            try:
+                self.data_access = create_unified_data_access(
+                    data_access_config={"use_cache": True, "auto_sync": False},
+                    validate_sources=False,
+                )
+            except Exception:
+                self.data_access = None
         self.use_enhanced_features = use_enhanced_features
         self.use_enhanced_preprocessing = use_enhanced_preprocessing
         self.preprocessing_complexity = preprocessing_complexity
@@ -458,101 +471,153 @@ class IntelligentStockSelector:
         except Exception as e:
             logger.error(f"标准化器加载失败: {e}")
             return 0
-    
+
+    def _fetch_prices_bulk(
+        self,
+        symbols: List[str],
+        lookback_days: int = 180,
+    ) -> Dict[str, pd.DataFrame]:
+        """使用统一数据访问层批量获取历史数据，并统一列名。"""
+
+        if not symbols or self.data_access is None:
+            return {}
+
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=lookback_days)
+
+        try:
+            data_map = self.data_access.get_bulk_stock_data(
+                symbols,
+                start_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d"),
+                fields=["open", "high", "low", "close", "volume", "turnover", "amount"],
+                force_refresh=False,
+                auto_sync=False,
+            )
+        except Exception as exc:  # pragma: no cover - 回退到旧逻辑
+            logger.warning(f"批量获取历史数据失败，回退数据库接口: {exc}")
+            return {}
+
+        normalized: Dict[str, pd.DataFrame] = {}
+        for symbol, raw_df in (data_map or {}).items():
+            if raw_df is None or raw_df.empty:
+                continue
+
+            df = raw_df.copy()
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+            else:
+                df = df.reset_index()
+                if "index" in df.columns:
+                    df.rename(columns={"index": "date"}, inplace=True)
+                df["date"] = pd.to_datetime(df["date"])
+
+            df = df.sort_values("date")
+            df["symbol"] = symbol
+
+            rename_map = {
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+                "turnover": "Turnover",
+                "amount": "Amount",
+            }
+            for src_col, dst_col in rename_map.items():
+                if src_col in df.columns and dst_col not in df.columns:
+                    df[dst_col] = df[src_col]
+
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            normalized[symbol] = df
+
+        return normalized
+
     def get_latest_features(self, symbols: List[str], 
                            end_date: Optional[str] = None) -> pd.DataFrame:
-        """
-        获取最新的特征数据
-        """
+        """获取最新特征数据，并优先走统一数据访问层的批量缓存。"""
+
         if end_date is None:
             end_date = datetime.now().strftime('%Y-%m-%d')
-            
-        # 获取足够的历史数据用于特征计算（包含中期和长期特征）
-        start_date = (datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=180)).strftime('%Y-%m-%d')
-        
-        all_features = []
-        
-        # 批量获取所有股票的历史数据，减少数据库查询次数
-        try:
-            # 分批处理，避免一次性查询过多数据
-            batch_size = 50
-            for i in range(0, len(symbols), batch_size):
-                batch_symbols = symbols[i:i+batch_size]
-                # 只在关键节点输出日志，减少过程日志
-                if i == 0 or (i + batch_size) % 200 == 0 or i + batch_size >= len(symbols):
-                    logger.info(f"批量获取股票历史数据: {i+1}-{min(i+batch_size, len(symbols))}/{len(symbols)}")
-                
-                # 批量获取价格数据
-                all_prices = self.db.get_last_n_bars(batch_symbols, n=180)
-                if all_prices.empty:
-                    logger.warning(f"批量 {batch_symbols} 历史数据为空")
-                    continue
-                
-                # 按股票分组处理
-                for symbol in batch_symbols:
-                    # 提取该股票的数据
-                    prices = all_prices[all_prices['symbol'] == symbol].copy()
-                    if prices.empty or len(prices) < 20:
-                        logger.debug(f"股票 {symbol} 历史数据不足（少于20条记录）")
-                        continue
 
-                    # 按时间排序
-                    prices = prices.sort_values('date')
-                    
-                    # 使用FieldMapper标准化字段名，确保后续处理统一
-                    try:
-                        prices = FieldMapper.normalize_fields(prices, 'prices_daily')
-                        prices = FieldMapper.ensure_required_fields(prices, 'prices_daily')
-                    except Exception as fm_err:
-                        logger.debug(f"FieldMapper处理失败: {fm_err}")
+        all_features: List[pd.Series] = []
 
-                    # -------- 统一数值列类型，避免 decimal.Decimal 与 float 运算问题 --------
-                    numeric_cols_pi = ['Open', 'High', 'Low', 'Close', 'Volume']
-                    for col in numeric_cols_pi:
-                        if col in prices.columns:
-                            prices[col] = pd.to_numeric(prices[col], errors='coerce').astype(float)
-                    # ----------------------------------------------------------------------
-                    
-                    # 使用FeatureGenerator计算完整特征集（支持大小写列名）
-                    factor_features = self.feature_generator.calculate_factor_features(prices)
-                    if factor_features.empty:
-                        continue
-                    # 将特征转换为字典格式
-                    feature_dict = factor_features.iloc[-1].to_dict()  # 使用最新一天的特征
-                    feature_dict['symbol'] = symbol
-                    all_features.append(pd.Series(feature_dict))
-                        
-        except Exception as e:
-            logger.error(f"批量获取特征数据失败: {e}")
-            # 回退到逐个处理
+        def build_feature(symbol: str, prices: pd.DataFrame) -> Optional[pd.Series]:
+            if prices is None or prices.empty or len(prices) < 20:
+                return None
+
+            prices = prices.copy()
+            if 'date' in prices.columns:
+                prices['date'] = pd.to_datetime(prices['date'])
+            prices = prices.sort_values('date')
+
+            try:
+                prices = FieldMapper.normalize_fields(prices, 'prices_daily')
+                prices = FieldMapper.ensure_required_fields(prices, 'prices_daily')
+            except Exception as fm_err:
+                logger.debug(f"FieldMapper处理失败: {fm_err}")
+
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in prices.columns:
+                    prices[col] = pd.to_numeric(prices[col], errors='coerce').astype(float)
+
+            factor_features = self.feature_generator.calculate_factor_features(prices)
+            if factor_features.empty:
+                return None
+
+            feature_dict = factor_features.iloc[-1].to_dict()
+            feature_dict['symbol'] = symbol
+            return pd.Series(feature_dict)
+
+        batch_size = 50
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[i:i + batch_size]
+            if i == 0 or (i + batch_size) % 200 == 0 or i + batch_size >= len(symbols):
+                logger.info(
+                    "批量获取股票历史数据: %s-%s/%s",
+                    i + 1,
+                    min(i + batch_size, len(symbols)),
+                    len(symbols),
+                )
+
+            price_map = self._fetch_prices_bulk(batch_symbols)
+            missing_symbols = [sym for sym in batch_symbols if sym not in price_map]
+
+            fallback_prices = pd.DataFrame()
+            if missing_symbols:
+                fallback_prices = self.db.get_last_n_bars(missing_symbols, n=180)
+
+            for symbol in batch_symbols:
+                prices = price_map.get(symbol)
+                if prices is None and not fallback_prices.empty:
+                    subset = fallback_prices[fallback_prices['symbol'] == symbol].copy()
+                    if not subset.empty:
+                        subset = subset.sort_values('date')
+                        prices = subset
+
+                feature_series = build_feature(symbol, prices)
+                if feature_series is not None:
+                    all_features.append(feature_series)
+
+        if not all_features:
+            logger.warning("批量特征计算结果为空，尝试逐股票回退")
             for symbol in symbols:
-                # 获取价格数据（尽量多取一些，生成更多稳定特征）
                 prices = self.db.get_last_n_bars([symbol], n=180)
-                if prices.empty or len(prices) < 20:
-                    logger.warning(f"股票 {symbol} 历史数据不足（少于20条记录）")
-                    continue
-                
-                # 仅保留该股票并按时间排序
-                prices = prices[prices['symbol'] == symbol].copy()
-                prices = prices.sort_values('date')
-                
-                # 使用FeatureGenerator计算完整特征集（支持大小写列名）
-                factor_features = self.feature_generator.calculate_factor_features(prices)
-                if factor_features.empty:
-                    continue
-                # 将特征转换为字典格式
-                feature_dict = factor_features.iloc[-1].to_dict()  # 使用最新一天的特征
-                feature_dict['symbol'] = symbol
-                all_features.append(pd.Series(feature_dict))
+                prices = prices[prices['symbol'] == symbol].copy() if not prices.empty else pd.DataFrame()
+                feature_series = build_feature(symbol, prices)
+                if feature_series is not None:
+                    all_features.append(feature_series)
 
-        
         if all_features:
             result = pd.DataFrame(all_features)
             logger.info(f"特征获取完成，共处理 {len(result)} 只股票")
             return result
-        else:
-            logger.warning("特征获取结果为空")
-            return pd.DataFrame()
+
+        logger.warning("特征获取结果为空")
+        return pd.DataFrame()
     
     def predict_stocks(self, symbols: List[str], top_n: int = 10) -> List[Dict[str, Any]]:
         """
@@ -1470,4 +1535,3 @@ if __name__ == "__main__":
     result = selector.get_stock_picks(top_n=5)
     print("选股结果:")
     print(result)
-

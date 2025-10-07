@@ -387,6 +387,28 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
         # 复用全局 selector 实例
         selector = selector_service
 
+        def with_cache_metrics(payload: dict) -> dict:
+            uda = getattr(selector, "data_access", None) or _unified_data_access
+            if uda is None or not isinstance(payload, dict):
+                return payload
+            try:
+                report = uda.get_data_quality_report()
+                perf = report.get("performance", {}) if isinstance(report, dict) else {}
+                if perf:
+                    cache_metrics = {
+                        "requests": perf.get("requests", 0),
+                        "avg_latency_ms": perf.get("avg_latency_ms"),
+                        "l0_hit_rate": perf.get("l0_hit_rate"),
+                        "l1_hit_rate": perf.get("l1_hit_rate"),
+                        "l2_hit_rate": perf.get("l2_hit_rate"),
+                        "db_share": perf.get("db_share"),
+                        "provider_share": perf.get("provider_share"),
+                    }
+                    payload.setdefault("data", {})["cache_metrics"] = cache_metrics
+            except Exception as exc:  # pragma: no cover
+                logger.debug("附加缓存指标失败: %s", exc)
+            return payload
+
         # 缓存键与TTL检查
         cache_key = f"{limit_symbols or 0}:{top_n}"
         now = datetime.now()
@@ -446,6 +468,7 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
                     }
                 }
             }
+            response = with_cache_metrics(response)
 
             # 写入缓存
             try:
@@ -470,6 +493,7 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
                 "timing": {"total_ms": int((t1 - t0) * 1000)}
             }
         }
+        response = with_cache_metrics(response)
 
         try:
             ttl = timedelta(seconds=PICKS_CACHE_TTL_SECONDS)
