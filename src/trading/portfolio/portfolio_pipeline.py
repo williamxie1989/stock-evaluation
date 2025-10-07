@@ -111,7 +111,12 @@ class PortfolioPipeline:
         if end_date is None:
             end_date = pd.Timestamp(datetime.now().date())
         start_date = end_date - pd.Timedelta(days=days)
-        res = self.data_access.get_historical_data(symbol=symbol, start_date=str(start_date.date()), end_date=str(end_date.date()))
+        res = self.data_access.get_historical_data(
+            symbol=symbol,
+            start_date=str(start_date.date()),
+            end_date=str(end_date.date()),
+            fields=["open", "close", "high", "low", "volume", "turnover", "amount"],
+        )
         # 兼容异步/同步实现
         try:
             if asyncio.iscoroutine(res):

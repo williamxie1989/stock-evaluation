@@ -310,6 +310,8 @@ class UnifiedModelTrainer:
         collected_count = 0  # 成功收集的股票数量
         insufficient_symbols = []  # 本地数据不足，稍后再尝试 auto_sync 补拉的股票列表
 
+        fetch_fields = ["open", "high", "low", "close", "volume", "turnover", "amount"]
+
         # ---------------- 第一阶段：仅使用本地数据 ----------------
         for symbol in symbols:
             if collected_count >= n_stocks:
@@ -320,7 +322,13 @@ class UnifiedModelTrainer:
 
             try:
                 # 先只用本地数据，auto_sync=False
-                stock_data = self.data_access.get_stock_data(symbol, start_date, end_date, auto_sync=False)
+                stock_data = self.data_access.get_stock_data(
+                    symbol,
+                    start_date,
+                    end_date,
+                    fields=fetch_fields,
+                    auto_sync=False,
+                )
 
                 # 判定数据量是否足够
                 min_required_len = prediction_period + 15
@@ -399,7 +407,13 @@ class UnifiedModelTrainer:
                 if collected_count >= n_stocks:
                     break
                 try:
-                    stock_data = self.data_access.get_stock_data(symbol, start_date, end_date, auto_sync=True)
+                    stock_data = self.data_access.get_stock_data(
+                        symbol,
+                        start_date,
+                        end_date,
+                        fields=fetch_fields,
+                        auto_sync=True,
+                    )
                     if stock_data is None or stock_data.empty or len(stock_data) < prediction_period + 15:
                         continue
                     # 与第一阶段相同的处理流水线 ----------------

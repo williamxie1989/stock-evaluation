@@ -1,20 +1,19 @@
-"""
-统一数据访问层 - 整合数据库操作和统一数据提供者
-"""
+"""统一数据访问层 - 整合数据库操作和统一数据提供者"""
 
-import logging
-import pandas as pd
-import os
-import numpy as np
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Union, Tuple, Set
-from dataclasses import dataclass
-import threading
 import asyncio
-import time
-from pathlib import Path
 import hashlib
+import logging
 import os
+import time
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+import numpy as np
+import pandas as pd
 
 from src.cache.redis_cache import RedisCache
 
@@ -22,7 +21,7 @@ from src.cache.redis_cache import RedisCache
 from src.data.db.unified_database_manager import UnifiedDatabaseManager
 from src.data.providers.unified_data_provider import UnifiedDataProvider
 from src.data.providers.data_source_validator import DataSourceValidator
-from src.data.db.symbol_standardizer import standardize_symbol, get_symbol_standardizer
+from src.data.db.symbol_standardizer import get_symbol_standardizer, standardize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -61,26 +60,32 @@ class DataAccessConfig:
                 self.preferred_data_sources = ['tushare', 'eastmoney', 'tencent', 'sina', 'optimized_enhanced', 'enhanced_realtime', 'akshare', 'netease']
 
 
+@dataclass(eq=False)
+class CacheFetchResult:
+    """缓存加载结果，携带数据源信息，便于统计"""
+
+    dataframe: pd.DataFrame
+    source: str  # l1 / l2 / db / provider
+
+
 class UnifiedDataAccessLayer:
     """统一数据访问层 - 整合数据库和外部数据源"""
 
     def clear_all_caches(self) -> None:
         """清空内部缓存，用于测试或重置"""
         try:
-            # 清理统一 provider 缓存
             if hasattr(self, "unified_provider") and hasattr(self.unified_provider, "cache"):
                 self.unified_provider.cache.clear()
-            # 清理数据库管理器缓存（如果有）
             if hasattr(self.db_manager, "cache"):
                 self.db_manager.cache.clear()
-            # 重置内部统计
+            # 重置 L0/L1 缓存与统计
+            if hasattr(self, "_l0_cached_loader"):
+                self._l0_cached_loader.cache_clear()
             self._cache_stats = {'hits': 0, 'misses': 0}
-            # L0 进程级内存缓存（简单 TTL + 线程安全）
-            self._l0_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
-            self._l0_cache_lock = threading.Lock()
+            self._reset_perf_metrics()
             self._l1_cache = RedisCache(ttl=self.config.cache_ttl)
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover
+            logger.warning("clear_all_caches failed: %s", exc)
     
     def __init__(self, db_manager: Optional[UnifiedDatabaseManager] = None, 
                  config: Optional[DataAccessConfig] = None):
@@ -99,12 +104,100 @@ class UnifiedDataAccessLayer:
         self.data_validator = DataSourceValidator(self.unified_provider)
         self._sync_lock = threading.Lock()
         self._cache_stats = {'hits': 0, 'misses': 0}
-        # 初始化 L0/L1 缓存，避免后续属性缺失
-        self._l0_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
-        self._l0_cache_lock = threading.Lock()
+        self._perf_lock = threading.Lock()
+        self._reset_perf_metrics()
         self._l1_cache = RedisCache(ttl=self.config.cache_ttl)
-        
+        self._initialize_l0_cache()
+
         logger.info("UnifiedDataAccessLayer initialized")
+
+    # ------------------------------------------------------------------
+    # 内部初始化与度量
+    # ------------------------------------------------------------------
+    def _initialize_l0_cache(self) -> None:
+        """使用 functools.lru_cache 构建进程级 L0 缓存"""
+
+        maxsize = int(os.getenv("UDA_L0_MAXSIZE", "256"))
+        maxsize = max(32, maxsize)  # 防止配置过小导致频繁失效
+
+        @lru_cache(maxsize=maxsize)
+        def _cached_loader(
+            symbol: str,
+            start_str: str,
+            end_str: str,
+            fields_key: Tuple[str, ...],
+            ttl_bucket: int,
+            auto_sync_flag: bool,
+        ) -> CacheFetchResult:
+            # 新线程执行时没有事件循环，需要自行创建
+            start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_str, "%Y-%m-%d")
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(
+                    self._load_historical_data_uncached(
+                        symbol,
+                        start_dt,
+                        end_dt,
+                        fields_key,
+                        auto_sync_flag,
+                    )
+                )
+            finally:
+                loop.close()
+
+        self._l0_cached_loader = _cached_loader
+
+    def _reset_perf_metrics(self) -> None:
+        """重置性能统计"""
+
+        self._perf_metrics = {
+            "requests": 0,
+            "l0_hits": 0,
+            "l1_hits": 0,
+            "l2_hits": 0,
+            "db_hits": 0,
+            "provider_hits": 0,
+            "total_latency": 0.0,
+            "last_updated": None,
+        }
+
+    def _record_performance(self, source: str, latency: float) -> None:
+        """记录缓存命中层级与耗时"""
+
+        with self._perf_lock:
+            metrics = self._perf_metrics
+            metrics["requests"] += 1
+            metrics["total_latency"] += latency
+            metrics["last_updated"] = datetime.now().isoformat()
+
+            hit_map = {
+                "l0": "l0_hits",
+                "l1": "l1_hits",
+                "l2": "l2_hits",
+                "db": "db_hits",
+                "provider": "provider_hits",
+            }
+            metrics[hit_map.get(source, "db_hits")] += 1
+
+    def _get_performance_snapshot(self) -> Dict[str, Any]:
+        with self._perf_lock:
+            return dict(self._perf_metrics)
+
+    def _current_ttl_bucket(self) -> int:
+        """根据 cache_ttl 返回当前时间片，供 lru_cache 失效"""
+
+        ttl = getattr(self.config, "cache_ttl", 0) or 0
+        if ttl <= 0:
+            return 0
+        return int(time.time() // ttl)
+
+    @staticmethod
+    def _fields_to_tuple(fields: Optional[Sequence[str]]) -> Tuple[str, ...]:
+        if not fields:
+            return tuple()
+        return tuple(sorted({field for field in fields if field}))
     
     def initialize_data_sources(self, validate_sources: bool = True) -> Dict[str, Any]:
         """
@@ -324,8 +417,16 @@ class UnifiedDataAccessLayer:
             logger.error(f"Error getting all stock list: {e}")
             return None
     
-    def get_stock_data(self, symbol: str, start_date: Union[str, datetime], end_date: Union[str, datetime], force_refresh: bool = False, auto_sync: bool = None) -> Optional[pd.DataFrame]:
-        """同步获取股票历史数据，包装异步 get_historical_data 以兼容旧接口"""
+    def get_stock_data(
+        self,
+        symbol: str,
+        start_date: Union[str, datetime],
+        end_date: Union[str, datetime],
+        fields: Optional[Sequence[str]] = None,
+        force_refresh: bool = False,
+        auto_sync: bool = None,
+    ) -> Optional[pd.DataFrame]:
+        """同步获取股票历史数据，包装异步接口并支持字段选择"""
         try:
             # 标准化股票代码
             standardized_symbol = standardize_symbol(symbol)
@@ -340,7 +441,14 @@ class UnifiedDataAccessLayer:
                 new_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(new_loop)
                 try:
-                    coro = self.get_historical_data(standardized_symbol, start_date, end_date, force_refresh=force_refresh, auto_sync=auto_sync)
+                    coro = self.get_historical_data(
+                        standardized_symbol,
+                        start_date,
+                        end_date,
+                        fields=fields,
+                        force_refresh=force_refresh,
+                        auto_sync=auto_sync,
+                    )
                     result = new_loop.run_until_complete(coro)
                 finally:
                     new_loop.close()
@@ -360,7 +468,14 @@ class UnifiedDataAccessLayer:
             # 无事件循环，直接新建并运行
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            coro = self.get_historical_data(standardized_symbol, start_date, end_date, force_refresh=force_refresh, auto_sync=auto_sync)
+            coro = self.get_historical_data(
+                standardized_symbol,
+                start_date,
+                end_date,
+                fields=fields,
+                force_refresh=force_refresh,
+                auto_sync=auto_sync,
+            )
             result = loop.run_until_complete(coro)
             return result
 
@@ -709,12 +824,31 @@ class UnifiedDataAccessLayer:
                     }
             
             # 获取缓存统计
+            cache_hits = self._cache_stats.get('hits', 0)
+            cache_misses = self._cache_stats.get('misses', 0)
+            total_l0 = cache_hits + cache_misses
             cache_stats = {
-                'hits': self._cache_stats['hits'],
-                'misses': self._cache_stats['misses'],
-                'hit_rate': (self._cache_stats['hits'] / 
-                           (self._cache_stats['hits'] + self._cache_stats['misses']))
-                           if (self._cache_stats['hits'] + self._cache_stats['misses']) > 0 else 0
+                'l0_hits': cache_hits,
+                'l0_misses': cache_misses,
+                'l0_hit_rate': (cache_hits / total_l0) if total_l0 else 0.0,
+            }
+
+            perf_metrics = self._get_performance_snapshot()
+            perf_total = perf_metrics.get('requests', 0)
+            avg_latency_ms = (
+                (perf_metrics['total_latency'] / perf_total) * 1000
+                if perf_total
+                else 0.0
+            )
+            perf_summary = {
+                'requests': perf_total,
+                'avg_latency_ms': round(avg_latency_ms, 2),
+                'l0_hit_rate': (perf_metrics['l0_hits'] / perf_total) if perf_total else 0.0,
+                'l1_hit_rate': (perf_metrics['l1_hits'] / perf_total) if perf_total else 0.0,
+                'l2_hit_rate': (perf_metrics['l2_hits'] / perf_total) if perf_total else 0.0,
+                'db_share': (perf_metrics['db_hits'] / perf_total) if perf_total else 0.0,
+                'provider_share': (perf_metrics['provider_hits'] / perf_total) if perf_total else 0.0,
+                'last_updated': perf_metrics.get('last_updated'),
             }
             
             # 数据库状态
@@ -729,6 +863,7 @@ class UnifiedDataAccessLayer:
                 'primary_source': self.config.preferred_data_sources[0] if self.config.preferred_data_sources else 'unknown',
                 'data_sources': data_sources,
                 'cache_stats': cache_stats,
+                'performance': perf_summary,
                 'database': db_status,
                 'overall_health': 'healthy' if data_sources and any(ds.get('available') for ds in data_sources.values()) else 'degraded'
             }
@@ -1031,37 +1166,17 @@ class UnifiedDataAccessLayer:
 
         return {"synced": synced_total, "errors": errors_total}
 
-    def _make_cache_key(self, symbol: str, start_dt: datetime, end_dt: datetime) -> str:  # noqa: D401
-        """生成 L0 缓存 key（内部方法）"""
-        return f"{symbol}_{start_dt.strftime('%Y-%m-%d')}_{end_dt.strftime('%Y-%m-%d')}"
+    def _make_cache_key(
+        self,
+        symbol: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        fields: Tuple[str, ...],
+    ) -> str:  # noqa: D401
+        """生成缓存键，包含 symbol + 日期范围 + 字段列表"""
 
-
-    def _get_from_l0_cache(self, key: str) -> Optional[pd.DataFrame]:  # noqa: D401
-        """从 L0 缓存读取，如命中则返回 DataFrame 的拷贝"""
-        if not self.config.use_cache:
-            return None
-        with self._l0_cache_lock:
-            entry = self._l0_cache.get(key)
-            if not entry:
-                self._cache_stats['misses'] += 1
-                return None
-            df, ts = entry
-            if time.time() - ts <= self.config.cache_ttl:
-                self._cache_stats['hits'] += 1
-                return df.copy()
-            # 过期 - 删除
-            del self._l0_cache[key]
-            self._cache_stats['misses'] += 1
-        return None
-
-    def _save_to_l0_cache(self, key: str, df: pd.DataFrame) -> None:  # noqa: D401
-        """写入 L0 + L1 缓存（不会在禁用缓存或空 DF 时写入）"""
-        if not self.config.use_cache or df is None or df.empty:
-            return
-        with self._l0_cache_lock:
-            self._l0_cache[key] = (df.copy(), time.time())
-        # 同步写 L1
-        self._save_to_l1_cache(key, df)
+        fields_part = ",".join(fields) if fields else "all"
+        return f"{symbol}|{start_dt.strftime('%Y-%m-%d')}|{end_dt.strftime('%Y-%m-%d')}|{fields_part}"
 
 
 
@@ -1132,21 +1247,12 @@ class UnifiedDataAccessLayer:
         start_date: "datetime | str",
         end_date: "datetime | str",
         *,
+        fields: Optional[Sequence[str]] = None,
         force_refresh: bool = False,
         auto_sync: bool | None = None,
     ) -> "pd.DataFrame | None":  # noqa: D401
-        """异步获取历史行情数据，包含两级缓存策略。
+        """异步获取历史行情数据，带多层缓存与性能统计"""
 
-        Args:
-            symbol: 股票代码 (已标准化或待标准化)
-            start_date: 开始日期 (含)
-            end_date: 结束日期 (含)
-            force_refresh: 是否跳过缓存强制刷新
-            auto_sync: 若数据库缺失数据，是否自动从数据源同步 (默认为配置值)
-        """
-        import pandas as pd  # noqa: WPS433 (local import to减轻启动开销)
-
-        # 日期规范化 -------------------------------------------------------
         if isinstance(start_date, str):
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         else:
@@ -1156,70 +1262,119 @@ class UnifiedDataAccessLayer:
         else:
             end_dt = end_date
 
-        # 代码规范化 -------------------------------------------------------
         standardized_symbol = standardize_symbol(symbol)
+        fields_tuple = self._fields_to_tuple(fields)
+        auto_sync_flag = self.config.auto_sync if auto_sync is None else bool(auto_sync)
 
-        cache_key = self._make_cache_key(standardized_symbol, start_dt, end_dt)
+        perf_start = time.perf_counter()
 
-        # -------------------- L0 缓存 ------------------------------------
+        cache_source = "db"
+        result: CacheFetchResult
+
         if self.config.use_cache and not force_refresh:
-            df = self._get_from_l0_cache(cache_key)
-            if df is not None:
-                return df
+            loop = asyncio.get_running_loop()
+            ttl_bucket = self._current_ttl_bucket()
+            cache_info_before = self._l0_cached_loader.cache_info()
+            result = await loop.run_in_executor(
+                None,
+                self._l0_cached_loader,
+                standardized_symbol,
+                start_dt.strftime("%Y-%m-%d"),
+                end_dt.strftime("%Y-%m-%d"),
+                fields_tuple,
+                ttl_bucket,
+                auto_sync_flag,
+            )
+            cache_info_after = self._l0_cached_loader.cache_info()
+            l0_hit = cache_info_after.hits > cache_info_before.hits
+            cache_source = "l0" if l0_hit else result.source
+            if l0_hit:
+                self._cache_stats['hits'] += 1
+            else:
+                self._cache_stats['misses'] += 1
+        else:
+            result = await self._load_historical_data_uncached(
+                standardized_symbol,
+                start_dt,
+                end_dt,
+                fields_tuple,
+                auto_sync_flag,
+            )
+            cache_source = result.source
+            if self.config.use_cache:
+                self._cache_stats['misses'] += 1
+            if force_refresh and self.config.use_cache:
+                self._l0_cached_loader.cache_clear()
 
-        # -------------------- L1 缓存 ------------------------------------
-        if self.config.use_cache and not force_refresh:
+        df = result.dataframe
+        self._record_performance(cache_source, time.perf_counter() - perf_start)
+        return df
+
+    async def _load_historical_data_uncached(
+        self,
+        symbol: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        fields: Tuple[str, ...],
+        auto_sync_flag: bool,
+    ) -> CacheFetchResult:
+        """实际加载数据的实现，供 L0 缓存包装器调用"""
+
+        cache_key = self._make_cache_key(symbol, start_dt, end_dt, fields)
+        source = "db"
+
+        df: pd.DataFrame | None = None
+
+        if self.config.use_cache:
             df = self._get_from_l1_cache(cache_key)
             if df is not None:
-                # 回写到 L0 以加速后续访问
-                self._save_to_l0_cache(cache_key, df)
-                return df
+                source = "l1"
+            else:
+                df = self._get_from_l2_cache(cache_key)
+                if df is not None:
+                    source = "l2"
+                    self._save_to_l1_cache(cache_key, df)
 
-        # -------------------- L2 缓存 ------------------------------------
-        if self.config.use_cache and not force_refresh:
-            df = self._get_from_l2_cache(cache_key)
-            if df is not None:
-                # 回写到 L0/L1 以加速后续访问
-                self._save_to_l0_cache(cache_key, df)
-                self._save_to_l1_cache(cache_key, df)
-                return df
+        if df is None:
+            try:
+                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
+            except AttributeError:
+                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
 
-        # -------------------- 数据库 ------------------------------------
-        try:
-            df: pd.DataFrame | None = await self.db_manager.get_stock_data(
-                standardized_symbol, start_dt, end_dt
+            if df is None:
+                df = pd.DataFrame()
+
+        if auto_sync_flag and not self._is_data_complete(df, start_dt, end_dt):
+            missing_df = self.unified_provider.get_historical_data(
+                symbol,
+                start_dt.strftime("%Y-%m-%d"),
+                end_dt.strftime("%Y-%m-%d"),
             )
-        except AttributeError:
-            # 对于 DummyDBManager (测试专用) API 兼容
-            df = await self.db_manager.get_stock_data(standardized_symbol, start_dt, end_dt)
+            if missing_df is not None and not missing_df.empty:
+                df = missing_df
+                source = "provider"
+                try:
+                    await self.db_manager.save_stock_data(symbol, missing_df)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("save_stock_data failed: %s", exc)
 
         if df is None:
             df = pd.DataFrame()
 
-        # 如果需要自动同步且数据不完整，则从数据源补充 -------------------
-        if auto_sync if auto_sync is not None else self.config.auto_sync:
-            if not self._is_data_complete(df, start_dt, end_dt):
-                # unified_provider.get_historical_data 为同步方法
-                missing_df = self.unified_provider.get_historical_data(
-                    standardized_symbol,
-                    start_dt.strftime("%Y-%m-%d"),
-                    end_dt.strftime("%Y-%m-%d"),
-                )
-                if missing_df is not None and not missing_df.empty:
-                    df = missing_df
-                    # 保存到数据库
-                    try:
-                        await self.db_manager.save_stock_data(df)
-                    except Exception as exc:  # pragma: no cover
-                        logger.warning("save_stock_data failed: %s", exc)
+        if fields:
+            available_fields = [field for field in fields if field in df.columns]
+            if available_fields:
+                df = df.loc[:, available_fields].copy()
+            else:
+                df = df.copy()
+        else:
+            df = df.copy()
 
-        # -------------------- 写入缓存 -----------------------------------
-        if self.config.use_cache and df is not None and not df.empty:
-            self._save_to_l0_cache(cache_key, df)
+        if self.config.use_cache and not df.empty:
             self._save_to_l1_cache(cache_key, df)
             self._save_to_l2_cache(cache_key, df)
 
-        return df
+        return CacheFetchResult(dataframe=df, source=source)
 
     # ---------------------------------------------------------------------
     # 批量接口
@@ -1230,6 +1385,7 @@ class UnifiedDataAccessLayer:
         start_date: "datetime | str",
         end_date: "datetime | str",
         *,
+        fields: Optional[Sequence[str]] = None,
         force_refresh: bool = False,
         auto_sync: bool | None = None,
     ) -> "dict[str, pd.DataFrame]":  # noqa: D401
@@ -1239,6 +1395,7 @@ class UnifiedDataAccessLayer:
             symbols: 股票代码列表
             start_date: 开始日期 (含)
             end_date: 结束日期 (含)
+            fields: 需要返回的字段列表
             force_refresh: 是否跳过缓存强制刷新
             auto_sync: 若数据库缺失数据，是否自动从数据源同步 (默认为配置值)
 
@@ -1256,6 +1413,7 @@ class UnifiedDataAccessLayer:
                     sym,
                     start_date,
                     end_date,
+                    fields=fields,
                     force_refresh=force_refresh,
                     auto_sync=auto_sync,
                 )
@@ -1281,13 +1439,23 @@ class UnifiedDataAccessLayer:
             loop = None
 
         if loop and loop.is_running():
-            # 如果当前已有事件循环正在运行，则将协程提交到该事件循环并同步等待结果，
-            # 以便在同步测试代码中依旧可调用此方法。
-            future = asyncio.run_coroutine_threadsafe(
-                self.get_bulk_historical_data(symbols, start_date, end_date, **kwargs),
-                loop,
-            )
-            return future.result()
+            result: Dict[str, pd.DataFrame] | None = None
+
+            def run_in_thread():  # noqa: WPS430
+                nonlocal result
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    result = new_loop.run_until_complete(
+                        self.get_bulk_historical_data(symbols, start_date, end_date, **kwargs)
+                    )
+                finally:
+                    new_loop.close()
+
+            thread = threading.Thread(target=run_in_thread)
+            thread.start()
+            thread.join()
+            return result if result is not None else {}
 
         # 否则直接创建新的事件循环执行
         return asyncio.run(

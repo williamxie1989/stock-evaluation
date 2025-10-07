@@ -18,6 +18,7 @@ from ...services.stock.stock_list_manager import StockListManager
 from ...services.market.market_selector_service import MarketSelectorService
 from ...data.sync.data_sync_service import DataSyncService
 from ...apps.scripts.concurrent_data_sync_service import ConcurrentDataSyncService
+from src.cache.prefetch_scheduler import CachePrefetchScheduler
 from src.services.portfolio.portfolio_service import generate_portfolio_holdings
 
 # EnhancedDataProvider 已在第四阶段被归档，使用统一数据访问层替代
@@ -38,17 +39,24 @@ logger = logging.getLogger(__name__)
 logging.getLogger('src.data.field_mapping').setLevel(logging.WARNING)
 logging.getLogger('src.ml.features.enhanced_features').setLevel(logging.WARNING)
 
+cache_prefetch_scheduler: CachePrefetchScheduler | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用程序生命周期处理"""
-    # 启动时逻辑
     await startup_event()
-    
-    # yield 控制权给应用
-    yield
-    
-    # 可选择在此加入关闭时的清理逻辑
-    pass
+    try:
+        yield
+    finally:
+        global cache_prefetch_scheduler
+        if cache_prefetch_scheduler:
+            try:
+                cache_prefetch_scheduler.shutdown(wait=False)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("CachePrefetchScheduler shutdown failed: %s", exc)
+            finally:
+                cache_prefetch_scheduler = None
 
 app = FastAPI(
     title="股票分析系统", 
@@ -105,7 +113,7 @@ async def startup_event():
     """
     应用启动时智能初始化数据
     """
-    global selector_service, signal_generator, stock_list_manager
+    global selector_service, signal_generator, stock_list_manager, cache_prefetch_scheduler
     
     # 复用全局实例并在启动时预加载模型
     selector_service = IntelligentStockSelector(_db)
@@ -120,6 +128,41 @@ async def startup_event():
     
     signal_generator = SignalGenerator()
     stock_list_manager = StockListManager()
+
+    # 启动缓存预取调度器
+    try:
+        preload_env = os.getenv("PRELOAD_SYMBOLS", "")
+        prefetch_symbols = [s.strip() for s in preload_env.split(',') if s.strip()]
+        if not prefetch_symbols:
+            symbol_limit = int(os.getenv("PREFETCH_SYMBOL_LIMIT", "200"))
+            symbol_rows = _db.list_symbols(markets=['SH', 'SZ'], limit=symbol_limit)
+            prefetch_symbols = [row.get('symbol') for row in symbol_rows if row.get('symbol')]
+
+        lookback_days = int(os.getenv("PREFETCH_LOOKBACK_DAYS", "365"))
+        interval_minutes = int(os.getenv("PREFETCH_INTERVAL_MINUTES", "60"))
+
+        if _unified_data_access is not None and prefetch_symbols:
+            cache_prefetch_scheduler = CachePrefetchScheduler(
+                _unified_data_access,
+                symbols=prefetch_symbols,
+                lookback_days=lookback_days,
+                interval_minutes=interval_minutes,
+            )
+            cache_prefetch_scheduler.start()
+            logger.info(
+                "[startup] CachePrefetchScheduler started (symbols=%s, lookback=%s, interval=%smin)",
+                len(prefetch_symbols),
+                lookback_days,
+                interval_minutes,
+            )
+        else:
+            logger.info(
+                "[startup] 跳过缓存预取：access=%s, symbols=%s",
+                bool(_unified_data_access),
+                len(prefetch_symbols),
+            )
+    except Exception as exc:
+        logger.warning("[startup] 启动缓存预取任务失败: %s", exc)
     
     # 后台预热 stock-picks 缓存（不阻塞启动）
     if os.environ.get("SKIP_PREWARM", "0") not in ("1", "1", "1"):
