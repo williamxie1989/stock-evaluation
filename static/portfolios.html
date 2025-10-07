@@ -26,15 +26,33 @@
             <button id="btnCreate" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">新建组合</button>
         </div>
 
+        <!-- 概览统计 -->
+        <div id="summaryPanel" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+            <div class="bg-white rounded-lg shadow p-4">
+                <p class="text-sm text-gray-500 mb-1">组合数量</p>
+                <p class="text-2xl font-semibold text-gray-800" id="summaryCount">0</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-4">
+                <p class="text-sm text-gray-500 mb-1">平均组合净值</p>
+                <p class="text-2xl font-semibold text-gray-800" id="summaryAvgNav">-</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-4">
+                <p class="text-sm text-gray-500 mb-1">平均日收益</p>
+                <p class="text-2xl font-semibold text-gray-800" id="summaryAvgDaily">-</p>
+            </div>
+        </div>
+
         <!-- 列表表格 -->
         <div class="bg-white rounded-lg shadow overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200 text-sm">
                 <thead class="bg-gray-50">
                     <tr>
-                        <th class="px-4 py-2 text-left font-medium text-gray-700">名称</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">名称 / 策略</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">持股数量</th>
-                        <th class="px-4 py-2 text-left font-medium text-gray-700">净值</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">组合净值</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">当日收益</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">累计收益</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">风险等级</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">创建时间</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">操作</th>
                     </tr>
@@ -63,6 +81,9 @@
             <div class="mb-4" id="autoOptions">
                 <label class="block text-sm font-medium text-gray-700 mb-1">股票数量 (Top N)</label>
                 <input id="inputTopN" type="number" min="1" max="100" value="20" class="w-full px-3 py-2 border rounded">
+                <label class="block text-sm font-medium text-gray-700 mt-4 mb-1">初始资金（元）</label>
+                <input id="inputCapital" type="number" min="10000" step="10000" value="1000000" class="w-full px-3 py-2 border rounded" />
+                <p class="text-xs text-gray-500 mt-1">资金越高，生成的持仓市值越大，净值计算会同步反映。</p>
             </div>
             <div class="flex justify-end gap-2">
                 <button id="btnCancel" class="px-4 py-2 border rounded">取消</button>
@@ -72,63 +93,224 @@
     </div>
 
 <script>
-// 打开 / 关闭 modal
+// Modal 控制
 const modalMask = document.getElementById('modalMask');
 const btnCreate = document.getElementById('btnCreate');
 const btnCancel = document.getElementById('btnCancel');
-btnCreate.onclick = () => modalMask.classList.remove('hidden');
-btnCancel.onclick = () => modalMask.classList.add('hidden');
+const btnSubmit = document.getElementById('btnSubmit');
+const inputName = document.getElementById('inputName');
+const inputTopN = document.getElementById('inputTopN');
+const inputCapital = document.getElementById('inputCapital');
+const selectMode = document.getElementById('selectMode');
 
+function toggleModal(show) {
+    if (show) {
+        modalMask.classList.remove('hidden');
+        setTimeout(() => inputName.focus(), 50);
+    } else {
+        modalMask.classList.add('hidden');
+        inputName.value = '';
+        inputTopN.value = 20;
+        inputCapital.value = 1000000;
+    }
+}
+
+btnCreate.onclick = () => toggleModal(true);
+btnCancel.onclick = () => toggleModal(false);
+modalMask.addEventListener('click', (evt) => {
+    if (evt.target === modalMask) {
+        toggleModal(false);
+    }
+});
+document.addEventListener('keydown', (evt) => {
+    if (evt.key === 'Escape' && !modalMask.classList.contains('hidden')) {
+        toggleModal(false);
+    }
+});
+
+// 表格与统计
 const portfolioTable = document.getElementById('portfolioTable');
 const emptyHint = document.getElementById('emptyHint');
+const summaryCount = document.getElementById('summaryCount');
+const summaryAvgNav = document.getElementById('summaryAvgNav');
+const summaryAvgDaily = document.getElementById('summaryAvgDaily');
+
+function formatNumber(value, digits = 2) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
+    }
+    return Number(value).toFixed(digits);
+}
+
+function formatCurrency(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
+    }
+    return Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+}
+
+function formatPercent(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
+    }
+    const percent = Number(value) * 100;
+    const fixed = percent.toFixed(2);
+    const sign = percent > 0 ? '+' : '';
+    return `${sign}${fixed}%`;
+}
+
+function percentClass(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value)) || Number(value) === 0) {
+        return 'text-gray-600';
+    }
+    return Number(value) > 0 ? 'text-red-600' : 'text-green-600';
+}
+
+function applyPercentClass(el, value) {
+    el.classList.remove('text-red-600', 'text-green-600', 'text-gray-600');
+    el.classList.add(percentClass(value));
+}
+
+function formatDateTime(value) {
+    if (!value) return '-';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return '-';
+    return dt.toLocaleString();
+}
+
+function renderStrategyTags(tags = [], benchmark) {
+    const tagHtml = (tags || []).map(tag => `<span class="inline-flex items-center px-2 py-0.5 rounded bg-blue-50 text-blue-700 text-xs">${tag}</span>`).join('');
+    const benchmarkHtml = benchmark ? `<span class="inline-flex items-center px-2 py-0.5 rounded bg-gray-100 text-gray-600 text-xs">基准 ${benchmark}</span>` : '';
+    if (!tagHtml && !benchmarkHtml) return '';
+    return `<div class="mt-1 flex flex-wrap gap-1">${tagHtml}${benchmarkHtml}</div>`;
+}
+
+function riskBadge(level, benchmark) {
+    if (!level && !benchmark) return '-';
+    const clsMap = {
+        '高': 'bg-red-100 text-red-700',
+        '中': 'bg-yellow-100 text-yellow-700',
+        '低': 'bg-green-100 text-green-700'
+    };
+    const badge = level
+        ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${clsMap[level] || 'bg-gray-100 text-gray-600'}">${level}</span>`
+        : '';
+    const benchmarkInfo = benchmark
+        ? `<span class="text-xs text-gray-500">${benchmark}</span>`
+        : '';
+    return `<div class="flex flex-col gap-1">${badge}${benchmarkInfo ? `<div>${benchmarkInfo}</div>` : ''}</div>`;
+}
+
+function buildRow(portfolio) {
+    const tr = document.createElement('tr');
+    const navValue = formatNumber(portfolio.nav_value, 4);
+    const totalValue = formatCurrency(portfolio.total_value);
+    const dailyReturn = formatPercent(portfolio.daily_return_pct);
+    const totalReturn = formatPercent(portfolio.total_return_pct);
+    tr.innerHTML = `
+        <td class="px-4 py-3 align-top">
+            <div class="font-semibold text-gray-800">${portfolio.name}</div>
+            ${renderStrategyTags(portfolio.strategy_tags, portfolio.benchmark)}
+        </td>
+        <td class="px-4 py-3 align-top text-gray-700">${portfolio.holdings_count}</td>
+        <td class="px-4 py-3 align-top">
+            <div class="font-medium text-gray-800">${navValue}</div>
+            <div class="text-xs text-gray-500 mt-1">总资产 ¥${totalValue}</div>
+        </td>
+        <td class="px-4 py-3 align-top ${percentClass(portfolio.daily_return_pct)} font-medium">${dailyReturn}</td>
+        <td class="px-4 py-3 align-top ${percentClass(portfolio.total_return_pct)} font-medium">${totalReturn}</td>
+        <td class="px-4 py-3 align-top">${riskBadge(portfolio.risk_level, portfolio.benchmark)}</td>
+        <td class="px-4 py-3 align-top text-gray-600">${formatDateTime(portfolio.created_at)}</td>
+        <td class="px-4 py-3 align-top">
+            <a href="./portfolio_detail.html?id=${portfolio.id}" class="text-blue-600 hover:underline">查看</a>
+        </td>
+    `;
+    return tr;
+}
 
 async function loadPortfolios() {
     portfolioTable.innerHTML = '';
-    const res = await fetch(api('/api/portfolios'));
-    const json = await res.json();
-    if (!json.success) {
-        alert('获取组合列表失败');
-        return;
-    }
-    const list = json.portfolios;
-    if (list.length === 0) {
-        emptyHint.classList.remove('hidden');
-        return;
-    }
     emptyHint.classList.add('hidden');
-    list.forEach(p => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-            <td class="px-4 py-2">${p.name}</td>
-            <td class="px-4 py-2">${p.holdings_count}</td>
-            <td class="px-4 py-2">-</td>
-            <td class="px-4 py-2">-</td>
-            <td class="px-4 py-2">${new Date(p.created_at).toLocaleString()}</td>
-            <td class="px-4 py-2"><a href="./portfolio_detail.html?id=${p.id}" class="text-blue-600 hover:underline">查看</a></td>`;
-        portfolioTable.appendChild(tr);
-    });
+    try {
+        const res = await fetch(api('/api/portfolios'));
+        const json = await res.json();
+        if (!json.success) {
+            throw new Error(json.error || '未知错误');
+        }
+        const list = json.portfolios || [];
+        summaryCount.textContent = list.length;
+        if (list.length === 0) {
+            summaryAvgNav.textContent = '-';
+            summaryAvgDaily.textContent = '-';
+            summaryAvgDaily.classList.remove('text-red-600', 'text-green-600', 'text-gray-600');
+            summaryAvgDaily.classList.add('text-gray-600');
+            emptyHint.classList.remove('hidden');
+            return;
+        }
+        const navAvg = list.reduce((sum, item) => sum + (Number(item.nav_value) || 0), 0) / list.length;
+        const dailyAvg = list.reduce((sum, item) => sum + (Number(item.daily_return_pct) || 0), 0) / list.length;
+        summaryAvgNav.textContent = formatNumber(navAvg, 4);
+        summaryAvgDaily.textContent = formatPercent(dailyAvg);
+        applyPercentClass(summaryAvgDaily, dailyAvg);
+
+        list.forEach(portfolio => {
+            portfolioTable.appendChild(buildRow(portfolio));
+        });
+    } catch (error) {
+        console.error(error);
+        alert(`获取组合列表失败：${error.message}`);
+        summaryCount.textContent = '0';
+        summaryAvgNav.textContent = '-';
+        summaryAvgDaily.textContent = '-';
+        summaryAvgDaily.classList.remove('text-red-600', 'text-green-600');
+        summaryAvgDaily.classList.add('text-gray-600');
+        emptyHint.classList.remove('hidden');
+    }
 }
 
 async function createPortfolio() {
-    const name = document.getElementById('inputName').value.trim();
-    const mode = document.getElementById('selectMode').value;
-    const topN = parseInt(document.getElementById('inputTopN').value, 10);
-    const res = await fetch(api('/api/portfolios'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, mode, top_n: topN })
-    });
-    const json = await res.json();
-    if (json.success) {
-        modalMask.classList.add('hidden');
-        loadPortfolios();
-    } else {
-        alert('创建失败: ' + json.error);
+    if (selectMode.value !== 'auto') {
+        alert('当前仅支持智能推荐建仓。');
+        return;
+    }
+    const payload = {
+        name: inputName.value.trim(),
+        mode: 'auto',
+        top_n: Number(inputTopN.value),
+        initial_capital: Number(inputCapital.value)
+    };
+    if (!Number.isFinite(payload.top_n) || payload.top_n < 1) {
+        alert('Top N 必须大于等于 1');
+        return;
+    }
+    if (!Number.isFinite(payload.initial_capital) || payload.initial_capital <= 0) {
+        alert('初始资金必须大于 0');
+        return;
+    }
+    btnSubmit.disabled = true;
+    const originalText = btnSubmit.textContent;
+    btnSubmit.textContent = '创建中...';
+    try {
+        const res = await fetch(api('/api/portfolios'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        if (!json.success) {
+            throw new Error(json.error || '创建组合失败');
+        }
+        toggleModal(false);
+        await loadPortfolios();
+    } catch (error) {
+        console.error(error);
+        alert(`创建失败：${error.message}`);
+    } finally {
+        btnSubmit.disabled = false;
+        btnSubmit.textContent = originalText;
     }
 }
 
-// 提交按钮
-const btnSubmit = document.getElementById('btnSubmit');
 btnSubmit.onclick = createPortfolio;
 
 // 初次加载

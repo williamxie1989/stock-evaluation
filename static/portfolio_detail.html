@@ -6,6 +6,7 @@
     <title>组合详情 - 智能股票分析系统</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.tailwindcss.com/?plugins=typography"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
         const API_BASE = window.API_BASE || window.location.origin;
         function api(path) {
@@ -20,14 +21,17 @@
 <body class="bg-gray-100 min-h-screen">
     <div class="container mx-auto px-4 py-8">
         <!-- 头部 -->
-        <div class="flex justify-between items-center mb-6">
-            <h1 id="title" class="text-3xl font-bold text-gray-800">组合详情</h1>
+        <div class="flex justify-between items-center mb-4">
+            <div>
+                <h1 id="title" class="text-3xl font-bold text-gray-800">组合详情</h1>
+                <div id="strategyTags" class="flex flex-wrap gap-2 mt-3"></div>
+            </div>
             <a href="./portfolios.html" class="text-blue-600 hover:underline">返回列表</a>
         </div>
 
         <!-- 概览卡片 -->
         <div id="overviewCard" class="bg-white rounded-lg shadow p-6 mb-6 hidden">
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
                 <div>
                     <div class="text-gray-500 mb-1">组合名称</div>
                     <div id="ovName" class="font-medium text-gray-800">-</div>
@@ -37,14 +41,48 @@
                     <div id="ovCount" class="font-medium text-gray-800">-</div>
                 </div>
                 <div>
+                    <div class="text-gray-500 mb-1">风险等级 / 基准</div>
+                    <div id="ovRisk" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">当前净值</div>
+                    <div id="ovNavValue" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">组合总资产</div>
+                    <div id="ovTotalValue" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">初始资金</div>
+                    <div id="ovInitial" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">当日收益</div>
+                    <div id="ovDailyReturn" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">累计收益</div>
+                    <div id="ovTotalReturn" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">最近估值时间</div>
+                    <div id="ovUpdated" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
                     <div class="text-gray-500 mb-1">创建时间</div>
                     <div id="ovCreated" class="font-medium text-gray-800">-</div>
                 </div>
-                <div>
-                    <div class="text-gray-500 mb-1">净值</div>
-                    <div id="ovNav" class="font-medium text-gray-800">-</div>
-                </div>
             </div>
+        </div>
+
+        <!-- 净值走势 -->
+        <div class="bg-white rounded-lg shadow p-6 mb-8">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-lg font-semibold text-gray-800">组合净值走势</h2>
+                <span id="navChartRange" class="text-sm text-gray-500"></span>
+            </div>
+            <canvas id="navChart" height="220"></canvas>
+            <div id="navChartEmpty" class="text-center text-gray-500 text-sm mt-4 hidden">暂无净值历史数据</div>
         </div>
 
         <!-- 持仓表 -->
@@ -52,10 +90,13 @@
             <table class="min-w-full divide-y divide-gray-200 text-sm">
                 <thead class="bg-gray-50">
                     <tr>
-                        <th class="px-4 py-2 text-left font-medium text-gray-700">股票名称</th>
-                        <th class="px-4 py-2 text-left font-medium text-gray-700">代码</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">股票</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">最新价</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">成本价</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">持仓比例</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">持仓市值</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">浮动盈亏</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">日收益</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">建仓时间</th>
                         <th class="px-4 py-2 text-left font-medium text-gray-700">持仓天数</th>
                     </tr>
@@ -67,8 +108,9 @@
 
         <!-- 调仓历史 / 预留区域 -->
         <div class="bg-white rounded-lg shadow p-6">
-            <h2 class="text-lg font-semibold mb-4">调仓历史（占位）</h2>
-            <p class="text-gray-500 text-sm">未来将展示调仓记录、交易明细等信息。</p>
+            <h2 class="text-lg font-semibold mb-4">调仓历史</h2>
+            <div id="rebalanceList" class="space-y-4 text-sm text-gray-600 hidden"></div>
+            <p id="rebalanceEmpty" class="text-gray-500 text-sm">暂无调仓记录，后续调仓将自动记录在此。</p>
         </div>
     </div>
 
@@ -78,52 +120,276 @@ if (!pid) {
     alert('缺少参数 id');
 }
 
-async function loadOverview() {
-    const res = await fetch(api(`/api/portfolios/${pid}`));
-    const json = await res.json();
-    if (!json.success) {
-        alert('获取组合信息失败');
-        return;
+const overviewCard = document.getElementById('overviewCard');
+const titleEl = document.getElementById('title');
+const strategyTagsEl = document.getElementById('strategyTags');
+const ovName = document.getElementById('ovName');
+const ovCount = document.getElementById('ovCount');
+const ovRisk = document.getElementById('ovRisk');
+const ovNavValue = document.getElementById('ovNavValue');
+const ovTotalValue = document.getElementById('ovTotalValue');
+const ovInitial = document.getElementById('ovInitial');
+const ovDailyReturn = document.getElementById('ovDailyReturn');
+const ovTotalReturn = document.getElementById('ovTotalReturn');
+const ovUpdated = document.getElementById('ovUpdated');
+const ovCreated = document.getElementById('ovCreated');
+const holdingsTable = document.getElementById('holdingsTable');
+const holdingsEmpty = document.getElementById('holdingsEmpty');
+const navChartCanvas = document.getElementById('navChart');
+const navChartEmpty = document.getElementById('navChartEmpty');
+const navChartRange = document.getElementById('navChartRange');
+const rebalanceList = document.getElementById('rebalanceList');
+const rebalanceEmpty = document.getElementById('rebalanceEmpty');
+
+let navChartInstance = null;
+
+function formatNumber(value, digits = 2) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
     }
-    const p = json.portfolio;
-    document.getElementById('title').textContent = `组合详情 - ${p.name}`;
-    document.getElementById('ovName').textContent = p.name;
-    document.getElementById('ovCount').textContent = p.holdings_count;
-    document.getElementById('ovCreated').textContent = new Date(p.created_at).toLocaleString();
-    document.getElementById('overviewCard').classList.remove('hidden');
+    return Number(value).toFixed(digits);
 }
 
-async function loadHoldings() {
-    const res = await fetch(api(`/api/portfolios/${pid}/holdings`));
-    const json = await res.json();
-    if (!json.success) {
-        alert('获取持仓失败');
-        return;
+function formatCurrency(value, digits = 2) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
     }
-    const list = json.holdings || [];
-    const tbody = document.getElementById('holdingsTable');
-    tbody.innerHTML = '';
-    if (list.length === 0) {
-        document.getElementById('holdingsEmpty').classList.remove('hidden');
-        return;
-    }
-    document.getElementById('holdingsEmpty').classList.add('hidden');
-    list.forEach(h => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-            <td class="px-4 py-2">${h.symbol}</td>
-            <td class="px-4 py-2">${h.symbol}</td>
-            <td class="px-4 py-2">-</td>
-            <td class="px-4 py-2">${(h.weight * 100).toFixed(2)}%</td>
-            <td class="px-4 py-2">-</td>
-            <td class="px-4 py-2">-</td>
-        `;
-        tbody.appendChild(tr);
+    return Number(value).toLocaleString('zh-CN', {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
     });
 }
 
-loadOverview();
-loadHoldings();
+function formatPercent(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '-';
+    }
+    const percent = Number(value) * 100;
+    const fixed = percent.toFixed(2);
+    const sign = percent > 0 ? '+' : '';
+    return `${sign}${fixed}%`;
+}
+
+function percentClass(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value)) || Number(value) === 0) {
+        return 'text-gray-600';
+    }
+    return Number(value) > 0 ? 'text-red-600' : 'text-green-600';
+}
+
+function applyPercentClass(el, value) {
+    el.classList.remove('text-red-600', 'text-green-600', 'text-gray-600');
+    el.classList.add(percentClass(value));
+}
+
+function formatDateTime(value) {
+    if (!value) return '-';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return '-';
+    return dt.toLocaleString();
+}
+
+function formatWeight(weight) {
+    if (weight === null || weight === undefined || Number.isNaN(Number(weight))) {
+        return '-';
+    }
+    return `${(Number(weight) * 100).toFixed(2)}%`;
+}
+
+function renderStrategyTags(tags = []) {
+    strategyTagsEl.innerHTML = '';
+    (tags || []).forEach(tag => {
+        const span = document.createElement('span');
+        span.className = 'inline-flex items-center px-2 py-0.5 rounded bg-blue-50 text-blue-700 text-xs';
+        span.textContent = tag;
+        strategyTagsEl.appendChild(span);
+    });
+}
+
+function renderRisk(level, benchmark) {
+    if (!level && !benchmark) return '-';
+    const clsMap = {
+        '高': 'bg-red-100 text-red-700',
+        '中': 'bg-yellow-100 text-yellow-700',
+        '低': 'bg-green-100 text-green-700'
+    };
+    const pieces = [];
+    if (level) {
+        pieces.push(`<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${clsMap[level] || 'bg-gray-100 text-gray-600'}">${level}</span>`);
+    }
+    if (benchmark) {
+        pieces.push(`<span class="text-xs text-gray-500">基准 ${benchmark}</span>`);
+    }
+    return `<div class="flex flex-wrap items-center gap-2">${pieces.join('')}</div>`;
+}
+
+function renderOverview(portfolio) {
+    const metrics = portfolio.metrics || {};
+    const navValue = metrics.nav_value ?? portfolio.nav_value;
+    const totalValue = metrics.total_value ?? portfolio.total_value;
+    const dailyReturn = metrics.daily_return_pct ?? portfolio.daily_return_pct;
+    const totalReturn = metrics.total_return_pct ?? portfolio.total_return_pct;
+    const lastValuedAt = metrics.last_valued_at ?? portfolio.last_valued_at;
+    const initialCapital = metrics.initial_capital ?? portfolio.initial_capital;
+
+    titleEl.textContent = `组合详情 - ${portfolio.name}`;
+    ovName.textContent = portfolio.name;
+    ovCount.textContent = portfolio.holdings_count ?? '-';
+    ovRisk.innerHTML = renderRisk(portfolio.risk_level, portfolio.benchmark);
+    ovNavValue.textContent = formatNumber(navValue, 4);
+    ovTotalValue.textContent = `¥${formatCurrency(totalValue)}`;
+    ovInitial.textContent = `¥${formatCurrency(initialCapital)}`;
+    ovDailyReturn.textContent = formatPercent(dailyReturn);
+    applyPercentClass(ovDailyReturn, dailyReturn);
+    ovTotalReturn.textContent = formatPercent(totalReturn);
+    applyPercentClass(ovTotalReturn, totalReturn);
+    ovUpdated.textContent = formatDateTime(lastValuedAt);
+    ovCreated.textContent = formatDateTime(portfolio.created_at);
+    overviewCard.classList.remove('hidden');
+    renderStrategyTags(portfolio.strategy_tags);
+}
+
+function renderNavChart(history = []) {
+    if (navChartInstance) {
+        navChartInstance.destroy();
+        navChartInstance = null;
+    }
+    if (!history || history.length < 2) {
+        navChartEmpty.classList.remove('hidden');
+        navChartRange.textContent = '';
+        return;
+    }
+    navChartEmpty.classList.add('hidden');
+    const labels = history.map(item => item.date);
+    const data = history.map(item => item.nav_value);
+    navChartRange.textContent = `${labels[0]} ~ ${labels[labels.length - 1]}`;
+    navChartInstance = new Chart(navChartCanvas, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: '组合净值',
+                    data,
+                    borderColor: '#2563eb',
+                    backgroundColor: 'rgba(37, 99, 235, 0.12)',
+                    tension: 0.25,
+                    fill: true,
+                    pointRadius: 0,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label(ctx) {
+                            const value = ctx.parsed.y ?? 0;
+                            return `净值 ${value.toFixed(4)}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    ticks: { maxTicksLimit: 6 }
+                },
+                y: {
+                    ticks: {
+                        callback(value) {
+                            return Number(value).toFixed(2);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+function renderHoldings(holdings = []) {
+    holdingsTable.innerHTML = '';
+    if (!holdings || holdings.length === 0) {
+        holdingsEmpty.classList.remove('hidden');
+        return;
+    }
+    holdingsEmpty.classList.add('hidden');
+    holdings
+        .slice()
+        .sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0))
+        .forEach(holding => {
+            const tr = document.createElement('tr');
+            const dailyClass = percentClass(holding.daily_return_pct);
+            const pnlClass = percentClass(holding.pnl_pct);
+            tr.innerHTML = `
+                <td class="px-4 py-3 align-top">
+                    <div class="font-medium text-gray-800">${holding.name || holding.symbol}</div>
+                    <div class="text-xs text-gray-500 mt-1">${holding.code || holding.symbol}</div>
+                </td>
+                <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.latest_price, 2)}</td>
+                <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.cost_price, 2)}</td>
+                <td class="px-4 py-3 align-top text-gray-700">${formatWeight(holding.weight)}</td>
+                <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.latest_value, 2)}</td>
+                <td class="px-4 py-3 align-top font-medium ${pnlClass}">${formatPercent(holding.pnl_pct)}</td>
+                <td class="px-4 py-3 align-top font-medium ${dailyClass}">${formatPercent(holding.daily_return_pct)}</td>
+                <td class="px-4 py-3 align-top text-gray-600">${formatDateTime(holding.opened_at)}</td>
+                <td class="px-4 py-3 align-top text-gray-600">${holding.holding_days ?? '-'}</td>
+            `;
+            holdingsTable.appendChild(tr);
+        });
+}
+
+function renderRebalance(history = []) {
+    rebalanceList.innerHTML = '';
+    if (!history || history.length === 0) {
+        rebalanceList.classList.add('hidden');
+        rebalanceEmpty.classList.remove('hidden');
+        return;
+    }
+    rebalanceEmpty.classList.add('hidden');
+    rebalanceList.classList.remove('hidden');
+    history.forEach(entry => {
+        const wrapper = document.createElement('div');
+        const timestamp = formatDateTime(entry.timestamp);
+        const description = entry.description || entry.type || '';
+        const preview = (entry.holdings || [])
+            .slice(0, 5)
+            .map(h => `${h.symbol} (${formatWeight(h.weight)})`)
+            .join('，');
+        wrapper.innerHTML = `
+            <div class="border-l-2 border-blue-100 pl-3">
+                <div class="text-sm text-gray-700 font-medium">${timestamp}</div>
+                ${description ? `<div class="text-xs text-gray-500 mt-1">${description}</div>` : ''}
+                ${preview ? `<div class="text-xs text-gray-500 mt-1">持仓预览：${preview}${entry.holdings && entry.holdings.length > 5 ? ' 等' : ''}</div>` : ''}
+            </div>
+        `;
+        rebalanceList.appendChild(wrapper);
+    });
+}
+
+async function loadPortfolio() {
+    if (!pid) return;
+    try {
+        const res = await fetch(api(`/api/portfolios/${pid}`));
+        const json = await res.json();
+        if (!json.success) {
+            throw new Error(json.error || '未知错误');
+        }
+        const portfolio = json.portfolio || {};
+        renderOverview(portfolio);
+        renderNavChart(portfolio.nav_history || []);
+        renderHoldings(portfolio.holdings || []);
+        renderRebalance(portfolio.rebalance_history || []);
+    } catch (error) {
+        console.error(error);
+        alert(`加载组合详情失败：${error.message}`);
+    }
+}
+
+loadPortfolio();
 </script>
 </body>
 </html>

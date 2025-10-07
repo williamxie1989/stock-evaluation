@@ -374,7 +374,7 @@ class UnifiedDatabaseManager:
         """
         try:
             if self.db_type == 'mysql':
-                create_sql = (
+                predictions_sql = (
                     """
                     CREATE TABLE IF NOT EXISTS predictions (
                         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -390,8 +390,85 @@ class UnifiedDatabaseManager:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     """
                 )
+                portfolios_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolios (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        name VARCHAR(128) NOT NULL,
+                        top_n INT NOT NULL,
+                        initial_capital DOUBLE NOT NULL,
+                        holdings_count INT NOT NULL,
+                        benchmark VARCHAR(64),
+                        risk_level VARCHAR(32),
+                        strategy_tags JSON,
+                        notes TEXT,
+                        nav_value DOUBLE,
+                        total_value DOUBLE,
+                        daily_return_pct DOUBLE,
+                        total_return_pct DOUBLE,
+                        last_valued_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                holdings_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        portfolio_id INT NOT NULL,
+                        symbol VARCHAR(32) NOT NULL,
+                        code VARCHAR(32),
+                        name VARCHAR(128),
+                        weight DOUBLE,
+                        shares DOUBLE,
+                        cost_price DOUBLE,
+                        latest_price DOUBLE,
+                        previous_price DOUBLE,
+                        opened_at DATETIME,
+                        last_trade_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL,
+                        CONSTRAINT fk_portfolio_holdings
+                            FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
+                            ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                nav_history_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_nav_history (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        portfolio_id INT NOT NULL,
+                        nav_date DATE NOT NULL,
+                        nav_value DOUBLE,
+                        total_value DOUBLE,
+                        created_at DATETIME NOT NULL,
+                        UNIQUE KEY idx_portfolio_nav (portfolio_id, nav_date),
+                        CONSTRAINT fk_portfolio_nav
+                            FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
+                            ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                rebalance_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_rebalances (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        portfolio_id INT NOT NULL,
+                        event_time DATETIME NOT NULL,
+                        event_type VARCHAR(32),
+                        description TEXT,
+                        details JSON,
+                        created_at DATETIME NOT NULL,
+                        CONSTRAINT fk_portfolio_rebalance
+                            FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
+                            ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
             else:
-                create_sql = (
+                predictions_sql = (
                     """
                     CREATE TABLE IF NOT EXISTS predictions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -407,8 +484,83 @@ class UnifiedDatabaseManager:
                     )
                     """
                 )
-            self.execute_update(create_sql)
-            logger.info("确保 predictions 表存在")
+                portfolios_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolios (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        top_n INTEGER NOT NULL,
+                        initial_capital REAL NOT NULL,
+                        holdings_count INTEGER NOT NULL,
+                        benchmark TEXT,
+                        risk_level TEXT,
+                        strategy_tags TEXT,
+                        notes TEXT,
+                        nav_value REAL,
+                        total_value REAL,
+                        daily_return_pct REAL,
+                        total_return_pct REAL,
+                        last_valued_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                holdings_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        portfolio_id INTEGER NOT NULL,
+                        symbol TEXT NOT NULL,
+                        code TEXT,
+                        name TEXT,
+                        weight REAL,
+                        shares REAL,
+                        cost_price REAL,
+                        latest_price REAL,
+                        previous_price REAL,
+                        opened_at TEXT,
+                        last_trade_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                nav_history_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_nav_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        portfolio_id INTEGER NOT NULL,
+                        nav_date TEXT NOT NULL,
+                        nav_value REAL,
+                        total_value REAL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(portfolio_id, nav_date),
+                        FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                rebalance_sql = (
+                    """
+                    CREATE TABLE IF NOT EXISTS portfolio_rebalances (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        portfolio_id INTEGER NOT NULL,
+                        event_time TEXT NOT NULL,
+                        event_type TEXT,
+                        description TEXT,
+                        details TEXT,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            self.execute_update(predictions_sql)
+            self.execute_update(portfolios_sql)
+            self.execute_update(holdings_sql)
+            self.execute_update(nav_history_sql)
+            self.execute_update(rebalance_sql)
+            logger.info("确保 predictions 与 portfolio 系列表存在")
         except Exception as e:
             logger.error(f"确保表存在失败: {e}")
     

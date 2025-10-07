@@ -234,6 +234,21 @@ async def read_analysis(symbol: Optional[str] = None):
     """分析页面路由"""
     return FileResponse("static/analysis.html")
 
+@app.get("/portfolios")
+async def read_portfolios():
+    """组合列表页面路由"""
+    return FileResponse("static/portfolios.html")
+
+@app.get("/portfolios.html")
+async def read_portfolios_html():
+    """兼容直接访问 portfolios.html"""
+    return FileResponse("static/portfolios.html")
+
+@app.get("/portfolio_detail.html")
+async def read_portfolio_detail():
+    """组合详情页面路由"""
+    return FileResponse("static/portfolio_detail.html")
+
 @app.post("/api/analyze")
 async def analyze_stock(request: StockRequest):
     """分析股票"""
@@ -518,9 +533,29 @@ from src.services.portfolio.portfolio_management_service import (
     list_portfolios, create_portfolio_auto, get_portfolio_detail,
 )
 
+
+def _parse_as_of(as_of: str | None) -> datetime:
+    if not as_of:
+        return datetime.utcnow()
+    try:
+        return datetime.fromisoformat(as_of)
+    except ValueError:
+        try:
+            return datetime.strptime(as_of, "%Y-%m-%d")
+        except ValueError:
+            return datetime.utcnow()
+
+
 @app.get("/api/portfolios")
-def api_list_portfolios():
-    return {"success": True, "portfolios": list_portfolios()}
+def api_list_portfolios(as_of: str | None = None):
+    as_of_dt = _parse_as_of(as_of)
+    portfolios = list_portfolios(as_of=as_of_dt)
+    return {
+        "success": True,
+        "generated_at": as_of_dt.isoformat(),
+        "count": len(portfolios),
+        "portfolios": portfolios,
+    }
 
 @app.post("/api/portfolios")
 def api_create_portfolio(request: dict):
@@ -528,26 +563,45 @@ def api_create_portfolio(request: dict):
     mode = request.get("mode", "auto")
     top_n = int(request.get("top_n", 20))
     capital = float(request.get("initial_capital", 1_000_000))
-    if mode == "auto":
+    if top_n < 1:
+        return JSONResponse(status_code=400, content={"success": False, "error": "top_n must be >= 1"})
+    if capital <= 0:
+        return JSONResponse(status_code=400, content={"success": False, "error": "initial_capital must be > 0"})
+    if mode != "auto":
+        return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})
+    try:
         data = create_portfolio_auto(name=name, top_n=top_n, initial_capital=capital)
         return {"success": True, "portfolio": data}
-    else:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})
+    except Exception as exc:  # pragma: no cover - 防御性捕获
+        logger.exception("自动创建组合失败")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
 @app.get("/api/portfolios/{pid}")
-def api_get_portfolio(pid: int):
-    data = get_portfolio_detail(pid)
+def api_get_portfolio(pid: int, as_of: str | None = None):
+    as_of_dt = _parse_as_of(as_of)
+    data = get_portfolio_detail(pid, as_of=as_of_dt)
     if not data:
         return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
-    return {"success": True, "portfolio": data}
+    return {
+        "success": True,
+        "generated_at": as_of_dt.isoformat(),
+        "portfolio": data,
+    }
 
 @app.get("/api/portfolios/{pid}/holdings")
-def api_get_portfolio_holdings(pid: int):
-    data = get_portfolio_detail(pid)
+def api_get_portfolio_holdings(pid: int, as_of: str | None = None):
+    as_of_dt = _parse_as_of(as_of)
+    data = get_portfolio_detail(pid, as_of=as_of_dt)
     if not data:
         return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
     holdings = data.get("holdings", [])
-    return {"success": True, "holdings": holdings}
+    return {
+        "success": True,
+        "generated_at": as_of_dt.isoformat(),
+        "holdings": holdings,
+        "metrics": data.get("metrics", {}),
+        "nav_history": data.get("nav_history", []),
+    }
 
 # ---------- Portfolio Holdings (simulated) ----------
 
