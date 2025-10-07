@@ -62,10 +62,12 @@ models/*.h5
 models/*.model
 
 # 缓存和临时文件
+l2_cache/
 .cache/
 .pytest_cache/
 .coverage
 htmlcov/
+catboost_info/
 .tox/
 .nox/
 .coverage.*
