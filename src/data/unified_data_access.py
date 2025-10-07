@@ -7,10 +7,13 @@ import pandas as pd
 import os
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Union, Tuple
+from typing import Optional, Dict, Any, List, Union, Tuple, Set
 from dataclasses import dataclass
 import threading
 import asyncio
+import time
+
+from src.cache.redis_cache import RedisCache
 
 # 使用绝对导入
 from src.data.db.unified_database_manager import UnifiedDatabaseManager
@@ -69,6 +72,10 @@ class UnifiedDataAccessLayer:
                 self.db_manager.cache.clear()
             # 重置内部统计
             self._cache_stats = {'hits': 0, 'misses': 0}
+            # L0 进程级内存缓存（简单 TTL + 线程安全）
+            self._l0_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
+            self._l0_cache_lock = threading.Lock()
+            self._l1_cache = RedisCache(ttl=self.config.cache_ttl)
         except Exception:
             pass
     
@@ -89,6 +96,10 @@ class UnifiedDataAccessLayer:
         self.data_validator = DataSourceValidator(self.unified_provider)
         self._sync_lock = threading.Lock()
         self._cache_stats = {'hits': 0, 'misses': 0}
+        # 初始化 L0/L1 缓存，避免后续属性缺失
+        self._l0_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
+        self._l0_cache_lock = threading.Lock()
+        self._l1_cache = RedisCache(ttl=self.config.cache_ttl)
         
         logger.info("UnifiedDataAccessLayer initialized")
     
@@ -162,102 +173,10 @@ class UnifiedDataAccessLayer:
             logger.error(f"Failed to initialize data sources: {e}")
             raise
     
-    async def get_historical_data(self, symbol: str, start_date: Union[str, datetime], 
-                                 end_date: Union[str, datetime],
-                                 force_refresh: bool = False, auto_sync: bool = None) -> Optional[pd.DataFrame]:
-        """
-        获取股票历史数据 - 添加防循环和快速失败机制
+
         
-        Args:
-            symbol: 股票代码
-            start_date: 开始日期
-            end_date: 结束日期
-            force_refresh: 强制刷新，不从数据库读取
-            auto_sync: 是否自动同步缺失数据
-            
-        Returns:
-            股票历史数据
-        """
-        try:
-            # 标准化股票代码
-            standardized_symbol = standardize_symbol(symbol)
-            logger.info(f"Standardized symbol: {symbol} -> {standardized_symbol}")
-            
-            # 检查是否已经在处理中，防止循环调用
-            processing_key = f"processing_{standardized_symbol}_{start_date}_{end_date}"
-            if hasattr(self, '_processing_symbols'):
-                if self._processing_symbols.get(processing_key, False):
-                    logger.warning(f"Historical data request already in progress for {standardized_symbol} {start_date} to {end_date}, skipping to prevent loop")
-                    return None
-            else:
-                self._processing_symbols = {}
-            
-            # 标记处理进行中
-            self._processing_symbols[processing_key] = True
-            
-            try:
-                # 设置自动同步标志
-                if auto_sync is None:
-                    auto_sync = self.config.auto_sync
-                
-                # 转换日期格式
-                if isinstance(start_date, str):
-                    start_date = datetime.strptime(start_date, '%Y-%m-%d')
-                if isinstance(end_date, str):
-                    end_date = datetime.strptime(end_date, '%Y-%m-%d')
-                
-                # 首先尝试从数据库获取
-                if not force_refresh:
-                    db_data = await self.db_manager.get_stock_data(standardized_symbol, start_date, end_date)
-                    if db_data is not None and not db_data.empty:
-                        # 检查数据完整性
-                        if self._is_data_complete(db_data, start_date, end_date):
-                            logger.info(f"Retrieved complete data for {standardized_symbol} from database")
-                            return db_data
-                        else:
-                            # 检查同步次数，避免无限同步
-                            sync_key = f"sync_count_{standardized_symbol}"
-                            if not hasattr(self, '_sync_counts'):
-                                self._sync_counts = {}
-                            
-                            sync_count = self._sync_counts.get(sync_key, 0)
-                            if sync_count >= 2:  # 最多同步2次
-                                logger.warning(f"Maximum sync attempts ({sync_count}) reached for {standardized_symbol}, returning existing data")
-                                return db_data
-                            
-                            self._sync_counts[sync_key] = sync_count + 1
-                            logger.info(f"Database data incomplete for {standardized_symbol}, syncing missing data... (attempt {sync_count + 1}/2)")
-                            if auto_sync:
-                                return await self._sync_and_return_data(standardized_symbol, start_date, end_date, db_data)
-                
-                # 从外部数据源获取（注意：这是同步方法，不需要await）
-                logger.info(f"Fetching data for {standardized_symbol} from external sources")
-                
-                # 转换日期格式为字符串，以适配数据提供者
-                start_date_str = start_date.strftime('%Y-%m-%d')
-                end_date_str = end_date.strftime('%Y-%m-%d')
-                
-                external_data = self.unified_provider.get_historical_data(
-                    standardized_symbol, start_date_str, end_date_str, 
-                    quality_threshold=self.config.quality_threshold
-                )
-                
-                if external_data is not None and not external_data.empty:
-                    # 保存到数据库
-                    await self.db_manager.save_stock_data(standardized_symbol, external_data)
-                    logger.info(f"Saved external data for {standardized_symbol} to database")
-                    return external_data
-                
-                logger.warning(f"Failed to get data for {standardized_symbol} from all sources")
-                return None
-                
-            finally:
-                # 清除处理标记
-                self._processing_symbols[processing_key] = False
-                
-        except Exception as e:
-            logger.error(f"Error getting stock data for {symbol}: {e}")
-            return None
+
+
     
     async def get_realtime_data(self, symbols: List[str]) -> Optional[Dict[str, Dict[str, Any]]]:
         """
@@ -742,15 +661,17 @@ class UnifiedDataAccessLayer:
         if tail_gap > 3:
             return False
     
-        # 计算期望交易日（工作日）数量
-        expected_days = len(pd.bdate_range(start_date, end_date))
-        actual_days = len(data)
-    
+        # 计算期望交易日数量（使用 _is_trading_day 而非简单工作日）
+        expected_trade_dates = [d for d in pd.date_range(start_date, end_date, freq='D') if self._is_trading_day(d)]
+        expected_days = len(expected_trade_dates)
+        # 实际记录行数（假设每日唯一记录），如果索引有多行同一日期取 unique
+        actual_days = len({idx.date() for idx in data.index})
+
         if expected_days == 0:
             return False
-    
+
         completeness_ratio = actual_days / expected_days
-        # 允许 10% 缺失
+        # 允许 20% 缺失（之前 10%，考虑长假 & 交易所停牌）
         return completeness_ratio >= 0.8
     
     def get_data_quality_report(self) -> Dict[str, Any]:
@@ -888,20 +809,45 @@ class UnifiedDataAccessLayer:
             return False
 
     # 中国主要节假日列表（可根据需要补充）
-    HOLIDAYS: List[str] = [
-        # 格式 YYYY-MM-DD，例如 "2024-01-01" 表示元旦
-        "2024-01-01", "2024-02-09", "2024-02-12", "2024-04-04", "2024-05-01",
-        "2024-10-01", "2024-10-02", "2024-10-03"
-    ]
+    # 统一交易日缓存，首次使用时通过 akshare 接口加载
+    _TRADE_DATES_CACHE: Optional[Set[datetime.date]] = None
 
-    @staticmethod
-    def _is_trading_day(date_obj: Union[datetime, pd.Timestamp, datetime.date]) -> bool:
-        """判断是否为交易日：周一至周五且不在 HOLIDAYS 列表。"""
+    @classmethod
+    def _load_trade_dates(cls) -> Set[datetime.date]:
+        """从 akshare 获取所有历史交易日期并缓存。若 akshare 未安装则回退至简单周末判定。"""
+        if cls._TRADE_DATES_CACHE is not None:
+            return cls._TRADE_DATES_CACHE
+        try:
+            import akshare as ak  # 延迟导入减少启动开销
+            df_calendar = ak.tool_trade_date_hist_sina()
+            # 接口字段可能为 'trade_date' 或 'date'; 统一处理
+            if 'trade_date' in df_calendar.columns:
+                dates_series = df_calendar['trade_date']
+            else:
+                dates_series = df_calendar.iloc[:, 0]
+            cls._TRADE_DATES_CACHE = set(pd.to_datetime(dates_series).dt.date.tolist())
+            logger.info(f"Loaded {len(cls._TRADE_DATES_CACHE)} trade dates from akshare")
+        except ModuleNotFoundError:
+            logger.warning("akshare not installed, fallback to weekend-only trading day logic")
+            cls._TRADE_DATES_CACHE = set()
+        except Exception as exc:
+            logger.warning(f"Failed to load trade calendar from akshare: {exc}; fallback to weekend-only logic")
+            cls._TRADE_DATES_CACHE = set()
+        return cls._TRADE_DATES_CACHE
+
+    @classmethod
+    def _is_trading_day(cls, date_obj: Union[datetime, pd.Timestamp, datetime.date]) -> bool:
+        """判断是否为交易日：以 akshare 交易日历为准；若未能加载则退化为周一至周五。"""
         if isinstance(date_obj, datetime):
             date_obj = date_obj.date()
         elif isinstance(date_obj, pd.Timestamp):
             date_obj = date_obj.date()
-        return date_obj.weekday() < 5 and date_obj.strftime('%Y-%m-%d') not in UnifiedDataAccessLayer.HOLIDAYS
+
+        trade_dates = cls._load_trade_dates()
+        if trade_dates:
+            return date_obj in trade_dates
+        # 回退逻辑（仅排除周末）
+        return date_obj.weekday() < 5
 
     @staticmethod
     def _previous_trading_day(date_obj: datetime) -> datetime:
@@ -923,10 +869,7 @@ class UnifiedDataAccessLayer:
         max_retries: int = 2,
         rollback_on_failure: bool = True,
     ) -> Dict[str, int]:
-        """按日期范围递归同步市场数据，带重试与失败回退逻辑。
-
-        Args:
-            symbol: 股票代码。
+        """按日期范围递归同步市场数据，带重试与失败回退逻辑。            symbol: 股票代码。
             start_date: 起始日期（包含）。
             end_date: 结束日期（包含）。
             step_days: 每批最大天数，避免单次请求过大。
@@ -1084,3 +1027,148 @@ class UnifiedDataAccessLayer:
             await asyncio.sleep(delay)
 
         return {"synced": synced_total, "errors": errors_total}
+
+    def _make_cache_key(self, symbol: str, start_dt: datetime, end_dt: datetime) -> str:  # noqa: D401
+        """生成 L0 缓存 key（内部方法）"""
+        return f"{symbol}_{start_dt.strftime('%Y-%m-%d')}_{end_dt.strftime('%Y-%m-%d')}"
+
+
+    def _get_from_l0_cache(self, key: str) -> Optional[pd.DataFrame]:  # noqa: D401
+        """从 L0 缓存读取，如命中则返回 DataFrame 的拷贝"""
+        if not self.config.use_cache:
+            return None
+        with self._l0_cache_lock:
+            entry = self._l0_cache.get(key)
+            if not entry:
+                self._cache_stats['misses'] += 1
+                return None
+            df, ts = entry
+            if time.time() - ts <= self.config.cache_ttl:
+                self._cache_stats['hits'] += 1
+                return df.copy()
+            # 过期 - 删除
+            del self._l0_cache[key]
+            self._cache_stats['misses'] += 1
+        return None
+
+    def _save_to_l0_cache(self, key: str, df: pd.DataFrame) -> None:  # noqa: D401
+        """写入 L0 + L1 缓存（不会在禁用缓存或空 DF 时写入）"""
+        if not self.config.use_cache or df is None or df.empty:
+            return
+        with self._l0_cache_lock:
+            self._l0_cache[key] = (df.copy(), time.time())
+        # 同步写 L1
+        self._save_to_l1_cache(key, df)
+
+
+
+    # ---------------------------------------------------------------------
+    # L1 缓存（跨进程 Redis）辅助方法
+    # ---------------------------------------------------------------------
+    def _get_from_l1_cache(self, cache_key: str):  # noqa: D401
+        """从 Redis (L1) 获取缓存数据"""
+        try:
+            if not self.config.use_cache:
+                return None
+            if not hasattr(self, "_l1_cache"):
+                self._l1_cache = RedisCache(ttl=self.config.cache_ttl)
+            return self._l1_cache.get(cache_key)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("L1 cache get failed: %s", exc)
+            return None
+
+    def _save_to_l1_cache(self, cache_key: str, data):  # noqa: D401
+        """保存数据到 Redis (L1)"""
+        try:
+            if self.config.use_cache and hasattr(self, "_l1_cache"):
+                self._l1_cache.set(cache_key, data, ttl=self.config.cache_ttl)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("L1 cache set failed: %s", exc)
+
+    # ---------------------------------------------------------------------
+    # 对外公开接口: 异步获取历史行情数据
+    # ---------------------------------------------------------------------
+    async def get_historical_data(
+        self,
+        symbol: str,
+        start_date: "datetime | str",
+        end_date: "datetime | str",
+        *,
+        force_refresh: bool = False,
+        auto_sync: bool | None = None,
+    ) -> "pd.DataFrame | None":  # noqa: D401
+        """异步获取历史行情数据，包含两级缓存策略。
+
+        Args:
+            symbol: 股票代码 (已标准化或待标准化)
+            start_date: 开始日期 (含)
+            end_date: 结束日期 (含)
+            force_refresh: 是否跳过缓存强制刷新
+            auto_sync: 若数据库缺失数据，是否自动从数据源同步 (默认为配置值)
+        """
+        import pandas as pd  # noqa: WPS433 (local import to减轻启动开销)
+
+        # 日期规范化 -------------------------------------------------------
+        if isinstance(start_date, str):
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        else:
+            start_dt = start_date
+        if isinstance(end_date, str):
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        else:
+            end_dt = end_date
+
+        # 代码规范化 -------------------------------------------------------
+        standardized_symbol = standardize_symbol(symbol)
+
+        cache_key = self._make_cache_key(standardized_symbol, start_dt, end_dt)
+
+        # -------------------- L0 缓存 ------------------------------------
+        if self.config.use_cache and not force_refresh:
+            df = self._get_from_l0_cache(cache_key)
+            if df is not None:
+                return df
+
+        # -------------------- L1 缓存 ------------------------------------
+        if self.config.use_cache and not force_refresh:
+            df = self._get_from_l1_cache(cache_key)
+            if df is not None:
+                # 回写到 L0 以加速后续访问
+                self._save_to_l0_cache(cache_key, df)
+                return df
+
+        # -------------------- 数据库 ------------------------------------
+        try:
+            df: pd.DataFrame | None = await self.db_manager.get_stock_data(
+                standardized_symbol, start_dt, end_dt
+            )
+        except AttributeError:
+            # 对于 DummyDBManager (测试专用) API 兼容
+            df = await self.db_manager.get_stock_data(standardized_symbol, start_dt, end_dt)
+
+        if df is None:
+            df = pd.DataFrame()
+
+        # 如果需要自动同步且数据不完整，则从数据源补充 -------------------
+        if auto_sync if auto_sync is not None else self.config.auto_sync:
+            if not self._is_data_complete(df, start_dt, end_dt):
+                # unified_provider.get_historical_data 为同步方法
+                missing_df = self.unified_provider.get_historical_data(
+                    standardized_symbol,
+                    start_dt.strftime("%Y-%m-%d"),
+                    end_dt.strftime("%Y-%m-%d"),
+                )
+                if missing_df is not None and not missing_df.empty:
+                    df = missing_df
+                    # 保存到数据库
+                    try:
+                        await self.db_manager.save_stock_data(df)
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("save_stock_data failed: %s", exc)
+
+        # -------------------- 写入缓存 -----------------------------------
+        if self.config.use_cache and df is not None and not df.empty:
+            self._save_to_l0_cache(cache_key, df)
+            self._save_to_l1_cache(cache_key, df)
+
+        return df

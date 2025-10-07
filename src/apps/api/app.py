@@ -18,6 +18,7 @@ from ...services.stock.stock_list_manager import StockListManager
 from ...services.market.market_selector_service import MarketSelectorService
 from ...data.sync.data_sync_service import DataSyncService
 from ...apps.scripts.concurrent_data_sync_service import ConcurrentDataSyncService
+from src.services.portfolio.portfolio_service import generate_portfolio_holdings
 
 # EnhancedDataProvider 已在第四阶段被归档，使用统一数据访问层替代
 # from ...data.providers.optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
@@ -443,6 +444,57 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+# ---------- Portfolios CRUD ----------
+from fastapi.responses import JSONResponse
+from src.services.portfolio.portfolio_management_service import (
+    list_portfolios, create_portfolio_auto, get_portfolio_detail,
+)
+
+@app.get("/api/portfolios")
+def api_list_portfolios():
+    return {"success": True, "portfolios": list_portfolios()}
+
+@app.post("/api/portfolios")
+def api_create_portfolio(request: dict):
+    name = request.get("name") or f"组合{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    mode = request.get("mode", "auto")
+    top_n = int(request.get("top_n", 20))
+    capital = float(request.get("initial_capital", 1_000_000))
+    if mode == "auto":
+        data = create_portfolio_auto(name=name, top_n=top_n, initial_capital=capital)
+        return {"success": True, "portfolio": data}
+    else:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})
+
+@app.get("/api/portfolios/{pid}")
+def api_get_portfolio(pid: int):
+    data = get_portfolio_detail(pid)
+    if not data:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
+    return {"success": True, "portfolio": data}
+
+@app.get("/api/portfolios/{pid}/holdings")
+def api_get_portfolio_holdings(pid: int):
+    data = get_portfolio_detail(pid)
+    if not data:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
+    holdings = data.get("holdings", [])
+    return {"success": True, "holdings": holdings}
+
+# ---------- Portfolio Holdings (simulated) ----------
+
+@app.get("/api/portfolio/holdings")
+def get_portfolio_holdings(as_of_date: str | None = None, top_n: int = 20):
+    try:
+        resp = generate_portfolio_holdings(as_of_date=as_of_date, top_n=top_n)
+        if not resp.get("success", True):
+            return JSONResponse(status_code=500, content=resp)
+        return resp
+    except Exception as e:
+        logger.exception("获取组合持仓失败")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
 
 @app.post("/api/stocks/update")
 async def update_stock_list():

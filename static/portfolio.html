@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>持仓组合</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        .loading {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #4F46E5;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <nav class="bg-white shadow">
+        <div class="container mx-auto px-4 py-3 flex justify-between items-center">
+            <div class="text-xl font-semibold text-gray-800">投资组合系统</div>
+            <div class="flex gap-4">
+                <a href="/static/index.html" class="text-gray-600 hover:text-blue-600">首页</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container mx-auto px-4 py-6">
+        <div class="bg-white rounded-lg shadow-md p-6">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-2xl font-semibold text-gray-800">持仓组合</h2>
+                <button onclick="loadPortfolioHoldings()" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">刷新</button>
+            </div>
+            <div id="portfolioHoldingsLoading" class="hidden mb-4"><div class="loading"></div></div>
+            <div id="portfolioHoldingsContainer" class="text-sm"></div>
+        </div>
+    </main>
+
+    <script>
+        async function loadPortfolioHoldings() {
+            const container = document.getElementById('portfolioHoldingsContainer');
+            const loadingEl = document.getElementById('portfolioHoldingsLoading');
+            if (!container || !loadingEl) return;
+
+            loadingEl.classList.remove('hidden');
+            try {
+                const response = await fetch('http://localhost:8003/api/portfolio/holdings');
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || '加载失败');
+                }
+
+                if (!data.success) {
+                    throw new Error(data.error || '加载失败');
+                }
+
+                const holdings = data.holdings || [];
+
+                if (holdings.length === 0) {
+                    container.innerHTML = '<p class="text-gray-600">暂无持仓信息</p>';
+                    return;
+                }
+
+                let html = `<table class="min-w-full text-sm"><thead><tr><th class="px-2 py-1 text-left">股票</th><th class="px-2 py-1 text-right">持仓量</th><th class="px-2 py-1 text-right">成本价</th><th class="px-2 py-1 text-right">市价</th><th class="px-2 py-1 text-right">盈亏%</th></tr></thead><tbody>`;
+                holdings.forEach(h => {
+                    const pnl = ((h.current_price - h.cost_price) / h.cost_price) * 100;
+                    html += `<tr class="border-t"><td class="px-2 py-1">${h.symbol}</td><td class="px-2 py-1 text-right">${h.quantity}</td><td class="px-2 py-1 text-right">${h.cost_price.toFixed(2)}</td><td class="px-2 py-1 text-right">${h.current_price.toFixed(2)}</td><td class="px-2 py-1 text-right ${pnl >= 0 ? 'text-green-600' : 'text-red-600'}">${pnl.toFixed(2)}%</td></tr>`;
+                });
+                html += '</tbody></table>';
+                container.innerHTML = html;
+            } catch (e) {
+                container.innerHTML = `<p class="text-red-600">${e.message}</p>`;
+            } finally {
+                loadingEl.classList.add('hidden');
+            }
+        }
+
+        // 页面加载自动拉取一次
+        loadPortfolioHoldings();
+    </script>
+</body>
+</html>

@@ -75,7 +75,7 @@ from src.core.unified_data_access_factory import create_unified_data_access
 from src.ml.features.enhanced_features import EnhancedFeatureGenerator
 from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from src.ml.training.enhanced_ml_trainer import EnhancedMLTrainer
-from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV, cross_val_score
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV, cross_val_score, cross_validate, cross_val_predict
 from sklearn.metrics import make_scorer
 from sklearn.model_selection import BaseCrossValidator
 
@@ -1569,8 +1569,7 @@ class UnifiedModelTrainer:
                 'r2': cv_results['test_r2'],
                 'mse': -cv_results['test_mse'],
                 'mae': -cv_results['test_mae'],
-                'sharpe': cv_results['test_sharpe'],
-                'ir': cv_results['test_ir']
+                
             }
             import os
             metrics_dir = 'metrics'
@@ -1667,9 +1666,7 @@ class UnifiedModelTrainer:
             'ic': cv_results['test_ic'].tolist(),
             'r2': cv_results['test_r2'].tolist(),
             'mse': (-cv_results['test_mse']).tolist(),
-            'mae': (-cv_results['test_mae']).tolist(),
-            'sharpe': cv_results['test_sharpe'].tolist(),
-            'ir': cv_results['test_ir'].tolist()
+            'mae': (-cv_results['test_mae']).tolist()
         }
         metrics_dict = {
             'ic': cv_results['test_ic'],

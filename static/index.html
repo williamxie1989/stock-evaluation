@@ -93,6 +93,9 @@
                 <button id="tab-system-status" class="px-6 py-4 tab-inactive font-medium transition-all duration-200" onclick="switchTab('system-status')">
                     系统状态
                 </button>
+                <a href="./portfolios.html" class="px-6 py-4 tab-inactive font-medium transition-all duration-200" target="_self">
+                    持仓组合
+                </a>
             </nav>
         </div>
 
@@ -1114,7 +1117,6 @@
         }
 
         // 页面加载时初始化
-        loadStockPicks();
         loadSyncStatus();
         loadDataFreshness();
 

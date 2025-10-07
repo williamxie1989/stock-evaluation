@@ -206,62 +206,54 @@ class ModelTrainer:
             logger.error(f"模型加载失败: {e}")
             return None
     
-    def predict(self, model_name: str, X: pd.DataFrame) -> Optional[np.ndarray]:
-        """使用模型进行预测"""
+    def predict_proba(self, model_name: str, X: pd.DataFrame) -> np.ndarray:
+        """从指定路径加载训练好的模型（分类模型），并进行概率预测"""
+        model = self.load_model(model_name)
+        if model is None:
+            logger.error(f"模型 {model_name} 不存在")
+            return np.array([])
+        
+        # 检查模型是否支持 predict_proba
+        if not hasattr(model, 'predict_proba'):
+            logger.warning(f"模型 {model_name} 不支持概率预测")
+            # 尝试常规预测并返回
+            try:
+                return model.predict(X)
+            except:
+                return np.array([])
+        
+        # 清理数据
+        X_clean = X.copy()
+        for col in X_clean.columns:
+            if X_clean[col].dtype == 'object':
+                X_clean[col] = pd.to_numeric(X_clean[col], errors='coerce')
+        X_clean = X_clean.fillna(0.0)
+        
         try:
-            if model_name not in self.models:
-                model = self.load_model(model_name)
-                if model is None:
-                    return None
-            else:
-                model = self.models[model_name]
-            
-            # 数据预处理
-            X_clean = X.dropna()
-            
-            if len(X_clean) == 0:
-                return None
-            
-            # 预测
-            predictions = model.predict(X_clean)
-            
-            logger.info(f"预测完成: {model_name}, 样本数: {len(X_clean)}")
-            return predictions
-            
+            return model.predict_proba(X_clean)
         except Exception as e:
             logger.error(f"预测失败: {e}")
-            return None
-    
-    def predict_proba(self, model_name: str, X: pd.DataFrame) -> Optional[np.ndarray]:
-        """使用模型进行概率预测"""
+            return np.array([])
+            
+    def predict(self, model_name: str, X: pd.DataFrame) -> np.ndarray:
+        """从指定路径加载训练好的模型，并进行预测（支持回归和分类）"""
+        model = self.load_model(model_name)
+        if model is None:
+            logger.error(f"模型 {model_name} 不存在")
+            return np.array([])
+        
+        # 清理数据
+        X_clean = X.copy()
+        for col in X_clean.columns:
+            if X_clean[col].dtype == 'object':
+                X_clean[col] = pd.to_numeric(X_clean[col], errors='coerce')
+        X_clean = X_clean.fillna(0.0)
+        
         try:
-            if model_name not in self.models:
-                model = self.load_model(model_name)
-                if model is None:
-                    return None
-            else:
-                model = self.models[model_name]
-            
-            # 检查模型是否支持概率预测
-            if not hasattr(model, 'predict_proba'):
-                logger.warning(f"模型不支持概率预测: {model_name}")
-                return None
-            
-            # 数据预处理
-            X_clean = X.dropna()
-            
-            if len(X_clean) == 0:
-                return None
-            
-            # 概率预测
-            probabilities = model.predict_proba(X_clean)
-            
-            logger.info(f"概率预测完成: {model_name}, 样本数: {len(X_clean)}")
-            return probabilities
-            
+            return model.predict(X_clean)
         except Exception as e:
-            logger.error(f"概率预测失败: {e}")
-            return None
+            logger.error(f"预测失败: {e}")
+            return np.array([])
     
     def _get_feature_importance(self, model: Any, feature_names: List[str]) -> Dict[str, float]:
         """获取特征重要性"""

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>组合详情 - 智能股票分析系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com/?plugins=typography"></script>
+    <script>
+        const API_BASE = window.API_BASE || window.location.origin;
+        function api(path) {
+            return `${API_BASE}${path.startsWith('/') ? path : '/' + path}`;
+        }
+        function getQueryParam(key) {
+            const url = new URL(window.location.href);
+            return url.searchParams.get(key);
+        }
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- 头部 -->
+        <div class="flex justify-between items-center mb-6">
+            <h1 id="title" class="text-3xl font-bold text-gray-800">组合详情</h1>
+            <a href="./portfolios.html" class="text-blue-600 hover:underline">返回列表</a>
+        </div>
+
+        <!-- 概览卡片 -->
+        <div id="overviewCard" class="bg-white rounded-lg shadow p-6 mb-6 hidden">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div>
+                    <div class="text-gray-500 mb-1">组合名称</div>
+                    <div id="ovName" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">股票数量</div>
+                    <div id="ovCount" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">创建时间</div>
+                    <div id="ovCreated" class="font-medium text-gray-800">-</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 mb-1">净值</div>
+                    <div id="ovNav" class="font-medium text-gray-800">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 持仓表 -->
+        <div class="bg-white rounded-lg shadow overflow-x-auto mb-8">
+            <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">股票名称</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">代码</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">最新价</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">持仓比例</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">建仓时间</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">持仓天数</th>
+                    </tr>
+                </thead>
+                <tbody id="holdingsTable" class="divide-y divide-gray-200"></tbody>
+            </table>
+            <div id="holdingsEmpty" class="text-center text-gray-500 py-6 hidden">暂无持仓数据</div>
+        </div>
+
+        <!-- 调仓历史 / 预留区域 -->
+        <div class="bg-white rounded-lg shadow p-6">
+            <h2 class="text-lg font-semibold mb-4">调仓历史（占位）</h2>
+            <p class="text-gray-500 text-sm">未来将展示调仓记录、交易明细等信息。</p>
+        </div>
+    </div>
+
+<script>
+const pid = getQueryParam('id');
+if (!pid) {
+    alert('缺少参数 id');
+}
+
+async function loadOverview() {
+    const res = await fetch(api(`/api/portfolios/${pid}`));
+    const json = await res.json();
+    if (!json.success) {
+        alert('获取组合信息失败');
+        return;
+    }
+    const p = json.portfolio;
+    document.getElementById('title').textContent = `组合详情 - ${p.name}`;
+    document.getElementById('ovName').textContent = p.name;
+    document.getElementById('ovCount').textContent = p.holdings_count;
+    document.getElementById('ovCreated').textContent = new Date(p.created_at).toLocaleString();
+    document.getElementById('overviewCard').classList.remove('hidden');
+}
+
+async function loadHoldings() {
+    const res = await fetch(api(`/api/portfolios/${pid}/holdings`));
+    const json = await res.json();
+    if (!json.success) {
+        alert('获取持仓失败');
+        return;
+    }
+    const list = json.holdings || [];
+    const tbody = document.getElementById('holdingsTable');
+    tbody.innerHTML = '';
+    if (list.length === 0) {
+        document.getElementById('holdingsEmpty').classList.remove('hidden');
+        return;
+    }
+    document.getElementById('holdingsEmpty').classList.add('hidden');
+    list.forEach(h => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td class="px-4 py-2">${h.symbol}</td>
+            <td class="px-4 py-2">${h.symbol}</td>
+            <td class="px-4 py-2">-</td>
+            <td class="px-4 py-2">${(h.weight * 100).toFixed(2)}%</td>
+            <td class="px-4 py-2">-</td>
+            <td class="px-4 py-2">-</td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+loadOverview();
+loadHoldings();
+</script>
+</body>
+</html>

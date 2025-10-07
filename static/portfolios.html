@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>组合管理 - 智能股票分析系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com/?plugins=typography"></script>
+    <script>
+        const API_BASE = window.API_BASE || window.location.origin;
+        function api(path) {
+            return `${API_BASE}${path.startsWith('/') ? path : '/' + path}`;
+        }
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- 头部 -->
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-3xl font-bold text-gray-800">投资组合</h1>
+            <a href="./index.html" class="text-blue-600 hover:underline">返回首页</a>
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="mb-4 flex justify-end">
+            <button id="btnCreate" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">新建组合</button>
+        </div>
+
+        <!-- 列表表格 -->
+        <div class="bg-white rounded-lg shadow overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">名称</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">持股数量</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">净值</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">当日收益</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">创建时间</th>
+                        <th class="px-4 py-2 text-left font-medium text-gray-700">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="portfolioTable" class="divide-y divide-gray-200"></tbody>
+            </table>
+            <div id="emptyHint" class="text-center text-gray-500 py-6 hidden">暂无组合，点击“新建组合”按钮创建吧！</div>
+        </div>
+    </div>
+
+    <!-- 创建组合 Modal -->
+    <div id="modalMask" class="fixed inset-0 bg-black bg-opacity-40 hidden flex items-center justify-center z-50">
+        <div class="bg-white rounded-lg w-full max-w-md p-6">
+            <h2 class="text-xl font-semibold mb-4">新建组合</h2>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">组合名称</label>
+                <input id="inputName" type="text" placeholder="可留空自动生成" class="w-full px-3 py-2 border rounded">
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">建仓方式</label>
+                <select id="selectMode" class="w-full px-3 py-2 border rounded">
+                    <option value="auto">智能推荐</option>
+                    <option value="manual" disabled>手动创建（敬请期待）</option>
+                </select>
+            </div>
+            <div class="mb-4" id="autoOptions">
+                <label class="block text-sm font-medium text-gray-700 mb-1">股票数量 (Top N)</label>
+                <input id="inputTopN" type="number" min="1" max="100" value="20" class="w-full px-3 py-2 border rounded">
+            </div>
+            <div class="flex justify-end gap-2">
+                <button id="btnCancel" class="px-4 py-2 border rounded">取消</button>
+                <button id="btnSubmit" class="px-4 py-2 bg-blue-600 text-white rounded">创建</button>
+            </div>
+        </div>
+    </div>
+
+<script>
+// 打开 / 关闭 modal
+const modalMask = document.getElementById('modalMask');
+const btnCreate = document.getElementById('btnCreate');
+const btnCancel = document.getElementById('btnCancel');
+btnCreate.onclick = () => modalMask.classList.remove('hidden');
+btnCancel.onclick = () => modalMask.classList.add('hidden');
+
+const portfolioTable = document.getElementById('portfolioTable');
+const emptyHint = document.getElementById('emptyHint');
+
+async function loadPortfolios() {
+    portfolioTable.innerHTML = '';
+    const res = await fetch(api('/api/portfolios'));
+    const json = await res.json();
+    if (!json.success) {
+        alert('获取组合列表失败');
+        return;
+    }
+    const list = json.portfolios;
+    if (list.length === 0) {
+        emptyHint.classList.remove('hidden');
+        return;
+    }
+    emptyHint.classList.add('hidden');
+    list.forEach(p => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td class="px-4 py-2">${p.name}</td>
+            <td class="px-4 py-2">${p.holdings_count}</td>
+            <td class="px-4 py-2">-</td>
+            <td class="px-4 py-2">-</td>
+            <td class="px-4 py-2">${new Date(p.created_at).toLocaleString()}</td>
+            <td class="px-4 py-2"><a href="./portfolio_detail.html?id=${p.id}" class="text-blue-600 hover:underline">查看</a></td>`;
+        portfolioTable.appendChild(tr);
+    });
+}
+
+async function createPortfolio() {
+    const name = document.getElementById('inputName').value.trim();
+    const mode = document.getElementById('selectMode').value;
+    const topN = parseInt(document.getElementById('inputTopN').value, 10);
+    const res = await fetch(api('/api/portfolios'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, mode, top_n: topN })
+    });
+    const json = await res.json();
+    if (json.success) {
+        modalMask.classList.add('hidden');
+        loadPortfolios();
+    } else {
+        alert('创建失败: ' + json.error);
+    }
+}
+
+// 提交按钮
+const btnSubmit = document.getElementById('btnSubmit');
+btnSubmit.onclick = createPortfolio;
+
+// 初次加载
+loadPortfolios();
+</script>
+</body>
+</html>
