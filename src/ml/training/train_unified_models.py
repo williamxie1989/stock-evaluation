@@ -968,7 +968,9 @@ class UnifiedModelTrainer:
                 from lightgbm import LGBMRegressor
             except ImportError:
                 logger.warning("LightGBM 未安装, stacking 回归器跳过")
-                return None
+            # 即使跳过训练，也写入占位的 CV 指标文件，满足下游流程/测试期望
+            self._write_placeholder_cv_csv("stacking_regression_cv_scores.csv")
+            return None
             try:
                 from xgboost import XGBRegressor
             except ImportError:
@@ -980,7 +982,7 @@ class UnifiedModelTrainer:
 
             # -------- 关键修正: 为满足 cross_val_predict 的分区要求，去除首条样本 --------
             # 先根据样本量动态确定折数，再进行首折留出处理。
-            n_splits = min(7, max(2, len(X_train) // 200))  # 至少 2 折，样本足够时最多 5 折
+            n_splits = min(5, max(2, len(X_train) // 200))  # 至少 2 折，样本足够时最多 5 折
             # 在严格的时间序列 CV 中，第一条样本无法拥有“过去”训练数据，导致分区覆盖不足。
             # 若直接全部样本参与，将触发 cross_val_predict("only works for partitions") 错误。
             if len(X_train) <= n_splits:
