@@ -439,6 +439,43 @@ class AdaptiveTradingSystem:
             logger.error(f"获取性能指标失败: {e}")
             return {'error': str(e)}
     
+    def evaluate_positions(self, price_dict: Dict[str, float]) -> List[Dict[str, Any]]:
+        """根据最新价格检查持仓的止盈止损触发情况
+
+        参数
+        -----
+        price_dict: dict
+            key 为 symbol, value 为最新价格（float）
+
+        返回
+        -----
+        List[dict]
+            每个元素包含 symbol、current_price、action(KEEP/STOP_LOSS/TAKE_PROFIT)、trigger_price
+        """
+        alerts: List[Dict[str, Any]] = []
+        try:
+            for symbol, pos in list(self.positions.items()):
+                cur_price = price_dict.get(symbol)
+                if cur_price is None:
+                    continue
+                action = 'KEEP'
+                trigger_price = None
+                if cur_price <= pos['stop_loss']:
+                    action = 'STOP_LOSS'
+                    trigger_price = pos['stop_loss']
+                elif cur_price >= pos['take_profit']:
+                    action = 'TAKE_PROFIT'
+                    trigger_price = pos['take_profit']
+                alerts.append({
+                    'symbol': symbol,
+                    'current_price': cur_price,
+                    'action': action,
+                    'trigger_price': trigger_price
+                })
+        except Exception as e:
+            logger.error(f"仓位评估失败: {e}")
+        return alerts
+
     def reset(self):
         """重置交易系统"""
         self.current_capital = self.initial_capital
