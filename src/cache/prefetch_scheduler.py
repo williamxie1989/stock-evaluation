@@ -15,8 +15,12 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    AsyncIOScheduler = None
+    IntervalTrigger = None
 
 # 避免循环导入，仅在类型检查时引入
 from typing import TYPE_CHECKING
@@ -60,7 +64,10 @@ class CachePrefetchScheduler:
         self.scheduler = AsyncIOScheduler()
         self._job = None
 
-        if not self.symbols:
+        if AsyncIOScheduler is None or IntervalTrigger is None:
+            logger.warning("APScheduler 未安装，缓存预取功能被禁用。请运行 `pip install apscheduler` 启用该特性。")
+            self.scheduler = None
+        elif not self.symbols:
             logger.warning("CachePrefetchScheduler 初始化时未检测到待预取的股票代码列表，预取任务将不会运行。")
 
     async def _prefetch_job(self):
@@ -87,6 +94,9 @@ class CachePrefetchScheduler:
 
     def start(self):
         """启动定时预取任务"""
+        if self.scheduler is None:
+            logger.info("APScheduler 不可用，跳过预取任务启动。")
+            return
         if not self.symbols:
             logger.info("无预取任务，CachePrefetchScheduler 未启动。")
             return
@@ -102,6 +112,6 @@ class CachePrefetchScheduler:
 
     def shutdown(self, wait: bool = True):
         """停止预取任务"""
-        if self.scheduler.running:
+        if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=wait)
             logger.info("CachePrefetchScheduler 已关闭")

@@ -1376,6 +1376,24 @@ class UnifiedDataAccessLayer:
 
         return CacheFetchResult(dataframe=df, source=source)
 
+    def _bulk_concurrency_limit(self) -> int:
+        """确定批量历史数据抓取的并发上限，兼顾连接池容量。"""
+        try:
+            env_limit = int(os.getenv("UDA_BULK_CONCURRENCY", "").strip() or 0)
+        except ValueError:
+            env_limit = 0
+
+        if env_limit > 0:
+            return max(1, env_limit)
+
+        pool = getattr(self.db_manager, "_connection_pool", None)
+        pool_size = getattr(pool, "pool_size", None)
+        if isinstance(pool_size, int) and pool_size > 0:
+            # 保留余量，避免压满连接池
+            return max(1, pool_size - 2) if pool_size > 2 else pool_size
+
+        return 6
+
     # ---------------------------------------------------------------------
     # 批量接口
     # ---------------------------------------------------------------------
@@ -1406,20 +1424,23 @@ class UnifiedDataAccessLayer:
 
         # 提前标准化，防止并行请求重复工作 -------------------------------
         standardized = [standardize_symbol(s) for s in symbols]
+        concurrency_limit = self._bulk_concurrency_limit()
+        semaphore = asyncio.Semaphore(concurrency_limit)
 
         async def _fetch(sym: str) -> "pd.DataFrame | None":
-            try:
-                return await self.get_historical_data(
-                    sym,
-                    start_date,
-                    end_date,
-                    fields=fields,
-                    force_refresh=force_refresh,
-                    auto_sync=auto_sync,
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("bulk fetch for %s failed: %s", sym, exc)
-                return pd.DataFrame()
+            async with semaphore:
+                try:
+                    return await self.get_historical_data(
+                        sym,
+                        start_date,
+                        end_date,
+                        fields=fields,
+                        force_refresh=force_refresh,
+                        auto_sync=auto_sync,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("bulk fetch for %s failed: %s", sym, exc)
+                    return pd.DataFrame()
 
         tasks = [_fetch(s) for s in standardized]
         results = await asyncio.gather(*tasks)
