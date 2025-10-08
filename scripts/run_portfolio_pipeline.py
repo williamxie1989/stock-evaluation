@@ -68,7 +68,7 @@ def main():
         commission_rate=0.0003,
         lookback_days=120,
         top_n=args.top_n,
-        rebalance_freq='M',
+        rebalance_freq='30D',
         model_dir=args.model_dir,
         classifier_name=args.classifier,
         regressor_name=args.regressor,

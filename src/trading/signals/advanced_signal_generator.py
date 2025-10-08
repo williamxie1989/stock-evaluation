@@ -399,7 +399,14 @@ class AdvancedSignalGenerator:
                 # 检查是否已有相同类型的信号
                 if signal_key in last_signals:
                     last_signal = last_signals[signal_key]
-                    time_diff = (signal.timestamp - last_signal.timestamp).days
+                    # 计算信号间隔天数，兼容 timestamp 可能不是 datetime 的情况
+                    try:
+                        time_delta = signal.timestamp - last_signal.timestamp
+                        # 若结果具备 days 属性则读取，否则使用一个大整数表示间隔很大
+                        time_diff = time_delta.days if hasattr(time_delta, 'days') else 9999
+                    except Exception:
+                        # 任意异常均视为间隔足够大
+                        time_diff = 9999
                     
                     # 如果间隔小于3天，保留更强的信号
                     if time_diff < 3:

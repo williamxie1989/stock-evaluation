@@ -17,6 +17,35 @@ import joblib
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CANDIDATE_LIMIT = 3000
+
+
+def resolve_candidate_limit(limit: Optional[int]) -> Optional[int]:
+    """
+    统一解析候选股票数量限制：
+    - 正整数 → 限制数量
+    - 0 或负数 → 不限制
+    - None → 读取环境变量 PORTFOLIO_CANDIDATE_LIMIT，默认 3000
+    """
+    def _convert(value: Optional[int | str]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            logger.warning("候选股票限制值解析失败：%s", value)
+            return None
+
+    resolved = _convert(limit)
+    if resolved is not None:
+        return resolved if resolved > 0 else None
+
+    env_value = _convert(os.getenv("PORTFOLIO_CANDIDATE_LIMIT"))
+    if env_value is not None:
+        return env_value if env_value > 0 else None
+
+    return DEFAULT_CANDIDATE_LIMIT
+
 
 @dataclass
 class PickResult:
@@ -35,7 +64,7 @@ class Holding:
 
 
 class PortfolioPipeline:
-    """模型→选股→建仓→定期调仓→收益计算 管线（首版：信号+风险融合，月度等权调仓）"""
+    """模型→选股→建仓→定期调仓→收益计算 管线（首版：信号+风险融合，30天等权调仓）"""
 
     def __init__(
         self,
@@ -43,7 +72,7 @@ class PortfolioPipeline:
         commission_rate: float = 0.0003,
         lookback_days: int = 120,
         top_n: int = 20,
-        rebalance_freq: str = 'M',
+        rebalance_freq: str = '30D',
         w_model: float = 0.5,
         w_signal: float = 0.3,
         w_risk: float = 0.2,
@@ -61,6 +90,9 @@ class PortfolioPipeline:
         self.w_signal = w_signal
         self.w_risk = w_risk
 
+        self._apply_env_weights()
+        self._base_weights = (self.w_model, self.w_signal, self.w_risk)
+
         # 依赖
         self.signal_gen = AdvancedSignalGenerator()
         self.risk_manager = RiskManager()
@@ -74,6 +106,7 @@ class PortfolioPipeline:
         self.clf_model = self._load_model_safe(os.path.join(self.model_dir, f"{self.classifier_name}.pkl"))
         self.reg_model = self._load_model_safe(os.path.join(self.model_dir, f"{self.regressor_name}.pkl"))
         self.data_access = self._create_data_access()
+        self.candidate_limit = resolve_candidate_limit(None)
 
     def _load_model_safe(self, path: str):
         if not os.path.exists(path):
@@ -206,7 +239,53 @@ class PortfolioPipeline:
             kwargs["data_access_config"] = config
         return create_unified_data_access(**kwargs)
 
+    def _parse_env_float(self, name: str) -> Optional[float]:
+        value = os.getenv(name)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            logger.warning("环境变量 %s=%s 解析失败（期望 float）", name, value)
+            return None
+
+    def _apply_env_weights(self) -> None:
+        env_model = self._parse_env_float("PORTFOLIO_MODEL_WEIGHT")
+        env_signal = self._parse_env_float("PORTFOLIO_SIGNAL_WEIGHT")
+        env_risk = self._parse_env_float("PORTFOLIO_RISK_WEIGHT")
+
+        if env_model is not None:
+            self.w_model = env_model
+        if env_signal is not None:
+            self.w_signal = env_signal
+        if env_risk is not None:
+            self.w_risk = env_risk
+
+    def apply_weight_overrides(self, overrides: Dict[str, float]) -> None:
+        if overrides is None:
+            return
+        # 先回到环境/默认权重，避免污染缓存实例
+        self.reset_weights()
+        model = overrides.get("model")
+        signal = overrides.get("signal")
+        risk = overrides.get("risk")
+        if model is not None:
+            self.w_model = float(model)
+        if signal is not None:
+            self.w_signal = float(signal)
+        if risk is not None:
+            self.w_risk = float(risk)
+
+    def reset_weights(self) -> None:
+        base = getattr(self, "_base_weights", None)
+        if base and len(base) == 3:
+            self.w_model, self.w_signal, self.w_risk = base
+        else:
+            self.w_model, self.w_signal, self.w_risk = 0.5, 0.3, 0.2
+
     def _get_stock_pool(self, limit: Optional[int] = 1000) -> List[str]:
+        base_limit = limit if limit is not None else self.candidate_limit
+        resolved_limit = resolve_candidate_limit(base_limit) if base_limit is not None else None
         stocks = self.data_access.get_all_stock_list()
         if stocks is None or stocks.empty:
             logger.warning("股票列表为空，返回空池")
@@ -220,7 +299,7 @@ class PortfolioPipeline:
             if not (sym.endswith('.SH') or sym.endswith('.SZ')):
                 continue
             symbols.append(sym)
-            if limit and len(symbols) >= limit:
+            if resolved_limit and len(symbols) >= resolved_limit:
                 break
         return symbols
 
@@ -418,7 +497,7 @@ class PortfolioPipeline:
         return nav
 
     def run(self, start_date: str, end_date: str, candidates: Optional[List[str]] = None) -> Dict[str, Any]:
-        """执行：初始选股建仓→月度调仓→组合净值与指标"""
+        """执行：初始选股建仓→30天调仓→组合净值与指标"""
         start_dt = pd.Timestamp(start_date)
         end_dt = pd.Timestamp(end_date)
         # 初始选股与建仓（以start_dt为as_of_date）

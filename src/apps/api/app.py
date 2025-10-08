@@ -20,6 +20,7 @@ from ...data.sync.data_sync_service import DataSyncService
 from ...apps.scripts.concurrent_data_sync_service import ConcurrentDataSyncService
 from src.cache.prefetch_scheduler import CachePrefetchScheduler
 from src.services.portfolio.portfolio_service import generate_portfolio_holdings
+from src.trading.portfolio.portfolio_pipeline import resolve_candidate_limit
 
 # EnhancedDataProvider 已在第四阶段被归档，使用统一数据访问层替代
 # from ...data.providers.optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
@@ -50,6 +51,40 @@ def _local_now() -> datetime:
     return datetime.now(_APP_TZ).replace(tzinfo=None)
 
 cache_prefetch_scheduler: CachePrefetchScheduler | None = None
+
+
+def _parse_bool_param(value, default: Optional[bool] = None) -> Optional[bool]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _parse_float_param(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _parse_int_param(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 @asynccontextmanager
@@ -416,6 +451,7 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
     try:
         # 复用全局 selector 实例
         selector = selector_service
+        limit_resolved = resolve_candidate_limit(limit_symbols)
 
         def with_cache_metrics(payload: dict) -> dict:
             uda = getattr(selector, "data_access", None) or _unified_data_access
@@ -440,7 +476,7 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
             return payload
 
         # 缓存键与TTL检查
-        cache_key = f"{limit_symbols or 0}:{top_n}"
+        cache_key = f"{limit_resolved if limit_resolved is not None else 0}:{top_n}"
         now = datetime.now()
         if not force_refresh:
             cached = PICKS_CACHE.get(cache_key)
@@ -453,8 +489,8 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
 
         t0 = time.monotonic()
 
-        # 快速路径：限制参与预测的股票数量
-        if limit_symbols and limit_symbols > 0:
+        # 按统一限制数量的快速路径
+        if limit_resolved is not None:
             # 优先加载新模型，失败回退旧模型；若均失败则回退到原逻辑
             try:
                 _ = selector.load_models(period='30d') or selector.load_model()
@@ -481,7 +517,7 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
                 valid_symbols.append(code)
 
             # 截断至 limit_symbols
-            candidate_symbols = valid_symbols[:limit_symbols]
+            candidate_symbols = valid_symbols[:limit_resolved]
 
             # 预测并排序
             predicts = selector.predict_top_n(candidate_symbols, top_n)
@@ -605,9 +641,24 @@ def api_create_portfolio(request: dict):
         return JSONResponse(status_code=400, content={"success": False, "error": "top_n must be >= 1"})
     if capital <= 0:
         return JSONResponse(status_code=400, content={"success": False, "error": "initial_capital must be > 0"})
+    auto_trading_param = _parse_bool_param(request.get("auto_trading"))
+    weight_overrides_raw = {
+        "model": _parse_float_param(request.get("model_weight")),
+        "signal": _parse_float_param(request.get("signal_weight")),
+        "risk": _parse_float_param(request.get("risk_weight")),
+    }
+    weight_overrides = {k: v for k, v in weight_overrides_raw.items() if v is not None} or None
+    candidate_limit = _parse_int_param(request.get("candidate_limit"))
     try:
         if mode == "auto":
-            data = create_portfolio_auto(name=name, top_n=top_n, initial_capital=capital)
+            data = create_portfolio_auto(
+                name=name,
+                top_n=top_n,
+                initial_capital=capital,
+                auto_trading=auto_trading_param,
+                weight_overrides=weight_overrides,
+                candidate_limit=candidate_limit,
+            )
         elif mode == "backtrack":
             backtrack_str = request.get("backtrack_date")
             if not backtrack_str:
@@ -621,6 +672,9 @@ def api_create_portfolio(request: dict):
                 backtrack_date=backtrack_dt,
                 top_n=top_n,
                 initial_capital=capital,
+                auto_trading=auto_trading_param,
+                weight_overrides=weight_overrides,
+                candidate_limit=candidate_limit,
             )
         else:
             return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})

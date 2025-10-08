@@ -392,15 +392,32 @@ function renderRebalance(history = []) {
         const wrapper = document.createElement('div');
         const timestamp = formatDateTime(entry.timestamp);
         const description = entry.description || entry.type || '';
-        const preview = (entry.holdings || [])
+        const previewItems = (entry.holdings || [])
             .slice(0, 5)
-            .map(h => `${h.symbol} (${formatWeight(h.weight)})`)
+            .map(h => {
+                const displayName = h.name || h.symbol || '-';
+                const symbolText = h.symbol && displayName !== h.symbol ? ` (${h.symbol})` : '';
+                const retText = formatPercent(h.return_pct);
+                return `${displayName}${symbolText} ${retText}`;
+            })
             .join('，');
+        const preview = previewItems
+            ? `持仓预览：${previewItems}${entry.holdings && entry.holdings.length > 5 ? ' 等' : ''}`
+            : '';
+        const navParts = [];
+        if (entry.nav_value !== undefined && entry.nav_value !== null && !Number.isNaN(Number(entry.nav_value))) {
+            navParts.push(`净值 ${Number(entry.nav_value).toFixed(4)}`);
+        }
+        if (entry.total_value !== undefined && entry.total_value !== null && !Number.isNaN(Number(entry.total_value))) {
+            navParts.push(`总资产 ¥${formatCurrency(entry.total_value, 2)}`);
+        }
+        const navInfo = navParts.length ? navParts.join(' / ') : '';
         wrapper.innerHTML = `
             <div class="border-l-2 border-blue-100 pl-3">
                 <div class="text-sm text-gray-700 font-medium">${timestamp}</div>
                 ${description ? `<div class="text-xs text-gray-500 mt-1">${description}</div>` : ''}
-                ${preview ? `<div class="text-xs text-gray-500 mt-1">持仓预览：${preview}${entry.holdings && entry.holdings.length > 5 ? ' 等' : ''}</div>` : ''}
+                ${navInfo ? `<div class="text-xs text-gray-500 mt-1">${navInfo}</div>` : ''}
+                ${preview ? `<div class="text-xs text-gray-500 mt-1">${preview}</div>` : ''}
             </div>
         `;
         rebalanceList.appendChild(wrapper);

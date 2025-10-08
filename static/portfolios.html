@@ -91,6 +91,36 @@
                 <input id="inputBacktrackDate" type="date" class="w-full px-3 py-2 border rounded">
                 <p class="text-xs text-gray-500 mt-1">系统将以该日 15:00 收盘价建仓，并自动回放调仓与止盈止损。</p>
             </div>
+            <div class="mb-4">
+                <label class="inline-flex items-center text-sm font-medium text-gray-700">
+                    <input id="inputAutoTrading" type="checkbox" class="mr-2" checked>
+                    启用自动调仓
+                </label>
+                <p class="text-xs text-gray-500 mt-1">关闭后组合将按固定周期调仓，不触发止盈止损和自适应风控。</p>
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">候选股票数量上限</label>
+                <input id="inputCandidateLimit" type="number" min="0" placeholder="留空使用默认值" class="w-full px-3 py-2 border rounded">
+                <p class="text-xs text-gray-500 mt-1">0 表示不限数量；建议限制规模以提升建仓效率。</p>
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-2">模型打分权重（可选）</label>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    <div>
+                        <label class="text-xs text-gray-500">模型</label>
+                        <input id="inputModelWeight" type="number" step="0.05" placeholder="默认" class="w-full px-3 py-2 border rounded">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-500">信号</label>
+                        <input id="inputSignalWeight" type="number" step="0.05" placeholder="默认" class="w-full px-3 py-2 border rounded">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-500">风险</label>
+                        <input id="inputRiskWeight" type="number" step="0.05" placeholder="默认" class="w-full px-3 py-2 border rounded">
+                    </div>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">若为空则使用系统默认（或环境变量）值。</p>
+            </div>
             <div class="flex justify-end gap-2">
                 <button id="btnCancel" class="px-4 py-2 border rounded">取消</button>
                 <button id="btnSubmit" class="px-4 py-2 bg-blue-600 text-white rounded">创建</button>
@@ -125,6 +155,11 @@ function toggleModal(show) {
         inputBacktrackDate.value = '';
         backtrackOptions.classList.add('hidden');
         selectMode.value = 'auto';
+        inputAutoTrading.checked = true;
+        inputCandidateLimit.value = '';
+        inputModelWeight.value = '';
+        inputSignalWeight.value = '';
+        inputRiskWeight.value = '';
     }
 }
 
@@ -362,6 +397,29 @@ async function createPortfolio() {
         alert('初始资金必须大于 0');
         return;
     }
+    payload.auto_trading = inputAutoTrading.checked;
+
+    const candidateLimitRaw = inputCandidateLimit.value.trim();
+    if (candidateLimitRaw !== '') {
+        const candidateLimit = Number(candidateLimitRaw);
+        if (Number.isFinite(candidateLimit) && candidateLimit >= 0) {
+            payload.candidate_limit = candidateLimit;
+        }
+    }
+
+    const modelWeight = parseFloat(inputModelWeight.value);
+    const signalWeight = parseFloat(inputSignalWeight.value);
+    const riskWeight = parseFloat(inputRiskWeight.value);
+    if (Number.isFinite(modelWeight)) {
+        payload.model_weight = modelWeight;
+    }
+    if (Number.isFinite(signalWeight)) {
+        payload.signal_weight = signalWeight;
+    }
+    if (Number.isFinite(riskWeight)) {
+        payload.risk_weight = riskWeight;
+    }
+
     if (mode === 'backtrack') {
         const backtrackDate = inputBacktrackDate.value;
         if (!backtrackDate) {
