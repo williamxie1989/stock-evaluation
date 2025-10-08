@@ -62,7 +62,6 @@ class PortfolioPipeline:
         self.w_risk = w_risk
 
         # 依赖
-        self.data_access = create_unified_data_access(validate_sources=False)
         self.signal_gen = AdvancedSignalGenerator()
         self.risk_manager = RiskManager()
         # 允许通过环境变量覆盖模型目录与文件名，默认保持原值
@@ -74,20 +73,138 @@ class PortfolioPipeline:
         # 使用环境变量或参数解析后的目录/文件名
         self.clf_model = self._load_model_safe(os.path.join(self.model_dir, f"{self.classifier_name}.pkl"))
         self.reg_model = self._load_model_safe(os.path.join(self.model_dir, f"{self.regressor_name}.pkl"))
+        self.data_access = self._create_data_access()
 
     def _load_model_safe(self, path: str):
         if not os.path.exists(path):
             logger.warning(f"模型文件不存在: {path}")
             return None
         try:
-            return joblib.load(path)
+            payload = joblib.load(path)
         except Exception as e:
             logger.error(f"加载模型失败 {path}: {e}")
             return None
+        model = self._unwrap_model_payload(payload, origin=path)
+        if model is None:
+            logger.warning(f"模型文件未包含可用模型: {path}")
+        return model
 
-        proba = self.clf_model.predict_proba(Xc) if hasattr(self.clf_model, 'predict_proba') else self.clf_model.predict(Xc)
+    def _unwrap_model_payload(self, payload: Any, *, origin: str) -> Optional[Any]:
+        model = payload
+        feature_names = None
+        metadata = None
 
-        pred = self.reg_model.predict(Xr)
+        if isinstance(payload, dict):
+            for key in ("model", "estimator", "classifier", "regressor", "pipeline"):
+                if payload.get(key) is not None:
+                    model = payload[key]
+                    break
+            else:
+                logger.warning(f"模型文件 {origin} 未找到可用模型键")
+                return None
+            feature_names = (
+                payload.get("feature_names")
+                or payload.get("feature_names_in_")
+                or payload.get("features")
+                or payload.get("columns")
+            )
+            metadata = payload.get("metadata")
+        elif isinstance(payload, (list, tuple)) and payload:
+            model = payload[0]
+            if len(payload) > 1 and isinstance(payload[1], (list, tuple, np.ndarray)):
+                feature_names = payload[1]
+
+        if model is None:
+            return None
+
+        if feature_names is not None:
+            try:
+                feature_array = np.array(feature_names)
+                setattr(model, "feature_names_in_", feature_array)
+            except Exception:
+                logger.debug("无法设置模型特征名（%s）: %s", origin, feature_names, exc_info=True)
+
+        if metadata is not None:
+            try:
+                setattr(model, "_metadata", metadata)
+            except Exception:
+                logger.debug("无法附加模型 metadata（%s）", origin, exc_info=True)
+
+        return model
+
+    def _prepare_features_for_model(self, model: Any, latest_feats: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if model is None or latest_feats is None or latest_feats.empty:
+            return None
+
+        feature_names_attr = getattr(model, "feature_names_in_", None)
+        if feature_names_attr is not None and len(feature_names_attr) > 0:
+            feature_names = [str(name) for name in feature_names_attr]
+        else:
+            feature_names = list(latest_feats.columns)
+
+        expected_dim = getattr(model, "n_features_in_", None)
+        if expected_dim is not None:
+            try:
+                expected_dim = int(expected_dim)
+            except Exception:
+                expected_dim = None
+
+        available_cols = list(latest_feats.columns)
+        available_set = set(available_cols)
+        ordered_cols = [name for name in feature_names if name in available_set]
+
+        if expected_dim is not None:
+            if len(ordered_cols) > expected_dim:
+                ordered_cols = ordered_cols[:expected_dim]
+            if len(ordered_cols) < expected_dim:
+                remaining = [col for col in available_cols if col not in ordered_cols]
+                ordered_cols.extend(remaining[: max(0, expected_dim - len(ordered_cols))])
+
+        if not ordered_cols:
+            ordered_cols = available_cols[:expected_dim] if expected_dim is not None else available_cols
+
+        matrix = latest_feats.reindex(columns=ordered_cols, fill_value=0.0).copy()
+
+        if expected_dim is not None:
+            if matrix.shape[1] < expected_dim:
+                pad_count = expected_dim - matrix.shape[1]
+                for idx in range(pad_count):
+                    matrix[f"__pad_{idx}"] = 0.0
+            if matrix.shape[1] > expected_dim:
+                matrix = matrix.iloc[:, :expected_dim]
+
+        return matrix
+
+    def _parse_env_flag(self, name: str) -> Optional[bool]:
+        value = os.getenv(name)
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        return None
+
+    def _create_data_access(self):
+        config: Dict[str, Any] = {}
+        auto_sync_flag = self._parse_env_flag("PORTFOLIO_DATA_AUTO_SYNC")
+        if auto_sync_flag is not None:
+            config["auto_sync"] = auto_sync_flag
+        use_cache_flag = self._parse_env_flag("PORTFOLIO_DATA_USE_CACHE")
+        if use_cache_flag is not None:
+            config["use_cache"] = use_cache_flag
+        cache_ttl_val = os.getenv("PORTFOLIO_DATA_CACHE_TTL")
+        if cache_ttl_val and cache_ttl_val.isdigit():
+            try:
+                config["cache_ttl"] = int(cache_ttl_val)
+            except Exception:
+                logger.debug("无法解析 PORTFOLIO_DATA_CACHE_TTL=%s", cache_ttl_val, exc_info=True)
+
+        kwargs: Dict[str, Any] = {"validate_sources": False}
+        if config:
+            kwargs["data_access_config"] = config
+        return create_unified_data_access(**kwargs)
 
     def _get_stock_pool(self, limit: Optional[int] = 1000) -> List[str]:
         stocks = self.data_access.get_all_stock_list()
@@ -174,8 +291,9 @@ class PortfolioPipeline:
         # 分类概率
         if self.clf_model is not None:
             try:
-                feat_names = getattr(self.clf_model, "feature_names_in_", latest_feats.columns)
-                Xc = latest_feats.reindex(feat_names, axis=1).fillna(0.0)
+                Xc = self._prepare_features_for_model(self.clf_model, latest_feats)
+                if Xc is None or Xc.empty:
+                    raise ValueError("无法构建分类模型输入特征矩阵")
                 proba = self.clf_model.predict_proba(Xc) if hasattr(self.clf_model, 'predict_proba') else self.clf_model.predict(Xc)
                 if proba is not None and len(proba) > 0:
                     prob_up = float(proba[0][1]) if proba.shape[1] > 1 else float(proba[0])
@@ -185,8 +303,9 @@ class PortfolioPipeline:
         # 回归预测
         if self.reg_model is not None:
             try:
-                feat_names = getattr(self.reg_model, "feature_names_in_", latest_feats.columns)
-                Xr = latest_feats.reindex(feat_names, axis=1).fillna(0.0)
+                Xr = self._prepare_features_for_model(self.reg_model, latest_feats)
+                if Xr is None or Xr.empty:
+                    raise ValueError("无法构建回归模型输入特征矩阵")
                 pred = self.reg_model.predict(Xr)
                 if pred is not None and len(pred) > 0:
                     ret_pred = float(pred[0])

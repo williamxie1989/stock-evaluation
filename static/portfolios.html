@@ -75,6 +75,7 @@
                 <label class="block text-sm font-medium text-gray-700 mb-1">建仓方式</label>
                 <select id="selectMode" class="w-full px-3 py-2 border rounded">
                     <option value="auto">智能推荐</option>
+                    <option value="backtrack">回溯建仓</option>
                     <option value="manual" disabled>手动创建（敬请期待）</option>
                 </select>
             </div>
@@ -84,6 +85,11 @@
                 <label class="block text-sm font-medium text-gray-700 mt-4 mb-1">初始资金（元）</label>
                 <input id="inputCapital" type="number" min="10000" step="10000" value="1000000" class="w-full px-3 py-2 border rounded" />
                 <p class="text-xs text-gray-500 mt-1">资金越高，生成的持仓市值越大，净值计算会同步反映。</p>
+            </div>
+            <div class="mb-4 hidden" id="backtrackOptions">
+                <label class="block text-sm font-medium text-gray-700 mb-1">回溯日期</label>
+                <input id="inputBacktrackDate" type="date" class="w-full px-3 py-2 border rounded">
+                <p class="text-xs text-gray-500 mt-1">系统将以该日 15:00 收盘价建仓，并自动回放调仓与止盈止损。</p>
             </div>
             <div class="flex justify-end gap-2">
                 <button id="btnCancel" class="px-4 py-2 border rounded">取消</button>
@@ -102,16 +108,23 @@ const inputName = document.getElementById('inputName');
 const inputTopN = document.getElementById('inputTopN');
 const inputCapital = document.getElementById('inputCapital');
 const selectMode = document.getElementById('selectMode');
+const backtrackOptions = document.getElementById('backtrackOptions');
+const inputBacktrackDate = document.getElementById('inputBacktrackDate');
 
 function toggleModal(show) {
     if (show) {
         modalMask.classList.remove('hidden');
         setTimeout(() => inputName.focus(), 50);
+        const today = new Date();
+        inputBacktrackDate.value = today.toISOString().slice(0, 10);
     } else {
         modalMask.classList.add('hidden');
         inputName.value = '';
         inputTopN.value = 20;
         inputCapital.value = 1000000;
+        inputBacktrackDate.value = '';
+        backtrackOptions.classList.add('hidden');
+        selectMode.value = 'auto';
     }
 }
 
@@ -125,6 +138,14 @@ modalMask.addEventListener('click', (evt) => {
 document.addEventListener('keydown', (evt) => {
     if (evt.key === 'Escape' && !modalMask.classList.contains('hidden')) {
         toggleModal(false);
+    }
+});
+
+selectMode.addEventListener('change', () => {
+    if (selectMode.value === 'backtrack') {
+        backtrackOptions.classList.remove('hidden');
+    } else {
+        backtrackOptions.classList.add('hidden');
     }
 });
 
@@ -326,13 +347,10 @@ async function handleDeletePortfolio(portfolio, button) {
 }
 
 async function createPortfolio() {
-    if (selectMode.value !== 'auto') {
-        alert('当前仅支持智能推荐建仓。');
-        return;
-    }
+    const mode = selectMode.value;
     const payload = {
         name: inputName.value.trim(),
-        mode: 'auto',
+        mode,
         top_n: Number(inputTopN.value),
         initial_capital: Number(inputCapital.value)
     };
@@ -342,6 +360,17 @@ async function createPortfolio() {
     }
     if (!Number.isFinite(payload.initial_capital) || payload.initial_capital <= 0) {
         alert('初始资金必须大于 0');
+        return;
+    }
+    if (mode === 'backtrack') {
+        const backtrackDate = inputBacktrackDate.value;
+        if (!backtrackDate) {
+            alert('请选择回溯日期');
+            return;
+        }
+        payload.backtrack_date = backtrackDate;
+    } else if (mode !== 'auto') {
+        alert('该建仓模式暂不支持，请选择其他方式。');
         return;
     }
     btnSubmit.disabled = true;

@@ -660,6 +660,334 @@ def _build_holdings_from_recent_prices(
     return holdings, metas
 
 
+def _simulate_backtrack_portfolio(
+    *,
+    pipeline: PortfolioPipeline,
+    start_ts: datetime,
+    end_ts: datetime,
+    top_n: int,
+    initial_capital: float,
+) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
+    """基于 PortfolioPipeline + AdaptiveTradingSystem 运行回溯建仓与调仓仿真。"""
+    from src.trading.systems.adaptive_trading_system import AdaptiveTradingSystem
+
+    ats = AdaptiveTradingSystem(initial_capital=initial_capital)
+    price_cache: Dict[str, pd.Series] = {}
+    last_price_map: Dict[str, float] = {}
+    last_price_time: Dict[str, datetime] = {}
+    nav_history: List[Dict[str, Any]] = []
+    rebalance_events: List[Dict[str, Any]] = []
+
+    start_date = pd.Timestamp(start_ts.date())
+    end_date = pd.Timestamp(end_ts.date())
+    business_days = pd.date_range(start=start_date, end=end_date, freq="B")
+    # 至少包含起始日
+    if start_date not in business_days:
+        business_days = business_days.insert(0, start_date)
+    rebal_dates = pd.date_range(start=start_date, end=end_date, freq=pipeline.rebalance_freq or "M")
+    rebal_set = set(dt.normalize() for dt in rebal_dates)
+    rebal_set.add(start_date)
+
+    def _load_price_series(symbol: str) -> pd.Series:
+        series = price_cache.get(symbol)
+        if series is not None:
+            return series
+        total_days = max(5, int((end_date - start_date).days) + pipeline.lookback_days + 5)
+        df = pipeline._fetch_history(symbol, end_date=end_date, days=total_days)
+        if df is None or df.empty or "close" not in df.columns:
+            price_cache[symbol] = pd.Series(dtype=float)
+            return price_cache[symbol]
+        ser = df["close"].copy()
+        ser.index = pd.to_datetime(df.index)
+        ser = ser.sort_index()
+        ser = ser.dropna()
+        price_cache[symbol] = ser
+        return ser
+
+    def _price_on(symbol: str, ts: pd.Timestamp) -> Tuple[Optional[float], Optional[pd.Timestamp], Optional[float]]:
+        ser = _load_price_series(symbol)
+        if ser.empty:
+            return None, None, None
+        try:
+            price = ser.asof(ts)
+        except Exception:
+            price = None
+        if price is None or pd.isna(price):
+            return None, None, None
+        hist = ser[ser.index <= ts]
+        prev = hist.iloc[-2] if len(hist) >= 2 else None
+        price_time = hist.index[-1] if len(hist) >= 1 else None
+        return float(price), price_time, (float(prev) if prev is not None else None)
+
+    def _portfolio_value() -> float:
+        total = ats.current_capital
+        for sym, pos in ats.positions.items():
+            price = last_price_map.get(sym)
+            if price is None:
+                price, _, _ = _price_on(sym, pd.Timestamp(end_date))
+            if price is None:
+                continue
+            total += float(pos.get("volume", 0)) * float(price)
+        return float(total)
+
+    def _record_event(event_time: datetime, event_type: str, description: str, holdings_snapshot: List[Dict[str, Any]]) -> None:
+        rebalance_events.append(
+            {
+                "timestamp": event_time.isoformat(),
+                "type": event_type,
+                "description": description,
+                "holdings": holdings_snapshot,
+            }
+        )
+
+    def _snapshot_holdings(current_prices: Dict[str, float], total_value: float) -> List[Dict[str, Any]]:
+        snapshot: List[Dict[str, Any]] = []
+        for sym, pos in ats.positions.items():
+            volume = float(pos.get("volume", 0))
+            price = current_prices.get(sym) or last_price_map.get(sym) or 0.0
+            weight = (volume * price / total_value) if total_value > 0 else 0.0
+            snapshot.append(
+                {
+                    "symbol": sym,
+                    "weight": weight,
+                    "shares": volume,
+                    "price": price,
+                    "entry_price": float(pos.get("entry_price", 0.0)),
+                }
+            )
+        return snapshot
+
+    # 首日初始化建仓
+    initial_ts = start_date
+    picks_initial = pipeline.pick_stocks(as_of_date=initial_ts, top_n=top_n)
+    valid_picks: List[PickResult] = []
+    for pick in picks_initial:
+        price, price_time, _ = _price_on(pick.symbol, initial_ts)
+        if price is None or price <= 0:
+            continue
+        last_price_map[pick.symbol] = price
+        if price_time is not None:
+            last_price_time[pick.symbol] = price_time.to_pydatetime()
+        valid_picks.append(pick)
+    if not valid_picks:
+        raise RuntimeError("回溯建仓失败：指定日期缺少有效价格数据")
+
+    total_value = initial_capital
+    per_value = total_value / len(valid_picks)
+    ats.analyze_market_state(_load_price_series(valid_picks[0].symbol).to_frame(name="close"))
+    ats.assess_risk_level(_load_price_series(valid_picks[0].symbol).to_frame(name="close"))
+    ats.adapt_trading_params(ats.market_state, ats.risk_level)
+
+    build_holdings_meta: List[Dict[str, Any]] = []
+    for pick in valid_picks:
+        price = last_price_map.get(pick.symbol)
+        if price is None or price <= 0:
+            continue
+        target_volume = int(per_value // price)
+        if target_volume <= 0:
+            continue
+        trade = ats.execute_trade(symbol=pick.symbol, signal="BUY", price=price, volume=target_volume)
+        if not trade.get("success"):
+            logger.debug("建仓执行失败 %s: %s", pick.symbol, trade.get("error"))
+            continue
+        build_holdings_meta.append(
+            {
+                "symbol": pick.symbol,
+                "weight": per_value / total_value if total_value > 0 else 0.0,
+                "shares": target_volume,
+                "price": price,
+            }
+        )
+
+    total_value = _portfolio_value()
+    if build_holdings_meta and total_value > 0:
+        for meta in build_holdings_meta:
+            meta["weight"] = (meta["shares"] * meta["price"]) / total_value if total_value > 0 else 0.0
+    _record_event(
+        datetime.combine(start_ts.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15),
+        "create",
+        f"回溯建仓 Top{len(build_holdings_meta)} 持仓",
+        build_holdings_meta,
+    )
+
+    last_nav_at = datetime.combine(start_ts.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+    nav_history.append(
+        {
+            "date": last_nav_at.strftime("%Y-%m-%d"),
+            "nav_date": last_nav_at.isoformat(),
+            "nav_value": total_value / initial_capital if initial_capital > 0 else 1.0,
+            "total_value": total_value,
+        }
+    )
+    nav_index: Dict[str, int] = {nav_history[-1]["date"]: len(nav_history) - 1}
+
+    for current in business_days:
+        if current < start_date:
+            continue
+        current_prices: Dict[str, float] = {}
+        for sym in list(ats.positions.keys()):
+            price, price_time, _ = _price_on(sym, current)
+            if price is None:
+                continue
+            current_prices[sym] = price
+            last_price_map[sym] = price
+            if price_time is not None:
+                last_price_time[sym] = price_time.to_pydatetime()
+
+        if current_prices:
+            alerts = ats.evaluate_positions(current_prices)
+            for alert in alerts:
+                if alert.get("action") not in {"STOP_LOSS", "TAKE_PROFIT"}:
+                    continue
+                sym = alert["symbol"]
+                trig_price = current_prices.get(sym)
+                if trig_price is None:
+                    continue
+                result = ats.close_position(sym, trig_price)
+                if result.get("success"):
+                    last_price_map[sym] = trig_price
+                    event_type = "stop_loss" if alert["action"] == "STOP_LOSS" else "take_profit"
+                    event_time = datetime.combine(current.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+                    _record_event(
+                        event_time,
+                        event_type,
+                        f"{sym} 触发 {alert['action']}",
+                        _snapshot_holdings(current_prices, _portfolio_value()),
+                    )
+
+        if current.normalize() in rebal_set and current > start_date:
+            picks_now = pipeline.pick_stocks(as_of_date=current, top_n=top_n)
+            target_symbols: List[str] = []
+            pick_prices: Dict[str, float] = {}
+            for pick in picks_now:
+                price, price_time, _ = _price_on(pick.symbol, current)
+                if price is None or price <= 0:
+                    continue
+                pick_prices[pick.symbol] = price
+                last_price_map[pick.symbol] = price
+                if price_time is not None:
+                    last_price_time[pick.symbol] = price_time.to_pydatetime()
+                target_symbols.append(pick.symbol)
+
+            if target_symbols:
+                total_value_before = _portfolio_value()
+                per_value = total_value_before / len(target_symbols) if target_symbols else 0.0
+
+                existing_symbols = list(ats.positions.keys())
+                for sym in existing_symbols:
+                    if sym not in target_symbols:
+                        price = current_prices.get(sym) or last_price_map.get(sym)
+                        if price is None:
+                            continue
+                        ats.close_position(sym, price)
+                total_value_after_close = _portfolio_value()
+                if target_symbols:
+                    per_value = total_value_after_close / len(target_symbols) if total_value_after_close > 0 else 0.0
+                holdings_snapshot: List[Dict[str, Any]] = []
+
+                for sym in target_symbols:
+                    price = pick_prices.get(sym) or last_price_map.get(sym)
+                    if price is None or price <= 0:
+                        continue
+                    target_volume = int(per_value // price)
+                    if target_volume <= 0:
+                        continue
+                    adjust = ats.adjust_position(sym, price=price, target_volume=target_volume)
+                    if not adjust.get("success"):
+                        logger.debug("调仓失败 %s: %s", sym, adjust.get("error"))
+                        continue
+                    holdings_snapshot.append(
+                        {
+                            "symbol": sym,
+                            "weight": per_value / total_value if total_value > 0 else 0.0,
+                            "shares": target_volume,
+                            "price": price,
+                        }
+                    )
+                event_total = _portfolio_value()
+                if holdings_snapshot and event_total > 0:
+                    for meta in holdings_snapshot:
+                        meta["weight"] = (meta["shares"] * meta["price"]) / event_total if event_total > 0 else 0.0
+
+                event_time = datetime.combine(current.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+                _record_event(event_time, "rebalance", f"{event_time.date()} 调仓", holdings_snapshot)
+
+        total_value = _portfolio_value()
+        current_nav_time = datetime.combine(current.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+        nav_record = {
+            "date": current_nav_time.strftime("%Y-%m-%d"),
+            "nav_date": current_nav_time.isoformat(),
+            "nav_value": total_value / initial_capital if initial_capital > 0 else 1.0,
+            "total_value": total_value,
+        }
+        date_key = nav_record["date"]
+        if date_key in nav_index:
+            nav_history[nav_index[date_key]] = nav_record
+        else:
+            nav_index[date_key] = len(nav_history)
+            nav_history.append(nav_record)
+        last_nav_at = current_nav_time
+
+    # 生成最终持仓快照
+    final_total_value = _portfolio_value()
+    holdings_snapshots: List[PortfolioHoldingSnapshot] = []
+    quotes: Dict[str, PriceQuote] = {}
+    for sym, pos in ats.positions.items():
+        volume = float(pos.get("volume", 0))
+        price, price_time, prev_price = _price_on(sym, end_date)
+        if price is None:
+            price = last_price_map.get(sym, 0.0)
+        if price_time is not None:
+            last_price_time[sym] = price_time.to_pydatetime()
+        weight = (volume * price / final_total_value) if final_total_value > 0 else 0.0
+        opened_at = pos.get("entry_time")
+        if opened_at is None:
+            opened_at = datetime.combine(start_ts.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+        elif not isinstance(opened_at, datetime):
+            opened_at = datetime.combine(start_ts.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
+        cost_price = float(pos.get("entry_price", price or 0.0))
+        snapshot = PortfolioHoldingSnapshot(
+            symbol=sym,
+            code=_strip_suffix(sym),
+            name=_resolve_stock_name(sym, _strip_suffix(sym)),
+            weight=weight,
+            shares=volume,
+            cost_price=cost_price,
+            opened_at=opened_at,
+        )
+        holdings_snapshots.append(snapshot)
+        quotes[sym] = PriceQuote(
+            latest_price=float(price or 0.0),
+            previous_price=float(prev_price) if prev_price else None,
+            last_trade_at=last_price_time.get(sym),
+        )
+
+    if not nav_history:
+        raise RuntimeError("回溯建仓未生成净值数据")
+
+    nav_series = pd.Series(
+        data=[item["total_value"] for item in nav_history],
+        index=[pd.Timestamp(item["nav_date"]) for item in nav_history],
+    )
+    initial_value = initial_capital
+    final_value = nav_series.iloc[-1]
+    total_return = (final_value - initial_value) / initial_value if initial_value > 0 else 0.0
+    if len(nav_series) >= 2:
+        prev_total = nav_series.iloc[-2]
+        daily_return_pct = (final_value - prev_total) / prev_total if prev_total > 0 else 0.0
+    else:
+        daily_return_pct = 0.0
+    valuation = PortfolioValuation(
+        nav_total=float(final_value),
+        nav_value=float(final_value / initial_capital) if initial_capital > 0 else 1.0,
+        daily_return_pct=float(daily_return_pct),
+        total_return_pct=float(total_return),
+        last_valued_at=last_nav_at,
+    )
+
+    return holdings_snapshots, quotes, rebalance_events, nav_history, valuation, last_nav_at
+
+
 def _persist_portfolio(
     detail: PortfolioDetail,
     valuation: PortfolioValuation,
@@ -1259,6 +1587,50 @@ def create_portfolio_auto(name: str, top_n: int = 20, initial_capital: float = 1
     valuation, quotes, nav_history = _calculate_portfolio_valuation(detail, as_of=as_of_dt)
     portfolio_id = _persist_portfolio(detail, valuation, quotes, nav_history)
     return get_portfolio_detail(portfolio_id, as_of=as_of_dt, refresh=False) or {}
+
+
+def create_portfolio_backtrack(
+    *,
+    name: str,
+    backtrack_date: date,
+    top_n: int = 20,
+    initial_capital: float = 1_000_000.0,
+) -> Dict[str, Any]:
+    pipeline = _get_pipeline(initial_capital, top_n)
+    if backtrack_date > _now().date():
+        raise ValueError("回溯日期不能晚于当前日期")
+    start_ts = datetime.combine(backtrack_date, datetime.min.time(), tzinfo=_TIMEZONE) + timedelta(hours=15)
+    end_ts = _now()
+    holdings_snapshots, quotes, rebalance_events, nav_history, valuation, last_nav_at = _simulate_backtrack_portfolio(
+        pipeline=pipeline,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        top_n=top_n,
+        initial_capital=initial_capital,
+    )
+    strategy_tags = [
+        "智能选股",
+        f"Top{top_n}",
+        "回溯建仓",
+    ]
+    detail = PortfolioDetail(
+        id=-1,
+        name=name,
+        created_at=start_ts,
+        top_n=top_n,
+        initial_capital=initial_capital,
+        holdings_count=len(holdings_snapshots),
+        benchmark="沪深300",
+        risk_level=_infer_risk_level(top_n),
+        strategy_tags=strategy_tags,
+        holdings=holdings_snapshots,
+        notes=f"回溯建仓（起始 {start_ts.date().isoformat()}）",
+        rebalance_history=rebalance_events,
+    )
+    # 覆盖估值时间，以回溯模拟结果为准
+    valuation.last_valued_at = last_nav_at
+    portfolio_id = _persist_portfolio(detail, valuation, quotes, nav_history)
+    return get_portfolio_detail(portfolio_id, as_of=end_ts, refresh=False) or {}
 
 
 def delete_portfolio(pid: int) -> bool:

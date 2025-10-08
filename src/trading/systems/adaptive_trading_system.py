@@ -293,7 +293,86 @@ class AdaptiveTradingSystem:
         except Exception as e:
             logger.error(f"交易执行失败: {e}")
             return {'success': False, 'error': str(e)}
-    
+
+    def adjust_position(self, symbol: str, price: float, target_volume: int) -> Dict[str, Any]:
+        """根据目标股数调整已有仓位，便于回溯调仓"""
+        try:
+            if target_volume < 0:
+                return {'success': False, 'error': 'target_volume must be >= 0'}
+
+            if symbol not in self.positions:
+                if target_volume == 0:
+                    return {'success': True, 'position': None, 'action': 'NO_POSITION'}
+                return self.execute_trade(symbol=symbol, signal='BUY', price=price, volume=target_volume)
+
+            if target_volume == 0:
+                return self.close_position(symbol, price)
+
+            position = self.positions[symbol]
+            current_volume = position.get('volume', 0)
+            if current_volume == target_volume:
+                # 更新止损止盈以匹配最新参数
+                position['stop_loss'] = price * (1 - self.current_params.stop_loss)
+                position['take_profit'] = price * (1 + self.current_params.take_profit)
+                position['entry_price'] = float(position.get('entry_price', price))
+                position['last_adjust_time'] = datetime.now()
+                return {'success': True, 'position': position, 'action': 'KEEP'}
+
+            diff = target_volume - current_volume
+            if diff > 0:
+                additional_cost = diff * price
+                if additional_cost > self.current_capital:
+                    return {'success': False, 'error': '资金不足'}
+                self.current_capital -= additional_cost
+                total_cost = position['entry_price'] * current_volume + additional_cost
+                position['entry_price'] = total_cost / target_volume if target_volume > 0 else price
+                position['volume'] = target_volume
+                position['stop_loss'] = position['entry_price'] * (1 - self.current_params.stop_loss)
+                position['take_profit'] = position['entry_price'] * (1 + self.current_params.take_profit)
+                position['last_adjust_time'] = datetime.now()
+                trade_record = {
+                    'symbol': symbol,
+                    'action': 'BUY',
+                    'price': price,
+                    'volume': diff,
+                    'total_cost': additional_cost,
+                    'timestamp': datetime.now(),
+                    'market_state': self.market_state.value,
+                    'risk_level': self.risk_level.value
+                }
+                self.trade_history.append(trade_record)
+                return {'success': True, 'position': position, 'action': 'INCREASE'}
+
+            # diff < 0，减仓
+            reduce_volume = -diff
+            proceeds = reduce_volume * price
+            self.current_capital += proceeds
+            position['volume'] = target_volume
+            position['last_adjust_time'] = datetime.now()
+            trade_record = {
+                'symbol': symbol,
+                'action': 'SELL',
+                'price': price,
+                'volume': reduce_volume,
+                'total_cost': proceeds,
+                'timestamp': datetime.now(),
+                'market_state': self.market_state.value,
+                'risk_level': self.risk_level.value
+            }
+            self.trade_history.append(trade_record)
+            if target_volume == 0:
+                self.positions.pop(symbol, None)
+            else:
+                # 保持原入场价，更新止盈止损
+                entry_price = position.get('entry_price', price)
+                position['stop_loss'] = entry_price * (1 - self.current_params.stop_loss)
+                position['take_profit'] = entry_price * (1 + self.current_params.take_profit)
+            return {'success': True, 'position': position if target_volume > 0 else None, 'action': 'DECREASE'}
+
+        except Exception as e:
+            logger.error(f"调整仓位失败: {e}")
+            return {'success': False, 'error': str(e)}
+
     def close_position(self, symbol: str, price: float) -> Dict[str, Any]:
         """平仓"""
         try:
@@ -342,7 +421,23 @@ class AdaptiveTradingSystem:
         except Exception as e:
             logger.error(f"平仓失败: {e}")
             return {'success': False, 'error': str(e)}
-    
+
+    def get_positions_snapshot(self) -> List[Dict[str, Any]]:
+        """返回当前持仓快照，便于写入组合服务"""
+        snapshot: List[Dict[str, Any]] = []
+        for symbol, pos in self.positions.items():
+            snapshot.append({
+                'symbol': symbol,
+                'entry_price': pos.get('entry_price', 0.0),
+                'volume': pos.get('volume', 0),
+                'stop_loss': pos.get('stop_loss'),
+                'take_profit': pos.get('take_profit'),
+                'market_state': pos.get('market_state'),
+                'risk_level': pos.get('risk_level'),
+                'opened_at': pos.get('entry_time')
+            })
+        return snapshot
+
     def get_portfolio_summary(self) -> Dict[str, Any]:
         """获取组合摘要"""
         try:

@@ -547,6 +547,7 @@ from fastapi.responses import JSONResponse
 from src.services.portfolio.portfolio_management_service import (
     list_portfolios,
     create_portfolio_auto,
+    create_portfolio_backtrack,
     get_portfolio_detail,
     delete_portfolio,
 )
@@ -604,13 +605,28 @@ def api_create_portfolio(request: dict):
         return JSONResponse(status_code=400, content={"success": False, "error": "top_n must be >= 1"})
     if capital <= 0:
         return JSONResponse(status_code=400, content={"success": False, "error": "initial_capital must be > 0"})
-    if mode != "auto":
-        return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})
     try:
-        data = create_portfolio_auto(name=name, top_n=top_n, initial_capital=capital)
+        if mode == "auto":
+            data = create_portfolio_auto(name=name, top_n=top_n, initial_capital=capital)
+        elif mode == "backtrack":
+            backtrack_str = request.get("backtrack_date")
+            if not backtrack_str:
+                return JSONResponse(status_code=400, content={"success": False, "error": "backtrack_date is required"})
+            try:
+                backtrack_dt = datetime.strptime(backtrack_str, "%Y-%m-%d").date()
+            except ValueError:
+                return JSONResponse(status_code=400, content={"success": False, "error": "backtrack_date format must be YYYY-MM-DD"})
+            data = create_portfolio_backtrack(
+                name=name,
+                backtrack_date=backtrack_dt,
+                top_n=top_n,
+                initial_capital=capital,
+            )
+        else:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})
         return {"success": True, "portfolio": data}
     except Exception as exc:  # pragma: no cover - 防御性捕获
-        logger.exception("自动创建组合失败")
+        logger.exception("创建组合失败")
         return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
 @app.get("/api/portfolios/{pid}")
