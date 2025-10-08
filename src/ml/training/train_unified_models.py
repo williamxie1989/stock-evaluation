@@ -208,7 +208,9 @@ class UnifiedModelTrainer:
                  refresh_feature_selection: bool = False,
                  feature_selection_n_jobs: int = -1,
                  importance_model: str = 'rf',
-                 random_seed: int = 42):
+                 random_seed: int = 42,
+                 max_auto_sync_symbols: int = 0,
+                 feature_selection_strategy: str = 'balanced'):
         """初始化统一模型训练器
         Args:
             enable_feature_selection: 是否在数据预处理阶段启用特征选择优化器
@@ -234,6 +236,10 @@ class UnifiedModelTrainer:
         # 设置随机种子，保证结果可复现
         self.random_seed = random_seed
         np.random.seed(self.random_seed)
+        # 限制自动同步的股票数量（0 表示禁用，负数表示不限）
+        self.max_auto_sync_symbols = max_auto_sync_symbols
+        # 特征选择策略 full/balanced/fast
+        self.feature_selection_strategy = feature_selection_strategy
     
     def prepare_training_data(self, stock_list: List[str] = None, mode: str = 'both', lookback_days: int = 365, 
                             n_stocks: int = 1000, prediction_period: int = 30,
@@ -312,6 +318,37 @@ class UnifiedModelTrainer:
 
         fetch_fields = ["open", "high", "low", "close", "volume", "turnover", "amount"]
 
+        def _normalize_stock_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+            """确保数据包含标准的 date 列并完成基础清洗。"""
+            df = df.reset_index()
+            # 尝试识别日期列
+            candidate_names = [
+                'date', 'trade_date', 'datetime', 'timestamp',
+                'time', 'date_time', 'dt', 'level_0', 'index'
+            ]
+            date_col = None
+            for name in candidate_names:
+                if name in df.columns:
+                    date_col = name
+                    break
+            if date_col is None:
+                known_value_cols = {'open', 'high', 'low', 'close', 'volume', 'turnover', 'amount'}
+                miscellaneous = [c for c in df.columns if c not in known_value_cols and c != 'symbol']
+                if miscellaneous:
+                    date_col = miscellaneous[0]
+            if date_col is None:
+                raise ValueError("缺少日期列，无法对齐时间序列数据")
+            if date_col != 'date':
+                df = df.rename(columns={date_col: 'date'})
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            df = df.dropna(subset=[c for c in required_cols if c in df.columns])
+            return df
+
         # ---------------- 第一阶段：仅使用本地数据 ----------------
         for symbol in symbols:
             if collected_count >= n_stocks:
@@ -338,14 +375,12 @@ class UnifiedModelTrainer:
                     continue
 
                 # ---------------- 以下与原处理逻辑一致 ----------------
-                stock_data = stock_data.reset_index()
-                stock_data['date'] = pd.to_datetime(stock_data['date'])
-                numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-                for col in numeric_cols:
-                    if col in stock_data.columns:
-                        stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce').astype(float)
-                required_cols = ['open', 'high', 'low', 'close', 'volume']
-                stock_data = stock_data.dropna(subset=required_cols)
+                try:
+                    stock_data = _normalize_stock_dataframe(stock_data)
+                except Exception as normal_err:
+                    logger.warning(f"{symbol} 数据列缺失: {normal_err}")
+                    failed_stocks.append(symbol)
+                    continue
 
                 features_df = self.feature_generator.generate_features(stock_data)
                 if features_df.empty:
@@ -401,11 +436,23 @@ class UnifiedModelTrainer:
                 failed_stocks.append(symbol)
 
         # ---------------- 第二阶段：对不足股票启用 auto_sync 再尝试 ----------------
+        auto_sync_limit = getattr(self, 'max_auto_sync_symbols', 0)
+        auto_sync_attempts = 0
         if collected_count < n_stocks and insufficient_symbols:
-            logger.info(f"本地数据不足，仅收集到 {collected_count} 只股票，尝试对 {len(insufficient_symbols)} 只股票启用 auto_sync 补拉数据")
+            if auto_sync_limit == 0:
+                logger.info(f"本地数据不足，仅收集到 {collected_count} 只股票，但已禁用自动同步，将直接使用现有样本。")
+            else:
+                allowed = len(insufficient_symbols) if auto_sync_limit < 0 else min(len(insufficient_symbols), auto_sync_limit)
+                logger.info(f"本地数据不足，仅收集到 {collected_count} 只股票，尝试对 {allowed} 只股票启用 auto_sync 补拉数据")
             for symbol in insufficient_symbols:
                 if collected_count >= n_stocks:
                     break
+                if auto_sync_limit == 0:
+                    break
+                if auto_sync_limit > 0 and auto_sync_attempts >= auto_sync_limit:
+                    logger.info(f"已达到 auto_sync 限制 {auto_sync_limit}，停止远程补拉。")
+                    break
+                auto_sync_attempts += 1
                 try:
                     stock_data = self.data_access.get_stock_data(
                         symbol,
@@ -417,14 +464,11 @@ class UnifiedModelTrainer:
                     if stock_data is None or stock_data.empty or len(stock_data) < prediction_period + 15:
                         continue
                     # 与第一阶段相同的处理流水线 ----------------
-                    stock_data = stock_data.reset_index()
-                    stock_data['date'] = pd.to_datetime(stock_data['date'])
-                    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-                    for col in numeric_cols:
-                        if col in stock_data.columns:
-                            stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce').astype(float)
-                    required_cols = ['open', 'high', 'low', 'close', 'volume']
-                    stock_data = stock_data.dropna(subset=required_cols)
+                    try:
+                        stock_data = _normalize_stock_dataframe(stock_data)
+                    except Exception as normal_err:
+                        logger.warning(f"{symbol} 数据列缺失: {normal_err}")
+                        continue
                     features_df = self.feature_generator.generate_features(stock_data)
                     if features_df.empty:
                         from src.ml.features.feature_generator import FeatureGenerator
@@ -553,14 +597,21 @@ class UnifiedModelTrainer:
             if os.path.exists(self.feature_cache_file):
                 try:
                     with open(self.feature_cache_file, 'r') as f:
-                        cached_features = json.load(f)
-                    if isinstance(cached_features, list):
+                        cache_payload = json.load(f)
+                    if isinstance(cache_payload, dict):
+                        cached_strategy = cache_payload.get('strategy')
+                        cached_features = cache_payload.get('features', [])
+                    else:
+                        cached_strategy = 'legacy'
+                        cached_features = cache_payload
+                    if cached_strategy not in (None, 'legacy', self.feature_selection_strategy):
+                        logger.info(f"缓存特征策略 {cached_strategy} 与当前 {self.feature_selection_strategy} 不一致，跳过复用")
+                    elif isinstance(cached_features, list):
                         available_features = [feat for feat in cached_features if feat in X_final.columns]
                         missing_features = [feat for feat in cached_features if feat not in X_final.columns]
                         if missing_features:
                             logger.warning(
                                 f"特征缓存中有 {len(missing_features)} 个特征在当前数据集中缺失，仅展示前10个: {missing_features[:10]}")
-                        # 复用策略：至少 10 个且不低于原缓存的一半
                         if len(available_features) >= 10 and len(available_features) >= len(cached_features) * 0.5:
                             logger.info(f"加载缓存特征集合，可用 {len(available_features)}/{len(cached_features)} 个特征")
                             X_selected = X_final[available_features]
@@ -574,56 +625,66 @@ class UnifiedModelTrainer:
         logger.info("开始特征选择优化...")
         try:
             from src.ml.features.feature_selector_optimizer import FeatureSelectorOptimizer
-            
-            # 为分类和回归任务分别选择特征
-            n_features = min(50, X_final.shape[1])  # 选择最多50个特征
-            
+
+            strategy = getattr(self, 'feature_selection_strategy', 'balanced')
+            if strategy == 'full':
+                fs_method = 'auto'
+                target_n_features = min(60, X_final.shape[1])
+            elif strategy == 'fast':
+                fs_method = 'importance'
+                target_n_features = min(25, X_final.shape[1])
+            else:
+                fs_method = 'importance'
+                target_n_features = min(40, X_final.shape[1])
+            logger.info(f"特征选择策略: {strategy}, 目标特征数: {target_n_features}")
+
             # 分类特征选择
             if len(np.unique(y_cls_final)) > 1:  # 确保有多于一个类别
                 cls_selector = FeatureSelectorOptimizer(
-                    task_type='classification', 
-                    target_n_features=n_features,
+                    task_type='classification',
+                    target_n_features=target_n_features,
                     n_jobs=self.feature_selection_n_jobs,
                     importance_model=getattr(self, 'importance_model', 'rf')
                 )
                 cls_results = cls_selector.optimize_feature_selection(
-                    X_final, y_cls_final, method='auto'
+                    X_final, y_cls_final, method=fs_method
                 )
                 cls_features = cls_results['selected_features']
                 logger.info(f"分类任务选择了 {len(cls_features)} 个特征")
             else:
                 cls_features = X_final.columns.tolist()
-            
+
             # 回归特征选择
             reg_selector = FeatureSelectorOptimizer(
-                task_type='regression', 
-                target_n_features=n_features,
+                task_type='regression',
+                target_n_features=target_n_features,
                 n_jobs=self.feature_selection_n_jobs,
                 importance_model=getattr(self, 'importance_model', 'rf')
             )
             reg_results = reg_selector.optimize_feature_selection(
-                X_final, y_reg_final, method='auto'
+                X_final, y_reg_final, method=fs_method
             )
             reg_features = reg_results['selected_features']
             logger.info(f"回归任务选择了 {len(reg_features)} 个特征")
-            
+
             # 合并两个任务的特征
             all_selected_features = list(set(cls_features + reg_features))
             X_selected = X_final[all_selected_features]
-            
+
             logger.info(f"特征选择优化完成: 从 {X_final.shape[1]} 个特征中选择 {len(all_selected_features)} 个")
             logger.info(f"特征缩减比例: {(1 - len(all_selected_features)/X_final.shape[1])*100:.1f}%")
             # 缓存特征集合
             if self.reuse_feature_selection or self.refresh_feature_selection:
                 try:
                     with open(self.feature_cache_file, 'w') as f:
-                        json.dump(all_selected_features, f)
+                        json.dump({'strategy': strategy, 'features': all_selected_features}, f)
                     logger.info(f"特征集合已缓存至 {self.feature_cache_file}")
                 except Exception as e:
                     logger.warning(f"写入特征缓存失败: {e}")
 
             return X_selected, y_reg_final, y_cls_final
-            
+
+
         except Exception as e:
             logger.warning(f"特征选择优化失败: {e}，使用全部特征")
             return X_final, y_reg_final, y_cls_final
@@ -982,13 +1043,14 @@ class UnifiedModelTrainer:
                 from lightgbm import LGBMRegressor
             except ImportError:
                 logger.warning("LightGBM 未安装, stacking 回归器跳过")
-            # 即使跳过训练，也写入占位的 CV 指标文件，满足下游流程/测试期望
-            self._write_placeholder_cv_csv("stacking_regression_cv_scores.csv")
-            return None
+                # 即使跳过训练，也写入占位的 CV 指标文件，满足下游流程/测试期望
+                self._write_placeholder_cv_csv("stacking_regression_cv_scores.csv")
+                return None
             try:
                 from xgboost import XGBRegressor
             except ImportError:
                 logger.warning("XGBoost 未安装, stacking 回归器跳过")
+                self._write_placeholder_cv_csv("stacking_regression_cv_scores.csv")
                 return None
 
             # 分割数据
@@ -1220,7 +1282,6 @@ class UnifiedModelTrainer:
                 }
             }
             return result
-            return result
         except Exception as e:
             logger.error(f"训练 stacking 回归模型失败: {e}")
             return None
@@ -1323,7 +1384,7 @@ class UnifiedModelTrainer:
         results = {}
         
         # 回归模型类型（可外部指定）
-        regression_models = reg_models if reg_models is not None else ['xgboost', 'lightgbm', 'catboost', 'lasso', 'stacking']  # 默认模型 + stacking
+        regression_models = reg_models if reg_models is not None else ['lightgbm', 'xgboost', 'stacking']  # 精简默认模型
         
         logger.info(f"开始并行训练 {len(regression_models)} 个回归模型...")
         
@@ -1358,6 +1419,13 @@ class UnifiedModelTrainer:
         from sklearn.pipeline import Pipeline
         from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
         import numpy as np
+        catboost_min_iter = int(os.getenv('CATBOOST_OPTUNA_MIN_ITER', '200'))
+        catboost_max_iter = int(os.getenv('CATBOOST_OPTUNA_MAX_ITER', '900'))
+        if catboost_max_iter <= catboost_min_iter:
+            catboost_max_iter = catboost_min_iter + 100
+        catboost_cv_folds = max(2, int(os.getenv('CATBOOST_CV_FOLDS', '3')))
+        catboost_optuna_timeout = int(os.getenv('CATBOOST_OPTUNA_TIMEOUT', '0'))
+        catboost_od_wait = max(10, int(os.getenv('CATBOOST_OD_WAIT', '50')))
         
         # 分割数据
         X_train, X_test, y_train, y_test = train_test_split(
@@ -1760,7 +1828,9 @@ class UnifiedModelTrainer:
                     loss_function='Huber:delta=1',
                     depth=6,
                     verbose=False,
-                    random_state=42
+                    random_state=42,
+                    allow_writing_files=False,
+                    thread_count=-1
                 )
                 param_grid = {
                     'regressor__iterations': [300, 600],
@@ -1884,11 +1954,11 @@ class UnifiedModelTrainer:
                             'regressor__bagging_freq': trial.suggest_int('regressor__bagging_freq', 0, 10)
                         }
                     elif model_type == 'catboost':
-                        # 扩展 CatBoost 搜索空间，覆盖更多正则化与结构超参数
+                        # 收敛速度慢，限制迭代次数与深度范围
                         search_params = {
-                            'regressor__iterations': trial.suggest_int('regressor__iterations', 200, 2000),
-                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.005, 0.3, log=True),
-                            'regressor__depth': trial.suggest_int('regressor__depth', 4, 12),
+                            'regressor__iterations': trial.suggest_int('regressor__iterations', catboost_min_iter, catboost_max_iter),
+                            'regressor__learning_rate': trial.suggest_float('regressor__learning_rate', 0.01, 0.2, log=True),
+                            'regressor__depth': trial.suggest_int('regressor__depth', 4, 10),
                             'regressor__l2_leaf_reg': trial.suggest_float('regressor__l2_leaf_reg', 1.0, 10.0),
                             'regressor__bagging_temperature': trial.suggest_float('regressor__bagging_temperature', 0.0, 1.0),
                             'regressor__random_strength': trial.suggest_float('regressor__random_strength', 0.0, 2.0),
@@ -1919,7 +1989,10 @@ class UnifiedModelTrainer:
                         }
                     # 设置参数并计算交叉验证分数
                     pipeline.set_params(**search_params)
-                    tscv = get_cv(n_splits=5, embargo=60)
+                    split_count = catboost_cv_folds if model_type == 'catboost' else 5
+                    tscv = get_cv(n_splits=split_count, embargo=60)
+                    if model_type == 'catboost':
+                        logger.info(f"CatBoost Optuna: 使用 {split_count} 折 CV，迭代区间 [{catboost_min_iter}, {catboost_max_iter}]")
                     score = cross_val_score(
                         pipeline, X_train, y_train,
                         cv=tscv, scoring=_scorer, n_jobs=-1
@@ -1928,7 +2001,10 @@ class UnifiedModelTrainer:
 
                 early_stop_rounds = 10
                 study = create_study_with_pruner(direction=_direction, patience=early_stop_rounds)
-                study.optimize(objective, n_trials=optimization_trials, show_progress_bar=False)
+                optimize_kwargs = {'n_trials': optimization_trials, 'show_progress_bar': False}
+                if model_type == 'catboost' and catboost_optuna_timeout > 0:
+                    optimize_kwargs['timeout'] = catboost_optuna_timeout
+                study.optimize(objective, **optimize_kwargs)
 
                 best_params = study.best_params
                 best_score = study.best_value
@@ -1959,8 +2035,9 @@ class UnifiedModelTrainer:
                 _scoring = ic_scorer
                 _metric_label = 'IC'
                 _score_post = lambda s: s
+            split_count = catboost_cv_folds if model_type == 'catboost' else 5
             grid_search = GridSearchCV(
-                pipeline, param_grid, cv=get_cv(n_splits=5), scoring=_scoring, n_jobs=-1
+                pipeline, param_grid, cv=get_cv(n_splits=split_count), scoring=_scoring, n_jobs=-1
             )
             grid_search.fit(X_train, y_train)
             best_params = grid_search.best_params_
@@ -2000,6 +2077,32 @@ class UnifiedModelTrainer:
                 fit_params = {
                     'regressor__eval_set': eval_set
                 }
+        elif model_type == 'catboost':
+            try:
+                val_frac = float(os.getenv('CATBOOST_VAL_FRAC', '0.2'))
+            except Exception:
+                val_frac = 0.2
+            val_size = max(1, int(len(X_train) * val_frac))
+            split_idx = max(1, len(X_train) - val_size)
+            X_val = X_train.iloc[split_idx:]
+            y_val = y_train.iloc[split_idx:]
+            eval_set = [
+                (X_train.values if hasattr(X_train, 'values') else X_train,
+                 y_train.values if hasattr(y_train, 'values') else y_train),
+                (X_val.values if hasattr(X_val, 'values') else X_val,
+                 y_val.values if hasattr(y_val, 'values') else y_val)
+            ]
+            pipeline.set_params(
+                regressor__use_best_model=True,
+                regressor__od_type='Iter',
+                regressor__od_wait=catboost_od_wait,
+                regressor__allow_writing_files=False,
+                regressor__verbose=False
+            )
+            fit_params = {
+                'regressor__eval_set': eval_set,
+                'regressor__verbose': False
+            }
         pipeline.fit(X_train, y_train, **fit_params)
 
         # 预测
@@ -2164,7 +2267,7 @@ class UnifiedModelTrainer:
         # 若未显式指定模型列表，按任务类型给默认值
         if reg_models is None:
             reg_models = (
-                ['xgboost', 'lightgbm', 'catboost', 'lasso'] if mode == 'regression'
+                ['lightgbm', 'xgboost'] if mode == 'regression'
                 else ['xgboost', 'logistic', 'randomforest']
             )
 
@@ -2431,6 +2534,8 @@ if __name__ == "__main__":
                         help='回溯天数（默认：365）')
     parser.add_argument('--n-stocks', type=int, default=1000,
                         help='参与训练的股票数量上限（默认：1000）')
+    parser.add_argument('--max-auto-sync', type=int, default=None,
+                        help='当本地数据不足时允许 auto_sync 的股票数量，0 表示禁用，负数表示不限（默认读取 TRAIN_MAX_AUTO_SYNC，未设置则为0）')
     parser.add_argument('--prediction-period', type=int, default=30,
                         help='标签预测周期，单位：天（默认：30）')
 
@@ -2470,6 +2575,9 @@ if __name__ == "__main__":
                         help='特征选择时使用的重要性模型（默认：rf，可选：rf/xgb/lgb/auto）')
     parser.add_argument('--enable-interaction-features', action='store_true', dest='enable_interaction_features',
                         help='启用自动交互特征生成（默认关闭）')
+    parser.add_argument('--feature-selection-strategy', type=str, default='balanced',
+                        choices=['full', 'balanced', 'fast'],
+                        help='特征选择策略：full=全量(auto)、balanced=重要性筛选(默认)、fast=快速重要性筛选')
     # 快速测试模式
     parser.add_argument('--quick-test', action='store_true',
                         help='启用快速验证模式：自动缩小数据规模、禁用耗时操作')
@@ -2490,7 +2598,21 @@ if __name__ == "__main__":
         args.optimization_trials = 5
         args.disable_feature_selection = True
         args.fs_n_jobs = 1
+        args.feature_selection_strategy = 'fast'
     # -------------------------------------------------------------
+
+    # 解析 auto_sync 上限（命令行优先，其次环境变量，再次默认禁用）
+    env_auto_sync = os.getenv('TRAIN_MAX_AUTO_SYNC')
+    if args.max_auto_sync is not None:
+        max_auto_sync = args.max_auto_sync
+    elif env_auto_sync is not None:
+        try:
+            max_auto_sync = int(env_auto_sync)
+        except ValueError:
+            logger.warning(f'TRAIN_MAX_AUTO_SYNC={env_auto_sync} 无法解析为整数，默认禁用 auto_sync')
+            max_auto_sync = 0
+    else:
+        max_auto_sync = 0
 
     # 解析模型列表
     cls_models = [m.strip() for m in args.cls_models.split(',')] if args.cls_models else None
@@ -2501,7 +2623,9 @@ if __name__ == "__main__":
                                   reuse_feature_selection=not args.no_feature_cache,
                                   refresh_feature_selection=args.refresh_feature_selection,
                                   feature_selection_n_jobs=args.fs_n_jobs,
-                                  importance_model=args.importance_model)
+                                  importance_model=args.importance_model,
+                                  max_auto_sync_symbols=max_auto_sync,
+                                  feature_selection_strategy=args.feature_selection_strategy)
 
     if getattr(args, 'enable_interaction_features', False):
         trainer.feature_generator.feature_config['interaction']['enabled'] = True
