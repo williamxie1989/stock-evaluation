@@ -81,7 +81,7 @@
                 <h2 class="text-lg font-semibold text-gray-800">组合净值走势</h2>
                 <span id="navChartRange" class="text-sm text-gray-500"></span>
             </div>
-            <canvas id="navChart" height="220"></canvas>
+            <canvas id="navChart" height="220" class="w-full"></canvas>
             <div id="navChartEmpty" class="text-center text-gray-500 text-sm mt-4 hidden">暂无净值历史数据</div>
         </div>
 
@@ -312,7 +312,7 @@ function renderNavChart(history = []) {
             ]
         },
         options: {
-            responsive: true,
+            responsive: false,
             maintainAspectRatio: false,
             plugins: {
                 legend: { display: false },
