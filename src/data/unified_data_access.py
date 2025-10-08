@@ -949,6 +949,7 @@ class UnifiedDataAccessLayer:
     # 中国主要节假日列表（可根据需要补充）
     # 统一交易日缓存，首次使用时通过 akshare 接口加载
     _TRADE_DATES_CACHE: Optional[Set[datetime.date]] = None
+    _LOCAL_HOLIDAYS: Optional[Set[datetime.date]] = None
 
     @classmethod
     def _load_trade_dates(cls) -> Set[datetime.date]:
@@ -974,12 +975,53 @@ class UnifiedDataAccessLayer:
         return cls._TRADE_DATES_CACHE
 
     @classmethod
+    def _load_local_holidays(cls) -> Set[datetime.date]:
+        """从本地文件加载节假日清单（若存在）。"""
+        if cls._LOCAL_HOLIDAYS is not None:
+            return cls._LOCAL_HOLIDAYS
+        candidates: List[Path] = []
+        env_path = os.getenv("LOCAL_MARKET_HOLIDAY_FILE")
+        if env_path:
+            candidates.append(Path(env_path).expanduser())
+        candidates.append(Path("Except2025/neednote_RecentHSHoliday.txt"))
+        holidays: Set[datetime.date] = set()
+        for candidate in candidates:
+            try:
+                if not candidate:
+                    continue
+                path = candidate if candidate.is_absolute() else Path.cwd() / candidate
+                if not path.exists():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                if "=" in text:
+                    text = text.split("=", 1)[1]
+                text = text.replace("，", ",")
+                for token in text.split(","):
+                    token = token.strip()
+                    if len(token) == 8 and token.isdigit():
+                        try:
+                            holidays.add(datetime.strptime(token, "%Y%m%d").date())
+                        except ValueError:
+                            continue
+                if holidays:
+                    logger.info("Loaded %s local holiday dates from %s", len(holidays), path)
+                    break
+            except Exception as exc:
+                logger.warning("Failed to load local holiday file %s: %s", candidate, exc)
+        cls._LOCAL_HOLIDAYS = holidays
+        return cls._LOCAL_HOLIDAYS
+
+    @classmethod
     def _is_trading_day(cls, date_obj: Union[datetime, pd.Timestamp, datetime.date]) -> bool:
         """判断是否为交易日：以 akshare 交易日历为准；若未能加载则退化为周一至周五。"""
         if isinstance(date_obj, datetime):
             date_obj = date_obj.date()
         elif isinstance(date_obj, pd.Timestamp):
             date_obj = date_obj.date()
+
+        local_holidays = cls._load_local_holidays()
+        if date_obj in local_holidays:
+            return False
 
         trade_dates = cls._load_trade_dates()
         if trade_dates:

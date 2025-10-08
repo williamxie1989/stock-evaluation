@@ -18,7 +18,7 @@
         <!-- 头部 -->
         <div class="flex justify-between items-center mb-6">
             <h1 class="text-3xl font-bold text-gray-800">投资组合</h1>
-            <a href="./index.html" class="text-blue-600 hover:underline">返回首页</a>
+            <a href="/" class="text-blue-600 hover:underline">返回首页</a>
         </div>
 
         <!-- 操作按钮 -->
@@ -134,6 +134,7 @@ const emptyHint = document.getElementById('emptyHint');
 const summaryCount = document.getElementById('summaryCount');
 const summaryAvgNav = document.getElementById('summaryAvgNav');
 const summaryAvgDaily = document.getElementById('summaryAvgDaily');
+let loadRequestId = 0;
 
 function formatNumber(value, digits = 2) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -222,20 +223,40 @@ function buildRow(portfolio) {
         <td class="px-4 py-3 align-top">${riskBadge(portfolio.risk_level, portfolio.benchmark)}</td>
         <td class="px-4 py-3 align-top text-gray-600">${formatDateTime(portfolio.created_at)}</td>
         <td class="px-4 py-3 align-top">
-            <a href="./portfolio_detail.html?id=${portfolio.id}" class="text-blue-600 hover:underline">查看</a>
+            <div class="flex items-center gap-3">
+                <a href="./portfolio_detail.html?id=${portfolio.id}" class="text-blue-600 hover:underline">查看</a>
+                <button type="button" class="text-red-600 hover:underline btn-delete">删除</button>
+            </div>
         </td>
     `;
+    const deleteBtn = tr.querySelector('.btn-delete');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', () => handleDeletePortfolio(portfolio, deleteBtn));
+    }
     return tr;
 }
 
-async function loadPortfolios() {
-    portfolioTable.innerHTML = '';
-    emptyHint.classList.add('hidden');
+async function loadPortfolios(options = {}) {
+    const { forceRefresh = true, showSpinner = true } = options;
+    const requestId = ++loadRequestId;
+    if (showSpinner) {
+        portfolioTable.innerHTML = `
+            <tr>
+                <td colspan="8" class="px-4 py-6 text-center text-gray-500">加载中...</td>
+            </tr>
+        `;
+        emptyHint.classList.add('hidden');
+    }
     try {
-        const res = await fetch(api('/api/portfolios'));
+        const basePath = forceRefresh ? '/api/portfolios?refresh=1' : '/api/portfolios';
+        const separator = basePath.includes('?') ? '&' : '?';
+        const res = await fetch(api(`${basePath}${separator}ts=${Date.now()}`), { cache: 'no-store' });
         const json = await res.json();
         if (!json.success) {
             throw new Error(json.error || '未知错误');
+        }
+        if (requestId !== loadRequestId) {
+            return;
         }
         const list = json.portfolios || [];
         summaryCount.textContent = list.length;
@@ -247,6 +268,7 @@ async function loadPortfolios() {
             emptyHint.classList.remove('hidden');
             return;
         }
+        portfolioTable.innerHTML = '';
         const navAvg = list.reduce((sum, item) => sum + (Number(item.nav_value) || 0), 0) / list.length;
         const dailyAvg = list.reduce((sum, item) => sum + (Number(item.daily_return_pct) || 0), 0) / list.length;
         summaryAvgNav.textContent = formatNumber(navAvg, 4);
@@ -258,13 +280,48 @@ async function loadPortfolios() {
         });
     } catch (error) {
         console.error(error);
-        alert(`获取组合列表失败：${error.message}`);
+        if (requestId !== loadRequestId) {
+            return;
+        }
+        if (showSpinner) {
+            alert(`获取组合列表失败：${error.message}`);
+        }
         summaryCount.textContent = '0';
         summaryAvgNav.textContent = '-';
         summaryAvgDaily.textContent = '-';
         summaryAvgDaily.classList.remove('text-red-600', 'text-green-600');
         summaryAvgDaily.classList.add('text-gray-600');
+        portfolioTable.innerHTML = '';
         emptyHint.classList.remove('hidden');
+    }
+}
+
+async function handleDeletePortfolio(portfolio, button) {
+    const name = portfolio.name || `组合${portfolio.id}`;
+    if (!window.confirm(`确定要删除组合「${name}」吗？此操作不可恢复。`)) {
+        return;
+    }
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = '删除中...';
+    try {
+        const res = await fetch(api(`/api/portfolios/${portfolio.id}`), {
+            method: 'DELETE'
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || !json.success) {
+            throw new Error(json.error || `服务返回状态码 ${res.status}`);
+        }
+        await loadPortfolios({ forceRefresh: false });
+        loadPortfolios({ forceRefresh: true, showSpinner: false });
+    } catch (error) {
+        console.error(error);
+        alert(`删除组合失败：${error.message}`);
+    } finally {
+        if (button && button.isConnected) {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
     }
 }
 
@@ -301,7 +358,8 @@ async function createPortfolio() {
             throw new Error(json.error || '创建组合失败');
         }
         toggleModal(false);
-        await loadPortfolios();
+        await loadPortfolios({ forceRefresh: false });
+        loadPortfolios({ forceRefresh: true, showSpinner: false });
     } catch (error) {
         console.error(error);
         alert(`创建失败：${error.message}`);
@@ -313,8 +371,11 @@ async function createPortfolio() {
 
 btnSubmit.onclick = createPortfolio;
 
-// 初次加载
-loadPortfolios();
+// 初次加载：先展示已有数据，再触发刷新
+(async () => {
+    await loadPortfolios({ forceRefresh: false });
+    loadPortfolios({ forceRefresh: true, showSpinner: false });
+})();
 </script>
 </body>
 </html>

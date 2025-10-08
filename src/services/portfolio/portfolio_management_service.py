@@ -4,18 +4,28 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import os
+import threading
+import pandas as pd
+from zoneinfo import ZoneInfo
 
 from src.data.db.unified_database_manager import UnifiedDatabaseManager
 from src.services.stock.stock_list_manager import StockListManager
 from src.trading.portfolio.portfolio_pipeline import Holding, PickResult, PortfolioPipeline
+from src.apps.scripts.selector_service import IntelligentStockSelector
 
 logger = logging.getLogger(__name__)
+
+_TIMEZONE_NAME = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+try:
+    _TIMEZONE = ZoneInfo(_TIMEZONE_NAME)
+except Exception:
+    logger.warning("Invalid APP_TIMEZONE '%s', fallback到UTC", _TIMEZONE_NAME)
+    _TIMEZONE = ZoneInfo("UTC")
 
 
 # =========================================================================
@@ -148,11 +158,23 @@ class PortfolioDetail(PortfolioInfo):
 
 _db_manager = UnifiedDatabaseManager()
 _stock_list_manager = StockListManager()
+
+_AUTO_SELECTOR: Optional[IntelligentStockSelector] = None
+_SELECTOR_LOCK = threading.Lock()
+_AUTO_PICK_CACHE: Dict[str, Any] = {}
+_AUTO_PICK_CACHE_TTL = int(os.getenv("PORTFOLIO_AUTO_CACHE_SECONDS", "600"))
+_AUTO_SYMBOL_LIMIT_DEFAULT = int(os.getenv("PORTFOLIO_AUTO_SYMBOL_LIMIT", "600"))
+_SELECTOR_READY = False
+
 _REFRESH_THRESHOLD_MINUTES = int(os.getenv("PORTFOLIO_REFRESH_MINUTES", "60"))
+
+_FALLBACK_LOOKBACK_DAYS = int(os.getenv("PORTFOLIO_FALLBACK_LOOKBACK_DAYS", "120"))
+_FALLBACK_MIN_ROWS = int(os.getenv("PORTFOLIO_FALLBACK_MIN_ROWS", "15"))
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    now_local = datetime.now(_TIMEZONE)
+    return now_local.replace(tzinfo=None)
 
 
 def _json_dumps(data: Any) -> Optional[str]:
@@ -210,11 +232,59 @@ def _strip_suffix(symbol: str) -> str:
     return symbol.split(".")[0] if symbol and "." in symbol else symbol
 
 
-def _lookup_stock_name(code: str) -> str:
+@lru_cache(maxsize=2048)
+def _resolve_stock_name(symbol: str, code: str) -> str:
+    """优先从 stocks 表获取股票简称，失败时回退到 StockListManager。"""
+    symbol = (symbol or "").strip()
+    code = (code or _strip_suffix(symbol or "")).strip()
+    placeholder = _placeholder()
+    candidates: List[str] = []
+    if symbol:
+        candidates.append(symbol)
+    if code and code not in candidates:
+        candidates.append(code)
+    # 附加常见交易所后缀，避免代码未携带市场信息时匹配失败
+    suffixes = (".SH", ".SZ", ".BJ")
+    for suffix in suffixes:
+        candidate = f"{code}{suffix}"
+        if code and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            rows = _db_manager.execute_query(
+                f"SELECT name FROM stocks WHERE symbol = {placeholder} LIMIT 1",
+                (candidate,),
+            )
+            if rows:
+                name = rows[0].get("name")
+                if name:
+                    return name
+        except Exception:
+            logger.debug("查询股票名称失败: %s", candidate, exc_info=True)
+            break
+
+    if code:
+        try:
+            pattern = f"%{code}"
+            rows = _db_manager.execute_query(
+                f"SELECT name FROM stocks WHERE symbol LIKE {placeholder} ORDER BY symbol LIMIT 1",
+                (pattern,),
+            )
+            if rows:
+                name = rows[0].get("name")
+                if name:
+                    return name
+        except Exception:
+            logger.debug("模糊查询股票名称失败: %s", code, exc_info=True)
+
     info = _stock_list_manager.get_stock_info(code)
-    if not info:
-        return f"股票{code}"
-    return info.get("name") or f"股票{code}"
+    if info and info.get("name"):
+        return info["name"]
+    fallback = code or symbol or "未知股票"
+    return f"股票{fallback}"
 
 
 @lru_cache(maxsize=8)
@@ -298,7 +368,7 @@ def _hydrate_detail(
         holding = PortfolioHoldingSnapshot(
             symbol=symbol,
             code=code,
-            name=row.get("name") or _lookup_stock_name(code),
+            name=row.get("name") or _resolve_stock_name(symbol, code),
             weight=float(row.get("weight") or 0.0),
             shares=float(row.get("shares") or 0.0),
             cost_price=float(row.get("cost_price") or 0.0),
@@ -348,6 +418,246 @@ def _hydrate_detail(
     )
 
     return detail, valuation, quotes, nav_history
+
+
+def _get_auto_selector() -> IntelligentStockSelector:
+    global _AUTO_SELECTOR
+    if _AUTO_SELECTOR is None:
+        with _SELECTOR_LOCK:
+            if _AUTO_SELECTOR is None:
+                _AUTO_SELECTOR = IntelligentStockSelector(db_manager=_db_manager)
+    return _AUTO_SELECTOR
+
+
+def _ensure_selector_ready(selector: IntelligentStockSelector) -> bool:
+    global _SELECTOR_READY
+    if _SELECTOR_READY:
+        return True
+    loaded = (
+        selector.load_models(period="30d")
+        or selector.load_models(period="10d")
+        or selector.load_model()
+    )
+    _SELECTOR_READY = bool(loaded)
+    return _SELECTOR_READY
+
+
+def _auto_pick_cache_key(top_n: int, symbol_limit: int) -> str:
+    return f"{top_n}:{symbol_limit}"
+
+
+def _get_latest_price(symbol: str) -> float:
+    try:
+        bars = _db_manager.get_last_n_bars([symbol], n=1)
+        if bars is not None and not bars.empty:
+            row = bars.iloc[-1]
+            price = row.get("close") or row.get("Close")
+            if price is not None:
+                return float(price)
+    except Exception as exc:
+        logger.debug("获取最新价格失败 %s: %s", symbol, exc)
+    return 0.0
+
+
+def _symbols_with_recent_data(
+    limit: int,
+    *,
+    lookback_days: int,
+    min_rows: int,
+    as_of: Optional[datetime] = None,
+) -> List[str]:
+    """在本地数据库中筛选近期有行情的股票。"""
+    if limit <= 0:
+        return []
+    as_of = as_of or _now()
+    start_date = (as_of.date() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    placeholder = _placeholder()
+    query = (
+        "SELECT symbol, MAX(date) AS latest_date, COUNT(*) AS rows_count "
+        "FROM prices_daily "
+        f"WHERE date >= {placeholder} "
+        "GROUP BY symbol "
+        f"HAVING rows_count >= {placeholder} "
+        "ORDER BY latest_date DESC "
+        f"LIMIT {placeholder}"
+    )
+    try:
+        rows = _db_manager.execute_query(query, (start_date, int(min_rows), int(limit)))
+    except Exception:
+        logger.debug("查询近端行情股票失败", exc_info=True)
+        return []
+    symbols: List[str] = []
+    for row in rows or []:
+        symbol = row.get("symbol") if isinstance(row, dict) else row[0]
+        if symbol and str(symbol).endswith((".SH", ".SZ")):
+            symbols.append(symbol)
+    return symbols
+
+
+def _fetch_quick_picks(
+    top_n: int,
+    symbol_limit: int,
+    *,
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    if top_n <= 0:
+        return []
+    symbol_limit = max(symbol_limit, top_n * 3)
+    cache_key = _auto_pick_cache_key(top_n, symbol_limit)
+    now = _now()
+    if not force_refresh and _AUTO_PICK_CACHE_TTL > 0:
+        cached = _AUTO_PICK_CACHE.get(cache_key)
+        if cached and cached.get("expires_at") and cached["expires_at"] > now:
+            picks_cached = cached.get("picks") or []
+            return [dict(item) for item in picks_cached[:top_n]]
+
+    selector = _get_auto_selector()
+    picks: List[Dict[str, Any]] = []
+
+    with _SELECTOR_LOCK:
+        ready = _ensure_selector_ready(selector)
+        try:
+            candidates_raw = _db_manager.list_symbols(
+                markets=["SH", "SZ"],
+                limit=max(symbol_limit, top_n * 6),
+            )
+        except Exception as exc:
+            logger.warning("获取候选股票失败: %s", exc)
+            candidates_raw = []
+        candidate_symbols = [
+            row.get("symbol")
+            for row in candidates_raw
+            if row.get("symbol") and str(row.get("symbol")).endswith((".SH", ".SZ"))
+        ]
+        recent_symbols: List[str] = []
+        if candidate_symbols:
+            recent_symbols = _symbols_with_recent_data(
+                max(symbol_limit, top_n * 6),
+                lookback_days=_FALLBACK_LOOKBACK_DAYS,
+                min_rows=max(5, _FALLBACK_MIN_ROWS),
+            )
+            if recent_symbols:
+                recent_set = set(recent_symbols)
+                candidate_symbols = [sym for sym in candidate_symbols if sym in recent_set]
+            candidate_symbols = candidate_symbols[: max(symbol_limit, top_n * 6)]
+        if ready and candidate_symbols:
+            try:
+                picks = selector.predict_top_n(candidate_symbols, max(top_n * 3, top_n))
+            except Exception as exc:
+                logger.warning("智能选股预测失败，将使用备用逻辑: %s", exc)
+                picks = []
+        if not picks:
+            fallback = selector._fallback_stock_picks(max(top_n, 30))
+            if isinstance(fallback, dict):
+                picks = fallback.get("data", {}).get("picks", []) or []
+
+    if picks and _AUTO_PICK_CACHE_TTL > 0:
+        _AUTO_PICK_CACHE[cache_key] = {
+            "picks": [dict(item) for item in picks[:top_n]],
+            "expires_at": now + timedelta(seconds=_AUTO_PICK_CACHE_TTL),
+        }
+    return [dict(item) for item in picks[:top_n]]
+
+
+def _build_holdings_from_picks(
+    picks: List[Dict[str, Any]],
+    *,
+    initial_capital: float,
+    pipeline: PortfolioPipeline,
+) -> Tuple[List[Holding], List[Dict[str, Any]]]:
+    if not picks:
+        return [], []
+    filtered: List[Tuple[str, float, Dict[str, Any]]] = []
+    for pick in picks:
+        symbol = pick.get("symbol")
+        if not symbol:
+            continue
+        price = pick.get("last_close") or pick.get("close") or pick.get("price")
+        try:
+            price = float(price or 0.0)
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            price = _get_latest_price(symbol)
+        if price <= 0:
+            continue
+        filtered.append((symbol, price, pick))
+    if not filtered:
+        return [], []
+
+    max_count = min(len(filtered), len(picks))
+    target_weight = 1.0 / max_count
+    commission = getattr(pipeline, "commission_rate", 0.0)
+    holdings: List[Holding] = []
+    holdings_meta: List[Dict[str, Any]] = []
+
+    for symbol, price, pick in filtered[:max_count]:
+        alloc = initial_capital * target_weight
+        shares = (alloc * (1 - commission)) / price if price > 0 else 0.0
+        holdings.append(Holding(symbol=symbol, weight=target_weight, shares=shares))
+        meta = {
+            "symbol": symbol,
+            "weight": target_weight,
+            "shares": shares,
+            "price": price,
+            "probability": pick.get("prob_up_30d") or pick.get("probability"),
+            "expected_return": pick.get("expected_return_30d"),
+            "score": pick.get("score"),
+            "sentiment": pick.get("sentiment"),
+        }
+        holdings_meta.append(meta)
+
+    return holdings, holdings_meta
+
+
+def _build_holdings_from_recent_prices(
+    symbols: List[str],
+    *,
+    initial_capital: float,
+    pipeline: PortfolioPipeline,
+) -> Tuple[List[Holding], List[Dict[str, Any]]]:
+    """基于本地最新价格构建等权持仓，作为模型兜底方案。"""
+    if not symbols:
+        return [], []
+    price_df = _db_manager.get_last_n_bars(symbols=symbols, n=1)
+    if price_df is None or price_df.empty:
+        return [], []
+    valid_quotes: List[Tuple[str, float]] = []
+    for _, row in price_df.iterrows():
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        price = row.get("close") or row.get("Close")
+        try:
+            price = float(price)
+        except Exception:
+            price = 0.0
+        if price and price > 0:
+            valid_quotes.append((symbol, price))
+    if not valid_quotes:
+        return [], []
+    max_count = min(len(valid_quotes), len(symbols))
+    target_weight = 1.0 / max_count if max_count else 0.0
+    commission = getattr(pipeline, "commission_rate", 0.0)
+    holdings: List[Holding] = []
+    metas: List[Dict[str, Any]] = []
+    for symbol, price in valid_quotes[:max_count]:
+        alloc = initial_capital * target_weight
+        shares = (alloc * (1 - commission)) / price if price > 0 else 0.0
+        holdings.append(Holding(symbol=symbol, weight=target_weight, shares=shares))
+        metas.append(
+            {
+                "symbol": symbol,
+                "weight": target_weight,
+                "shares": shares,
+                "price": price,
+                "probability": None,
+                "expected_return": None,
+                "score": None,
+                "sentiment": None,
+            }
+        )
+    return holdings, metas
 
 
 def _persist_portfolio(
@@ -596,7 +906,7 @@ def _build_holding_snapshots(
     for h in holdings:
         symbol = h.symbol
         code = _strip_suffix(symbol)
-        name = _lookup_stock_name(code)
+        name = _resolve_stock_name(symbol, code)
         alloc = initial_capital * h.weight
         cost_price = (alloc * (1 - commission)) / h.shares if h.shares > 0 else 0.0
         snapshots.append(
@@ -622,7 +932,7 @@ def _load_snapshots_from_rows(holdings_rows: List[Dict[str, Any]]) -> List[Portf
             PortfolioHoldingSnapshot(
                 symbol=symbol,
                 code=code,
-                name=row.get("name") or _lookup_stock_name(code),
+                name=row.get("name") or _resolve_stock_name(symbol, code),
                 weight=float(row.get("weight") or 0.0),
                 shares=float(row.get("shares") or 0.0),
                 cost_price=float(row.get("cost_price") or 0.0),
@@ -695,6 +1005,18 @@ def _calculate_portfolio_valuation(
     nav_value = nav_total / initial_capital if initial_capital else 0.0
     total_return_pct = (nav_total - initial_capital) / initial_capital if initial_capital else 0.0
     daily_return_pct = (nav_total - prev_total) / prev_total if prev_available and prev_total > 0 else 0.0
+    as_of_date = as_of.date()
+    stale_trading_day = False
+    if symbols:
+        if last_trade is None:
+            stale_trading_day = True
+        else:
+            last_trade_date = last_trade.date()
+            stale_trading_day = last_trade_date < as_of_date
+    if stale_trading_day:
+        daily_return_pct = 0.0
+        for quote in quotes.values():
+            quote.previous_price = None
     valuation = PortfolioValuation(
         nav_total=nav_total,
         nav_value=nav_value,
@@ -816,18 +1138,77 @@ def get_portfolio_detail(pid: int, as_of: Optional[datetime] = None, refresh: bo
 def create_portfolio_auto(name: str, top_n: int = 20, initial_capital: float = 1_000_000.0) -> Dict[str, Any]:
     pipeline = _get_pipeline(initial_capital, top_n)
     as_of_dt = _now()
-    picks: List[PickResult] = pipeline.pick_stocks(top_n=top_n)
-    holdings_raw = pipeline._equal_weight_holdings(  # type: ignore[attr-defined]
-        picks,
-        as_of_date=as_of_dt,
-        capital=initial_capital,
-    )
+    use_selector = os.getenv("PORTFOLIO_AUTO_USE_SELECTOR", "1").lower() not in {"0", "false", "off"}
+    symbol_limit = int(os.getenv("PORTFOLIO_AUTO_SYMBOL_LIMIT", str(_AUTO_SYMBOL_LIMIT_DEFAULT)) or _AUTO_SYMBOL_LIMIT_DEFAULT)
+
+    holdings_raw: List[Holding] = []
+    holdings_meta: List[Dict[str, Any]] = []
+    used_selector = False
+    used_price_fallback = False
+
+    if use_selector:
+        try:
+            picks_meta = _fetch_quick_picks(top_n, symbol_limit, force_refresh=False)
+            holdings_raw, holdings_meta = _build_holdings_from_picks(
+                picks_meta,
+                initial_capital=initial_capital,
+                pipeline=pipeline,
+            )
+            used_selector = bool(holdings_raw)
+            if not holdings_raw:
+                logger.warning("快速选股未返回有效持仓，回退至 PortfolioPipeline")
+        except Exception:
+            logger.exception("快速选股建仓失败，回退至 PortfolioPipeline")
+            holdings_raw = []
+            holdings_meta = []
+
+    if not holdings_raw:
+        recent_symbols = _symbols_with_recent_data(
+            limit=max(top_n * 3, symbol_limit),
+            lookback_days=_FALLBACK_LOOKBACK_DAYS,
+            min_rows=max(5, _FALLBACK_MIN_ROWS),
+        )
+        holdings_raw, holdings_meta = _build_holdings_from_recent_prices(
+            recent_symbols,
+            initial_capital=initial_capital,
+            pipeline=pipeline,
+        )
+        used_price_fallback = bool(holdings_raw)
+        if used_price_fallback:
+            logger.info("使用本地等权兜底方案生成组合持仓（symbols=%s）", len(holdings_raw))
+
+    if not holdings_raw:
+        picks: List[PickResult] = pipeline.pick_stocks(top_n=top_n)
+        holdings_raw = pipeline._equal_weight_holdings(  # type: ignore[attr-defined]
+            picks,
+            as_of_date=as_of_dt,
+            capital=initial_capital,
+        )
+        for holding in holdings_raw:
+            price = _get_latest_price(holding.symbol)
+            holdings_meta.append(
+                {
+                    "symbol": holding.symbol,
+                    "weight": holding.weight,
+                    "shares": holding.shares,
+                    "price": price if price > 0 else None,
+                    "probability": None,
+                    "expected_return": None,
+                    "score": None,
+                    "sentiment": None,
+                }
+            )
+
+    if not holdings_raw:
+        raise RuntimeError("无法生成组合持仓，请稍后重试")
+
     snapshots = _build_holding_snapshots(
         holdings_raw,
         pipeline=pipeline,
         initial_capital=initial_capital,
         as_of=as_of_dt,
     )
+    meta_map = {meta["symbol"]: meta for meta in holdings_meta}
     detail = PortfolioDetail(
         id=-1,
         name=name,
@@ -837,9 +1218,21 @@ def create_portfolio_auto(name: str, top_n: int = 20, initial_capital: float = 1
         holdings_count=len(snapshots),
         benchmark="沪深300",
         risk_level=_infer_risk_level(top_n),
-        strategy_tags=["智能选股", f"Top{top_n}", "等权分散"],
+        strategy_tags=[
+            "智能选股",
+            f"Top{top_n}",
+            "快速建仓" if used_selector else ("本地等权" if used_price_fallback else "等权分散"),
+        ],
         holdings=snapshots,
-        notes="智能推荐自动建仓",
+        notes=(
+            "智能推荐自动建仓（快速选股模式）"
+            if used_selector
+            else (
+                "数据库等权兜底建仓"
+                if used_price_fallback
+                else "智能推荐自动建仓"
+            )
+        ),
         rebalance_history=[
             {
                 "timestamp": as_of_dt.isoformat(),
@@ -850,6 +1243,13 @@ def create_portfolio_auto(name: str, top_n: int = 20, initial_capital: float = 1
                         "symbol": h.symbol,
                         "weight": round(h.weight, 6),
                         "shares": round(h.shares, 4),
+                        "price": round(meta_map.get(h.symbol, {}).get("price", 0.0), 4)
+                        if meta_map.get(h.symbol, {}).get("price")
+                        else None,
+                        "probability": meta_map.get(h.symbol, {}).get("probability"),
+                        "expected_return": meta_map.get(h.symbol, {}).get("expected_return"),
+                        "score": meta_map.get(h.symbol, {}).get("score"),
+                        "sentiment": meta_map.get(h.symbol, {}).get("sentiment"),
                     }
                     for h in snapshots
                 ],
@@ -859,6 +1259,17 @@ def create_portfolio_auto(name: str, top_n: int = 20, initial_capital: float = 1
     valuation, quotes, nav_history = _calculate_portfolio_valuation(detail, as_of=as_of_dt)
     portfolio_id = _persist_portfolio(detail, valuation, quotes, nav_history)
     return get_portfolio_detail(portfolio_id, as_of=as_of_dt, refresh=False) or {}
+
+
+def delete_portfolio(pid: int) -> bool:
+    """删除指定组合，返回是否删除成功。"""
+    select_query = f"SELECT id FROM portfolios WHERE id = {_placeholder()}"
+    rows = _db_manager.execute_query(select_query, (pid,))
+    if not rows:
+        return False
+    delete_query = f"DELETE FROM portfolios WHERE id = {_placeholder()}"
+    _db_manager.execute_update(delete_query, (pid,))
+    return True
 
 
 def create_portfolio_manual_stub(*args, **kwargs):

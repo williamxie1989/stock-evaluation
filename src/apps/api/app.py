@@ -33,11 +33,21 @@ import logging
 import time
 import asyncio
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 
 # 配置日志
 logger = logging.getLogger(__name__)
 logging.getLogger('src.data.field_mapping').setLevel(logging.WARNING)
 logging.getLogger('src.ml.features.enhanced_features').setLevel(logging.WARNING)
+
+_APP_TZ_NAME = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+try:
+    _APP_TZ = ZoneInfo(_APP_TZ_NAME)
+except Exception:
+    logger.warning("APP_TIMEZONE '%s' 无效，使用 UTC", _APP_TZ_NAME)
+    _APP_TZ = ZoneInfo("UTC")
+def _local_now() -> datetime:
+    return datetime.now(_APP_TZ).replace(tzinfo=None)
 
 cache_prefetch_scheduler: CachePrefetchScheduler | None = None
 
@@ -227,6 +237,11 @@ def _to_a_symbol_with_suffix(code: Optional[str]) -> Optional[str]:
 
 @app.get("/")
 async def read_root():
+    return FileResponse("static/index.html")
+
+@app.get("/index.html")
+async def read_index_html():
+    """兼容直接访问 index.html"""
     return FileResponse("static/index.html")
 
 @app.get("/analysis")
@@ -530,26 +545,48 @@ async def health_check():
 # ---------- Portfolios CRUD ----------
 from fastapi.responses import JSONResponse
 from src.services.portfolio.portfolio_management_service import (
-    list_portfolios, create_portfolio_auto, get_portfolio_detail,
+    list_portfolios,
+    create_portfolio_auto,
+    get_portfolio_detail,
+    delete_portfolio,
 )
 
 
 def _parse_as_of(as_of: str | None) -> datetime:
     if not as_of:
-        return datetime.utcnow()
+        return _local_now()
     try:
         return datetime.fromisoformat(as_of)
     except ValueError:
         try:
             return datetime.strptime(as_of, "%Y-%m-%d")
         except ValueError:
-            return datetime.utcnow()
+            return _local_now()
+
+
+def _parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 @app.get("/api/portfolios")
-def api_list_portfolios(as_of: str | None = None):
+def api_list_portfolios(as_of: str | None = None, refresh: str | None = None):
     as_of_dt = _parse_as_of(as_of)
+    refresh_flag = _parse_bool(refresh, default=False)
     portfolios = list_portfolios(as_of=as_of_dt)
+    if refresh_flag:
+        for item in portfolios:
+            try:
+                get_portfolio_detail(item["id"], as_of=as_of_dt, refresh=True)
+            except Exception:
+                logger.warning("刷新组合 %s 失败，返回旧数据", item["id"], exc_info=True)
+        portfolios = list_portfolios(as_of=as_of_dt)
     return {
         "success": True,
         "generated_at": as_of_dt.isoformat(),
@@ -577,9 +614,10 @@ def api_create_portfolio(request: dict):
         return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
 @app.get("/api/portfolios/{pid}")
-def api_get_portfolio(pid: int, as_of: str | None = None):
+def api_get_portfolio(pid: int, as_of: str | None = None, refresh: str | None = None):
     as_of_dt = _parse_as_of(as_of)
-    data = get_portfolio_detail(pid, as_of=as_of_dt)
+    refresh_flag = _parse_bool(refresh, default=True)
+    data = get_portfolio_detail(pid, as_of=as_of_dt, refresh=refresh_flag)
     if not data:
         return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
     return {
@@ -588,10 +626,22 @@ def api_get_portfolio(pid: int, as_of: str | None = None):
         "portfolio": data,
     }
 
+@app.delete("/api/portfolios/{pid}")
+def api_delete_portfolio(pid: int):
+    try:
+        removed = delete_portfolio(pid)
+    except Exception as exc:
+        logger.exception("删除组合失败")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
+    if not removed:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
+    return {"success": True}
+
 @app.get("/api/portfolios/{pid}/holdings")
-def api_get_portfolio_holdings(pid: int, as_of: str | None = None):
+def api_get_portfolio_holdings(pid: int, as_of: str | None = None, refresh: str | None = None):
     as_of_dt = _parse_as_of(as_of)
-    data = get_portfolio_detail(pid, as_of=as_of_dt)
+    refresh_flag = _parse_bool(refresh, default=False)
+    data = get_portfolio_detail(pid, as_of=as_of_dt, refresh=refresh_flag)
     if not data:
         return JSONResponse(status_code=404, content={"success": False, "error": "Portfolio not found"})
     holdings = data.get("holdings", [])

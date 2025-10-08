@@ -61,13 +61,14 @@ class CachePrefetchScheduler:
         self.symbols = symbols
         self.lookback_days = lookback_days
         self.interval_minutes = interval_minutes
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = None
         self._job = None
 
         if AsyncIOScheduler is None or IntervalTrigger is None:
             logger.warning("APScheduler 未安装，缓存预取功能被禁用。请运行 `pip install apscheduler` 启用该特性。")
-            self.scheduler = None
-        elif not self.symbols:
+        else:
+            self.scheduler = AsyncIOScheduler()
+        if self.scheduler is not None and not self.symbols:
             logger.warning("CachePrefetchScheduler 初始化时未检测到待预取的股票代码列表，预取任务将不会运行。")
 
     async def _prefetch_job(self):

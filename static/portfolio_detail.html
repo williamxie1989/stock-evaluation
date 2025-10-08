@@ -254,14 +254,45 @@ function renderNavChart(history = []) {
         navChartInstance.destroy();
         navChartInstance = null;
     }
-    if (!history || history.length < 2) {
+    const cleaned = [];
+    const seenDates = new Set();
+    (history || []).forEach(item => {
+        const date = item.date;
+        const value = Number(item.nav_value);
+        if (!date || seenDates.has(date) || !Number.isFinite(value)) {
+            return;
+        }
+        seenDates.add(date);
+        cleaned.push({ date, value });
+    });
+    const limited = cleaned.slice(-180);
+    if (!limited || limited.length < 2) {
         navChartEmpty.classList.remove('hidden');
         navChartRange.textContent = '';
         return;
     }
     navChartEmpty.classList.add('hidden');
-    const labels = history.map(item => item.date);
-    const data = history.map(item => item.nav_value);
+    const labels = limited.map(item => item.date);
+    const numericData = limited.map(item => item.value);
+    const finiteValues = numericData.filter(value => Number.isFinite(value));
+    if (finiteValues.length === 0) {
+        navChartEmpty.classList.remove('hidden');
+        navChartRange.textContent = '';
+        return;
+    }
+    const minVal = Math.min(...finiteValues);
+    const maxVal = Math.max(...finiteValues);
+    let padding = (maxVal - minVal) * 0.05;
+    if (!Number.isFinite(padding) || padding === 0) {
+        padding = Math.max(minVal * 0.02, 0.01);
+    }
+    let axisMin = Math.max(0, minVal - padding);
+    let axisMax = maxVal + padding;
+    if (axisMax <= axisMin) {
+        const center = (minVal + maxVal) / 2 || minVal || 1;
+        axisMin = Math.max(0, center - 0.02);
+        axisMax = center + 0.02;
+    }
     navChartRange.textContent = `${labels[0]} ~ ${labels[labels.length - 1]}`;
     navChartInstance = new Chart(navChartCanvas, {
         type: 'line',
@@ -270,7 +301,7 @@ function renderNavChart(history = []) {
             datasets: [
                 {
                     label: '组合净值',
-                    data,
+                    data: numericData,
                     borderColor: '#2563eb',
                     backgroundColor: 'rgba(37, 99, 235, 0.12)',
                     tension: 0.25,
@@ -299,9 +330,15 @@ function renderNavChart(history = []) {
                     ticks: { maxTicksLimit: 6 }
                 },
                 y: {
+                    beginAtZero: false,
+                    min: axisMin,
+                    max: axisMax,
                     ticks: {
+                        maxTicksLimit: 6,
                         callback(value) {
-                            return Number(value).toFixed(2);
+                            const num = Number(value);
+                            if (!Number.isFinite(num)) return value;
+                            return num.toFixed(2);
                         }
                     }
                 }
