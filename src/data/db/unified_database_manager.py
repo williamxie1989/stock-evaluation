@@ -771,7 +771,8 @@ class UnifiedDatabaseManager:
         
         logger.info(f"数据库切换完成，新类型: {self.db_type}")
     
-    async def get_stock_data(self, symbol: str, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+    async def get_stock_data(self, symbol: str, start_date: datetime, end_date: datetime, 
+                           fields: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
         """
         获取股票历史数据
         
@@ -779,22 +780,35 @@ class UnifiedDatabaseManager:
             symbol: 股票代码
             start_date: 开始日期
             end_date: 结束日期
+            fields: 要查询的字段列表，如果为None则查询所有字段
             
         Returns:
             股票历史数据DataFrame
         """
         try:
+            # 构建查询字段
+            if fields is None:
+                # 默认查询所有字段
+                select_fields = "symbol, date, open, high, low, close, volume, amount, source, " \
+                              "open_qfq, high_qfq, low_qfq, close_qfq, " \
+                              "open_hfq, high_hfq, low_hfq, close_hfq"
+            else:
+                # 确保包含必要的字段
+                required_fields = ['symbol', 'date']
+                select_fields_list = list(set(required_fields + list(fields)))
+                select_fields = ", ".join(select_fields_list)
+            
             # 根据数据库类型选择合适的参数占位符
             if self.db_type == 'mysql':
-                query = """
-                    SELECT symbol, date, open, high, low, close, volume, amount, source
+                query = f"""
+                    SELECT {select_fields}
                     FROM prices_daily 
                     WHERE symbol = %s AND date >= %s AND date <= %s
                     ORDER BY date ASC
                 """
             else:  # sqlite
-                query = """
-                    SELECT symbol, date, open, high, low, close, volume, amount, source
+                query = f"""
+                    SELECT {select_fields}
                     FROM prices_daily 
                     WHERE symbol = ? AND date >= ? AND date <= ?
                     ORDER BY date ASC

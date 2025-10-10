@@ -67,16 +67,48 @@ class EnhancedFeatureGenerator:
         try:
             logger.info("开始生成增强特征...")
             
+            # 标准化列名为小写，并将复权列重命名为标准列名
+            price_data = price_data.copy()
+            price_data.columns = [str(c).lower() for c in price_data.columns]
+            rename_map: Dict[str, str] = {}
+            fallback_candidates = {
+                "open": ["open", "open_hfq", "open_qfq"],
+                "close": ["close", "close_hfq", "close_qfq"],
+                "high": ["high", "high_hfq", "high_qfq"],
+                "low": ["low", "low_hfq", "low_qfq"],
+            }
+            for std_col, candidates in fallback_candidates.items():
+                if std_col not in price_data.columns:
+                    for cand in candidates:
+                        if cand in price_data.columns:
+                            rename_map[cand] = std_col
+                            break
+            if rename_map:
+                price_data = price_data.rename(columns=rename_map)
+
+            # 处理重复列名：为重复列追加序号后缀，避免后续按列访问得到DataFrame而非Series
+            if price_data.columns.duplicated().any():
+                new_cols = []
+                seen: Dict[str, int] = {}
+                for c in price_data.columns:
+                    if c in seen:
+                        seen[c] += 1
+                        new_cols.append(f"{c}__{seen[c]}")
+                    else:
+                        seen[c] = 0
+                        new_cols.append(c)
+                price_data.columns = new_cols
+
             # 降低最少样本要求，支持一个月数据（约20根K线）
             if len(price_data) < 20:
                 logger.warning("数据不足，无法生成完整的增强特征")
                 return pd.DataFrame()
             
             # -------- 新增：统一数值列类型，避免 decimal.Decimal 与 float 运算冲突 --------
-            price_data = price_data.copy()
             for col in price_data.columns:
-                # 仅尝试将对象或非数值列转换为数值
-                if price_data[col].dtype == 'object' or not np.issubdtype(price_data[col].dtype, np.number):
+                # 使用 dtypes 显式按列类型判断，避免重复列导致的 DataFrame 选择
+                col_dtype = price_data.dtypes[col]
+                if col_dtype == 'object' or not np.issubdtype(col_dtype, np.number):
                     price_data[col] = pd.to_numeric(price_data[col], errors='coerce')
             # 再次确保所有数值列为 float 类型
             numeric_cols = price_data.select_dtypes(include=[np.number]).columns

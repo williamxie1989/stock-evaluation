@@ -38,6 +38,8 @@ class DataAccessConfig:
     max_sync_retries: int = 3
     enable_data_validation: bool = True
     preferred_data_sources: List[str] = None
+    # 价格调整模式：origin(未复权), qfq(前复权), hfq(后复权)
+    default_adjust_mode: str = "origin"
     
     def __post_init__(self):
         # 如果没有显式传入 preferred_data_sources，则尝试读取环境变量覆盖，否则使用默认值
@@ -128,6 +130,7 @@ class UnifiedDataAccessLayer:
             fields_key: Tuple[str, ...],
             ttl_bucket: int,
             auto_sync_flag: bool,
+            adjust_mode: str = None,
         ) -> CacheFetchResult:
             # 新线程执行时没有事件循环，需要自行创建
             start_dt = datetime.strptime(start_str, "%Y-%m-%d")
@@ -142,6 +145,7 @@ class UnifiedDataAccessLayer:
                         end_dt,
                         fields_key,
                         auto_sync_flag,
+                        adjust_mode,
                     )
                 )
             finally:
@@ -198,6 +202,65 @@ class UnifiedDataAccessLayer:
         if not fields:
             return tuple()
         return tuple(sorted({field for field in fields if field}))
+    
+    @staticmethod
+    def _get_price_fields_mapping(adjust_mode: str = "origin") -> Dict[str, str]:
+        """
+        获取价格字段映射
+        
+        Args:
+            adjust_mode: 调整模式 origin/qfq/hfq
+            
+        Returns:
+            字段映射字典
+        """
+        if adjust_mode == "qfq":
+            return {
+                "open": "open_qfq",
+                "close": "close_qfq", 
+                "high": "high_qfq",
+                "low": "low_qfq"
+            }
+        elif adjust_mode == "hfq":
+            return {
+                "open": "open_hfq",
+                "close": "close_hfq",
+                "high": "high_hfq", 
+                "low": "low_hfq"
+            }
+        else:  # origin
+            return {
+                "open": "open",
+                "close": "close",
+                "high": "high", 
+                "low": "low"
+            }
+    
+    @staticmethod
+    def _map_price_fields(fields: Optional[Sequence[str]], adjust_mode: str = "origin") -> List[str]:
+        """
+        将标准价格字段映射为指定调整模式的字段
+        
+        Args:
+            fields: 原始字段列表
+            adjust_mode: 调整模式 origin/qfq/hfq
+            
+        Returns:
+            映射后的字段列表
+        """
+        if not fields:
+            return []
+            
+        price_mapping = UnifiedDataAccessLayer._get_price_fields_mapping(adjust_mode)
+        mapped_fields = []
+        
+        for field in fields:
+            if field in price_mapping:
+                mapped_fields.append(price_mapping[field])
+            else:
+                mapped_fields.append(field)
+                
+        return mapped_fields
     
     def initialize_data_sources(self, validate_sources: bool = True) -> Dict[str, Any]:
         """
@@ -425,12 +488,17 @@ class UnifiedDataAccessLayer:
         fields: Optional[Sequence[str]] = None,
         force_refresh: bool = False,
         auto_sync: bool = None,
+        adjust_mode: str = None,
     ) -> Optional[pd.DataFrame]:
         """同步获取股票历史数据，包装异步接口并支持字段选择"""
         try:
             # 标准化股票代码
             standardized_symbol = standardize_symbol(symbol)
             logger.info(f"Standardized symbol: {symbol} -> {standardized_symbol}")
+            
+            # 处理价格字段映射
+            effective_adjust_mode = adjust_mode or self.config.default_adjust_mode
+            mapped_fields = self._map_price_fields(fields, effective_adjust_mode)
             
             import asyncio
             import threading
@@ -445,7 +513,7 @@ class UnifiedDataAccessLayer:
                         standardized_symbol,
                         start_date,
                         end_date,
-                        fields=fields,
+                        fields=mapped_fields,
                         force_refresh=force_refresh,
                         auto_sync=auto_sync,
                     )
@@ -472,7 +540,7 @@ class UnifiedDataAccessLayer:
                 standardized_symbol,
                 start_date,
                 end_date,
-                fields=fields,
+                fields=mapped_fields,
                 force_refresh=force_refresh,
                 auto_sync=auto_sync,
             )
@@ -1292,6 +1360,7 @@ class UnifiedDataAccessLayer:
         fields: Optional[Sequence[str]] = None,
         force_refresh: bool = False,
         auto_sync: bool | None = None,
+        adjust_mode: str = None,
     ) -> "pd.DataFrame | None":  # noqa: D401
         """异步获取历史行情数据，带多层缓存与性能统计"""
 
@@ -1305,7 +1374,12 @@ class UnifiedDataAccessLayer:
             end_dt = end_date
 
         standardized_symbol = standardize_symbol(symbol)
-        fields_tuple = self._fields_to_tuple(fields)
+        
+        # 处理价格字段映射
+        effective_adjust_mode = adjust_mode or self.config.default_adjust_mode
+        mapped_fields = self._map_price_fields(fields, effective_adjust_mode)
+        fields_tuple = self._fields_to_tuple(mapped_fields)
+        
         auto_sync_flag = self.config.auto_sync if auto_sync is None else bool(auto_sync)
 
         perf_start = time.perf_counter()
@@ -1326,6 +1400,7 @@ class UnifiedDataAccessLayer:
                 fields_tuple,
                 ttl_bucket,
                 auto_sync_flag,
+                effective_adjust_mode,
             )
             cache_info_after = self._l0_cached_loader.cache_info()
             l0_hit = cache_info_after.hits > cache_info_before.hits
@@ -1341,6 +1416,7 @@ class UnifiedDataAccessLayer:
                 end_dt,
                 fields_tuple,
                 auto_sync_flag,
+                effective_adjust_mode,
             )
             cache_source = result.source
             if self.config.use_cache:
@@ -1349,6 +1425,15 @@ class UnifiedDataAccessLayer:
                 self._l0_cached_loader.cache_clear()
 
         df = result.dataframe
+        
+        # 如果使用了复权模式，需要将复权字段重命名为标准字段名
+        if effective_adjust_mode in ["qfq", "hfq"] and df is not None and not df.empty:
+            price_mapping = self._get_price_fields_mapping(effective_adjust_mode)
+            # 创建反向映射：从复权字段名到标准字段名
+            reverse_mapping = {v: k for k, v in price_mapping.items()}
+            # 重命名列
+            df = df.rename(columns=reverse_mapping)
+        
         self._record_performance(cache_source, time.perf_counter() - perf_start)
         return df
 
@@ -1359,6 +1444,7 @@ class UnifiedDataAccessLayer:
         end_dt: datetime,
         fields: Tuple[str, ...],
         auto_sync_flag: bool,
+        adjust_mode: str = None,
     ) -> CacheFetchResult:
         """实际加载数据的实现，供 L0 缓存包装器调用"""
 
@@ -1379,9 +1465,9 @@ class UnifiedDataAccessLayer:
 
         if df is None:
             try:
-                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
+                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
             except AttributeError:
-                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
+                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
 
             if df is None:
                 df = pd.DataFrame()
@@ -1411,6 +1497,14 @@ class UnifiedDataAccessLayer:
                 df = df.copy()
         else:
             df = df.copy()
+
+        # 如果使用了复权模式，需要将复权字段重命名为标准字段名
+        if adjust_mode in ["qfq", "hfq"] and df is not None and not df.empty:
+            price_mapping = self._get_price_fields_mapping(adjust_mode)
+            # 创建反向映射：从复权字段名到标准字段名
+            reverse_mapping = {v: k for k, v in price_mapping.items()}
+            # 重命名列
+            df = df.rename(columns=reverse_mapping)
 
         if self.config.use_cache and not df.empty:
             self._save_to_l1_cache(cache_key, df)

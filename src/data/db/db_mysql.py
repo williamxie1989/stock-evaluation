@@ -143,6 +143,48 @@ class MySQLDatabaseManager:
                     INDEX idx_prices_daily_volume (volume)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
+
+            # 为旧库增加复权列（若不存在）
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN open_qfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("open_qfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN high_qfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("high_qfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN low_qfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("low_qfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN close_qfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("close_qfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN open_hfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("open_hfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN high_hfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("high_hfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN low_hfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("low_hfq 列可能已存在或添加失败: %s", e)
+            try:
+                cursor.execute("ALTER TABLE prices_daily ADD COLUMN close_hfq DECIMAL(12,4) NULL")
+            except Error as e:
+                if e.errno != 1060:
+                    self.logger.debug("close_hfq 列可能已存在或添加失败: %s", e)
             # 若历史表缺少 updated_at 列，则补充
             try:
                 cursor.execute("""

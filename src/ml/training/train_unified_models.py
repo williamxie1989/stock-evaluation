@@ -316,7 +316,9 @@ class UnifiedModelTrainer:
         collected_count = 0  # 成功收集的股票数量
         insufficient_symbols = []  # 本地数据不足，稍后再尝试 auto_sync 补拉的股票列表
 
-        fetch_fields = ["open", "high", "low", "close", "volume", "turnover", "amount"]
+        fetch_fields = ["open", "high", "low", "close", "volume", "amount"]
+        # 模型训练使用后复权数据
+        adjust_mode = "hfq"
 
         def _normalize_stock_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             """确保数据包含标准的 date 列并完成基础清洗。"""
@@ -332,7 +334,7 @@ class UnifiedModelTrainer:
                     date_col = name
                     break
             if date_col is None:
-                known_value_cols = {'open', 'high', 'low', 'close', 'volume', 'turnover', 'amount'}
+                known_value_cols = {'open', 'high', 'low', 'close', 'volume', 'amount'}
                 miscellaneous = [c for c in df.columns if c not in known_value_cols and c != 'symbol']
                 if miscellaneous:
                     date_col = miscellaneous[0]
@@ -358,13 +360,14 @@ class UnifiedModelTrainer:
                 logger.info(f"已成功收集 {collected_count} 只股票，当前处理 {symbol}")
 
             try:
-                # 先只用本地数据，auto_sync=False
+                # 先只用本地数据，auto_sync=False，使用后复权数据
                 stock_data = self.data_access.get_stock_data(
                     symbol,
                     start_date,
                     end_date,
                     fields=fetch_fields,
                     auto_sync=False,
+                    adjust_mode=adjust_mode,
                 )
 
                 # 判定数据量是否足够
@@ -381,6 +384,27 @@ class UnifiedModelTrainer:
                     logger.warning(f"{symbol} 数据列缺失: {normal_err}")
                     failed_stocks.append(symbol)
                     continue
+
+                # 标准化列名为小写，并将复权列重命名为标准列名，确保存在 close/open/high/low
+                try:
+                    stock_data = stock_data.copy()
+                    stock_data.columns = [str(c).lower() for c in stock_data.columns]
+                    rename_map = {}
+                    for std_col, candidates in {
+                        "open": ["open", "open_hfq", "open_qfq"],
+                        "close": ["close", "close_hfq", "close_qfq"],
+                        "high": ["high", "high_hfq", "high_qfq"],
+                        "low": ["low", "low_hfq", "low_qfq"],
+                    }.items():
+                        if std_col not in stock_data.columns:
+                            for cand in candidates:
+                                if cand in stock_data.columns:
+                                    rename_map[cand] = std_col
+                                    break
+                    if rename_map:
+                        stock_data = stock_data.rename(columns=rename_map)
+                except Exception:
+                    pass
 
                 features_df = self.feature_generator.generate_features(stock_data)
                 if features_df.empty:
@@ -460,6 +484,7 @@ class UnifiedModelTrainer:
                         end_date,
                         fields=fetch_fields,
                         auto_sync=True,
+                        adjust_mode=adjust_mode,
                     )
                     if stock_data is None or stock_data.empty or len(stock_data) < prediction_period + 15:
                         continue

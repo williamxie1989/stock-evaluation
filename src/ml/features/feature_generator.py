@@ -21,6 +21,24 @@ class FeatureGenerator:
     def generate_technical_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
         """生成基础技术指标特征"""
         try:
+            # 标准化列名为小写，并将复权列重命名为标准列名
+            price_data = price_data.copy()
+            price_data.columns = [str(c).lower() for c in price_data.columns]
+            rename_map = {}
+            for std_col, candidates in {
+                "open": ["open", "open_hfq", "open_qfq"],
+                "close": ["close", "close_hfq", "close_qfq"],
+                "high": ["high", "high_hfq", "high_qfq"],
+                "low": ["low", "low_hfq", "low_qfq"],
+            }.items():
+                if std_col not in price_data.columns:
+                    for cand in candidates:
+                        if cand in price_data.columns:
+                            rename_map[cand] = std_col
+                            break
+            if rename_map:
+                price_data = price_data.rename(columns=rename_map)
+
             if len(price_data) < 20:  # 降低要求到20天
                 logger.warning("数据不足，无法生成完整的技术指标特征")
                 return pd.DataFrame()
@@ -71,6 +89,24 @@ class FeatureGenerator:
     def generate_momentum_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
         """生成动量特征"""
         try:
+            # 标准化列名并重命名
+            price_data = price_data.copy()
+            price_data.columns = [str(c).lower() for c in price_data.columns]
+            rename_map = {}
+            for std_col, candidates in {
+                "open": ["open", "open_hfq", "open_qfq"],
+                "close": ["close", "close_hfq", "close_qfq"],
+                "high": ["high", "high_hfq", "high_qfq"],
+                "low": ["low", "low_hfq", "low_qfq"],
+            }.items():
+                if std_col not in price_data.columns:
+                    for cand in candidates:
+                        if cand in price_data.columns:
+                            rename_map[cand] = std_col
+                            break
+            if rename_map:
+                price_data = price_data.rename(columns=rename_map)
+
             if len(price_data) < 15:  # 降低要求到15天
                 logger.warning("数据不足，无法生成完整的动量特征")
                 return pd.DataFrame()
@@ -109,6 +145,24 @@ class FeatureGenerator:
     def generate_volume_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
         """生成成交量特征"""
         try:
+            # 标准化列名并重命名
+            price_data = price_data.copy()
+            price_data.columns = [str(c).lower() for c in price_data.columns]
+            rename_map = {}
+            for std_col, candidates in {
+                "open": ["open", "open_hfq", "open_qfq"],
+                "close": ["close", "close_hfq", "close_qfq"],
+                "high": ["high", "high_hfq", "high_qfq"],
+                "low": ["low", "low_hfq", "low_qfq"],
+            }.items():
+                if std_col not in price_data.columns:
+                    for cand in candidates:
+                        if cand in price_data.columns:
+                            rename_map[cand] = std_col
+                            break
+            if rename_map:
+                price_data = price_data.rename(columns=rename_map)
+
             if len(price_data) < 15:  # 降低要求到15天
                 logger.warning("数据不足，无法生成完整的成交量特征")
                 return pd.DataFrame()
@@ -148,6 +202,24 @@ class FeatureGenerator:
     def generate_volatility_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
         """生成波动率特征"""
         try:
+            # 标准化列名并重命名
+            price_data = price_data.copy()
+            price_data.columns = [str(c).lower() for c in price_data.columns]
+            rename_map = {}
+            for std_col, candidates in {
+                "open": ["open", "open_hfq", "open_qfq"],
+                "close": ["close", "close_hfq", "close_qfq"],
+                "high": ["high", "high_hfq", "high_qfq"],
+                "low": ["low", "low_hfq", "low_qfq"],
+            }.items():
+                if std_col not in price_data.columns:
+                    for cand in candidates:
+                        if cand in price_data.columns:
+                            rename_map[cand] = std_col
+                            break
+            if rename_map:
+                price_data = price_data.rename(columns=rename_map)
+
             if len(price_data) < 15:  # 降低要求到15天
                 logger.warning("数据不足，无法生成完整的波动率特征")
                 return pd.DataFrame()

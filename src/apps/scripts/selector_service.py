@@ -490,7 +490,8 @@ class IntelligentStockSelector:
                 symbols,
                 start_date.strftime("%Y-%m-%d"),
                 end_date.strftime("%Y-%m-%d"),
-                fields=["open", "high", "low", "close", "volume", "turnover", "amount"],
+                # 删除 turnover 字段以兼容当前数据库结构
+                fields=["open", "high", "low", "close", "volume", "amount"],
                 force_refresh=False,
                 auto_sync=False,
             )

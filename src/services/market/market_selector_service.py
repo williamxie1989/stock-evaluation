@@ -504,9 +504,11 @@ class MarketSelectorService:
                 
                 stock_info = stock_df.iloc[0].to_dict()
                 
-                # 获取最近的价格数据
+                # 获取最近的价格数据（使用前复权数据）
                 price_query = """
-                    SELECT * FROM prices_daily 
+                    SELECT symbol, date, open_qfq as open, close_qfq as close, 
+                           high_qfq as high, low_qfq as low, volume, amount, source
+                    FROM prices_daily 
                     WHERE symbol = ? 
                     ORDER BY date DESC 
                     LIMIT 30
