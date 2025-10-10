@@ -311,7 +311,9 @@ class PortfolioPipeline:
             symbol=symbol,
             start_date=str(start_date.date()),
             end_date=str(end_date.date()),
-            fields=["open", "close", "high", "low", "volume", "turnover", "amount"],
+            # 不请求数据库中不存在的字段，避免 Unknown column 错误
+            fields=["open", "close", "high", "low", "volume", "amount"],
+            adjust_mode="qfq",  # 投资组合使用前复权数据
         )
         # 兼容异步/同步实现
         try:
@@ -429,6 +431,19 @@ class PortfolioPipeline:
         results.sort(key=lambda x: x.score, reverse=True)
         return results[:k]
 
+    def _calculate_cost_price(self, weight: float, shares: float, initial_capital: float, commission_rate: float, override_price: Optional[float] = None) -> Optional[float]:
+        """计算成本价格
+        考虑佣金因素，计算公式为：成本价格 = (initial_capital * weight * (1 - commission_rate)) / shares
+        如果提供了override_price，则直接使用该价格
+        """
+        if override_price is not None:
+            return override_price
+        if shares > 0 and initial_capital > 0:
+            alloc = initial_capital * weight
+            cost_price = (alloc * (1 - commission_rate)) / shares
+            return cost_price
+        return None
+    
     def _equal_weight_holdings(self, picks: List[PickResult], as_of_date: pd.Timestamp, capital: float) -> List[Holding]:
         """等权分配，按as_of_date收盘价计算份额（批量获取价格）"""
         if not picks:
@@ -477,6 +492,12 @@ class PortfolioPipeline:
             df = batch_data.get(h.symbol)
             if df is None or df.empty:
                 continue
+            # 确保索引为日期类型，避免RangeIndex导致比较错误
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if 'trade_date' in df.columns:
+                    df = df.set_index(pd.to_datetime(df['trade_date']))
+                else:
+                    df.index = pd.to_datetime(df.index, errors='coerce')
             price_frames[h.symbol] = df["close"][df.index >= start_date]
         if not price_frames:
             return pd.Series(dtype=float)

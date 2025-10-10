@@ -368,7 +368,7 @@ function renderHoldings(holdings = []) {
                 </td>
                 <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.latest_price, 2)}</td>
                 <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.cost_price, 2)}</td>
-                <td class="px-4 py-3 align-top text-gray-700">${formatWeight(holding.weight)}</td>
+                <td class="px-4 py-3 align-top text-gray-700">${(holding.weight_pct !== undefined && holding.weight_pct !== null) ? (Number(holding.weight_pct).toFixed(2) + '%') : formatWeight(holding.weight)}</td>
                 <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.latest_value, 2)}</td>
                 <td class="px-4 py-3 align-top font-medium ${pnlClass}">${formatPercent(holding.pnl_pct)}</td>
                 <td class="px-4 py-3 align-top font-medium ${dailyClass}">${formatPercent(holding.daily_return_pct)}</td>
@@ -397,8 +397,11 @@ function renderRebalance(history = []) {
             .map(h => {
                 const displayName = h.name || h.symbol || '-';
                 const symbolText = h.symbol && displayName !== h.symbol ? ` (${h.symbol})` : '';
-                const retText = formatPercent(h.return_pct);
-                return `${displayName}${symbolText} ${retText}`;
+                // show holding weight in preview (prefer backend-provided weight_pct, else compute from weight)
+                const weightText = (h.weight_pct !== undefined && h.weight_pct !== null)
+                    ? `${Number(h.weight_pct).toFixed(2)}%`
+                    : formatWeight(h.weight);
+                return `${displayName}${symbolText} ${weightText}`;
             })
             .join('，');
         const preview = previewItems

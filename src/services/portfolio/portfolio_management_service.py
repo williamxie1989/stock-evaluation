@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 from functools import lru_cache
@@ -81,6 +82,7 @@ class PortfolioHoldingSnapshot:
             "code": self.code,
             "name": self.name,
             "weight": round(self.weight, 6),
+            "weight_pct": round(self.weight * 100, 2),
             "shares": round(self.shares, 4),
             "cost_price": round(cost, 4),
             "latest_price": round(latest_price, 4),
@@ -111,7 +113,7 @@ class PortfolioInfo:
         return {
             "id": self.id,
             "name": self.name,
-            "created_at": self.created_at.isoformat(),
+            "created_at": _safe_isoformat(self.created_at),
             "top_n": self.top_n,
             "initial_capital": round(self.initial_capital, 2),
             "holdings_count": self.holdings_count,
@@ -122,7 +124,7 @@ class PortfolioInfo:
             "total_value": round(valuation.nav_total, 2),
             "daily_return_pct": round(valuation.daily_return_pct, 6),
             "total_return_pct": round(valuation.total_return_pct, 6),
-            "last_valued_at": valuation.last_valued_at.isoformat() if valuation.last_valued_at else None,
+            "last_valued_at": _safe_isoformat(valuation.last_valued_at),
         }
 
 
@@ -198,6 +200,19 @@ def _json_loads(text: Any, default: Any = None) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def _safe_isoformat(dt: Optional[datetime]) -> Optional[str]:
+    """Return ISO string for dt but treat obviously-bad dates (epoch/1970) as None."""
+    if dt is None:
+        return None
+    try:
+        # reject sentinel/epoch-like dates
+        if getattr(dt, "year", 0) and int(getattr(dt, "year", 0)) < 2000:
+            return None
+        return dt.isoformat()
+    except Exception:
+        return None
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -317,22 +332,102 @@ def _generate_rebalance_dates(
     return pd.DatetimeIndex(dates)
 
 
-def _format_rebalance_holdings(holdings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _format_rebalance_holdings(
+    holdings: List[Dict[str, Any]],
+    initial_capital: float = 0.0,
+    commission_rate: float = 0.0
+) -> List[Dict[str, Any]]:
     """标准化调仓事件中的持仓数据，补充名称、收益率与市值。"""
     formatted: List[Dict[str, Any]] = []
+
+    # 批量从本地 prices_daily 回补缺失的 price/entry_price（高优先级）
+    try:
+        missing_symbols = [
+            (raw.get("symbol") or "").strip()
+            for raw in (holdings or [])
+            if (not raw.get("price") or raw.get("price") in (None, ""))
+        ]
+        missing_symbols = [s for s in missing_symbols if s]
+        if missing_symbols:
+            try:
+                # 增加获取的数据量，从5天增加到30天，以确保有足够的历史数据
+                df_latest = _db_manager.get_last_n_bars(symbols=missing_symbols, n=30)
+                # 如果第一次获取失败，尝试获取更多数据
+                if df_latest is None or df_latest.empty:
+                    df_latest = _db_manager.get_last_n_bars(symbols=missing_symbols, n=90)
+            except Exception:
+                df_latest = None
+            
+            if df_latest is not None and not df_latest.empty:
+                grouped = df_latest.groupby("symbol")
+                price_map: Dict[str, Tuple[float, Optional[float]]] = {}
+                for sym, g in grouped:
+                    g = g.copy()
+                    g["date"] = pd.to_datetime(g["date"])
+                    g = g.sort_values("date")
+                    last = g.iloc[-1]
+                    prev = g.iloc[-2] if len(g) >= 2 else None
+                    last_price = float(last.get("close") or last.get("Close") or 0.0)
+                    prev_price = None
+                    if prev is not None:
+                        prev_price = float(prev.get("close") or prev.get("Close") or 0.0)
+                    price_map[sym] = (last_price, prev_price)
+                
+                for raw in holdings or []:
+                    sym = (raw.get("symbol") or "").strip()
+                    if not sym or sym not in price_map:
+                        continue
+                    p, prevp = price_map[sym]
+                    if (raw.get("price") in (None, "") or float(raw.get("price") or 0.0) <= 0.0) and p > 0:
+                        raw["price"] = p
+                    if (raw.get("entry_price") in (None, "") or float(raw.get("entry_price") or 0.0) <= 0.0):
+                        # 优先使用prevp，如果没有则回退到p
+                        if prevp and prevp > 0:
+                            raw["entry_price"] = prevp
+                        elif p > 0:
+                            raw["entry_price"] = p
+    except Exception as e:
+        logger.warning(f"价格回补失败: {str(e)}")
+        # 回填为辅助措施，失败则忽略
+        pass
+
     for raw in holdings or []:
         symbol = (raw.get("symbol") or "").strip()
         code = (raw.get("code") or _strip_suffix(symbol))
         name = raw.get("name") or _resolve_stock_name(symbol, code)
         weight = float(raw.get("weight") or 0.0)
         shares = float(raw.get("shares") or 0.0)
+
         price_raw = raw.get("price")
         price = float(price_raw) if price_raw not in (None, "") else 0.0
         entry_raw = raw.get("entry_price")
         entry_price = float(entry_raw) if entry_raw not in (None, "") else 0.0
+        # 如果 entry_price 未提供但有 price，则把 entry_price 设为 price
         if entry_price <= 0 and price > 0:
             entry_price = price
+        # 如果 price 缺失但 entry_price 可用，使用 entry_price 作为价格回退
+        if price <= 0 and entry_price > 0:
+            price = entry_price
+        
+        # 使用统一的成本价格计算逻辑
+        if initial_capital > 0 and weight > 0 and shares > 0:
+            # 使用_calculate_cost_price函数计算更准确的成本价格
+            calculated_cost_price = _calculate_cost_price(
+                weight,
+                shares,
+                initial_capital,
+                commission_rate,
+                None  # 不使用覆盖价格
+            )
+            # 只有在计算出的成本价格合理时才使用它
+            if calculated_cost_price > 0:
+                entry_price = calculated_cost_price
+
         value = shares * price if price > 0 else 0.0
+        # 跳过零股/零价值持仓，避免前端出现0.00%展示干扰
+        if shares <= 0 or price <= 0 or value <= 0:
+            continue
+
         return_raw = raw.get("return_pct")
         if return_raw not in (None, ""):
             try:
@@ -343,11 +438,13 @@ def _format_rebalance_holdings(holdings: List[Dict[str, Any]]) -> List[Dict[str,
             return_pct = (
                 (price - entry_price) / entry_price if entry_price and entry_price > 0 and price > 0 else 0.0
             )
+
         formatted_entry: Dict[str, Any] = {
             "symbol": symbol,
             "code": code,
             "name": name,
             "weight": round(weight, 6),
+            "weight_pct": round(weight * 100, 2),
             "shares": round(shares, 4),
             "price": round(price, 4) if price > 0 else None,
             "entry_price": round(entry_price, 4) if entry_price > 0 else None,
@@ -359,6 +456,21 @@ def _format_rebalance_holdings(holdings: List[Dict[str, Any]]) -> List[Dict[str,
         if extras:
             formatted_entry.update(extras)
         formatted.append(formatted_entry)
+
+    # 如果传入的每条持仓都没有 weight，但都包含 value，则用 value 重新计算权重
+    try:
+        local_total = sum([entry.get("value", 0.0) for entry in formatted])
+        if local_total > 0:
+            need_fix = any((entry.get("weight", 0.0) == 0.0 and entry.get("value", 0.0) > 0.0) for entry in formatted)
+            if need_fix:
+                for entry in formatted:
+                    v = entry.get("value", 0.0)
+                    entry["weight"] = round((v / local_total) if local_total > 0 else 0.0, 6)
+                    entry["weight_pct"] = round(entry["weight"] * 100, 2)  # 同步更新权重百分比
+    except Exception:
+        # 保持原样，避免格式化失败影响主流程
+        pass
+
     return formatted
 
 
@@ -375,15 +487,87 @@ def _build_rebalance_event_record(
     nav_value: Optional[float] = None
     if initial_capital and initial_capital > 0:
         nav_value = total_value / initial_capital
+    # 格式化持仓并重新计算合计市值以保证持仓明细与事件总值一致
+    try:
+        formatted = _format_rebalance_holdings(holdings, initial_capital=initial_capital) if holdings is not None else []
+        computed_total = sum([float(h.get("value") or 0.0) for h in formatted])
+    except Exception:
+        formatted = _format_rebalance_holdings(holdings, initial_capital=initial_capital)
+        computed_total = float(total_value or 0.0)
+
+    # 如果传入的 total_value 与由持仓计算的合计相差较大，则以计算值为准并记录警告
+    try:
+        # 对于回溯测试，使用更严格的容差以确保数据准确性
+        base_tol = max(1.0, 0.002 * computed_total)  # 最小 1 元，或 0.2% 的相对误差（比之前的0.5%更严格）
+        tol = base_tol
+        
+        # 对于创建组合事件，保持初始净值为1.0，不进行total_value替换
+        if event_type == 'create':
+            # 即使computed_total与total_value有差异，也保持total_value为initial_capital
+            if total_value != initial_capital:
+                logger.info(
+                    "组合创建事件: 强制设置total_value=initial_capital (%.2f)",
+                    initial_capital
+                )
+            total_value = initial_capital
+            nav_value = 1.0  # 强制设置初始净值为1.0
+            logger.debug(
+                "组合创建事件: 初始净值设置为1.0, event_time=%s",
+                getattr(event_time, 'isoformat', lambda: str(event_time))()
+            )
+        elif total_value is None or abs(float(total_value) - computed_total) > tol:
+            # 计算差异百分比
+            diff_pct = abs(float(total_value or 0.0) - computed_total) / max(1.0, computed_total) * 100
+            
+            # 根据差异大小调整日志级别
+            log_msg = "Rebalance total_value mismatch: provided=%.2f computed_from_holdings=%.2f diff=%.2f (%.2f%%) event_time=%s; using computed value"
+            log_args = [
+                float(total_value or 0.0),
+                computed_total,
+                abs(float(total_value or 0.0) - computed_total),
+                diff_pct,
+                getattr(event_time, 'isoformat', lambda: str(event_time))(),
+            ]
+            
+            if diff_pct > 5:  # 差异大于5%，使用error级别
+                logger.error(log_msg, *log_args)
+            elif diff_pct > 1:  # 差异大于1%，使用warning级别
+                logger.warning(log_msg, *log_args)
+            else:  # 差异小于1%，使用info级别
+                logger.info(log_msg, *log_args)
+            
+            # 总是使用计算值以确保数据一致性
+            total_value = computed_total
+            # 当 total_value 被调整时，同步更新 nav_value
+            if initial_capital and initial_capital > 0:
+                nav_value = total_value / initial_capital
+                logger.debug(
+                    "调仓事件: 调整nav_value=%.6f (total_value=%.2f, initial_capital=%.2f)",
+                    nav_value, total_value, initial_capital
+                )
+    except Exception:
+        # 在任何错误情况下，使用原始 total_value
+        total_value = float(total_value or 0.0)
+        logger.error(
+            "计算调仓事件净值时发生错误: event_time=%s, event_type=%s, error=%s",
+            getattr(event_time, 'isoformat', lambda: str(event_time))(),
+            event_type,
+            str(sys.exc_info()[1])
+        )
+
     record: Dict[str, Any] = {
         "timestamp": event_time.isoformat(),
         "type": event_type,
         "description": description,
-        "holdings": _format_rebalance_holdings(holdings),
-        "total_value": round(total_value, 2),
+        "holdings": formatted,
+        "total_value": round(float(total_value or 0.0), 2),
     }
     if nav_value is not None:
         record["nav_value"] = round(nav_value, 6)
+        logger.debug(
+            "调仓事件记录: event_type=%s, total_value=%.2f, nav_value=%.6f",
+            event_type, record["total_value"], record["nav_value"]
+        )
     return record
 
 
@@ -491,10 +675,12 @@ def _hydrate_detail(
         holdings_payload = details.get("holdings") if isinstance(details, dict) else details
         nav_value = details.get("nav_value") if isinstance(details, dict) else None
         total_value = details.get("total_value") if isinstance(details, dict) else None
-        formatted_holdings = _format_rebalance_holdings(holdings_payload) if holdings_payload else []
+        formatted_holdings = _format_rebalance_holdings(holdings_payload, initial_capital=info.initial_capital) if holdings_payload else []
+        event_ts = _parse_datetime(row.get("event_time")) or info.created_at
         rebalance_history.append(
             {
-                "timestamp": (_parse_datetime(row.get("event_time")) or info.created_at).isoformat(),
+                "timestamp": _safe_isoformat(event_ts),
+                "date": event_ts.date().isoformat() if hasattr(event_ts, "date") else None,
                 "type": row.get("event_type"),
                 "description": row.get("description"),
                 "holdings": formatted_holdings,
@@ -783,14 +969,14 @@ def _default_auto_trading() -> bool:
 
 
 def _simulate_backtrack_portfolio(
-    *,
-    pipeline: PortfolioPipeline,
-    start_ts: datetime,
-    end_ts: datetime,
-    top_n: int,
-    initial_capital: float,
-    auto_trading: bool,
-    weight_overrides: Optional[Dict[str, float]] = None,
+    *, 
+    pipeline: PortfolioPipeline, 
+    start_ts: datetime, 
+    end_ts: datetime, 
+    top_n: int, 
+    initial_capital: float, 
+    auto_trading: bool, 
+    weight_overrides: Optional[Dict[str, float]] = None, 
     candidate_limit: Optional[int] = None,
 ) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
     resolved_limit = resolve_candidate_limit(candidate_limit if candidate_limit is not None else pipeline.candidate_limit)
@@ -800,21 +986,36 @@ def _simulate_backtrack_portfolio(
     try:
         if auto_trading:
             return _simulate_backtrack_active(
-                pipeline=pipeline,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                top_n=top_n,
-                initial_capital=initial_capital,
+                pipeline=pipeline, 
+                start_ts=start_ts, 
+                end_ts=end_ts, 
+                top_n=top_n, 
+                initial_capital=initial_capital, 
                 candidate_limit=resolved_limit,
             )
         return _simulate_backtrack_passive(
-            pipeline=pipeline,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            top_n=top_n,
-            initial_capital=initial_capital,
+            pipeline=pipeline, 
+            start_ts=start_ts, 
+            end_ts=end_ts, 
+            top_n=top_n, 
+            initial_capital=initial_capital, 
             candidate_limit=resolved_limit,
         )
+    except Exception as e:
+        logger.error(f"组合回溯模拟失败: {str(e)}")
+        # 发生异常时返回空的结果集，确保调用方能够正常解包
+        empty_snapshots: List[PortfolioHoldingSnapshot] = []
+        empty_quotes: Dict[str, PriceQuote] = {}
+        empty_events: List[Dict[str, Any]] = []
+        empty_history: List[Dict[str, Any]] = []
+        empty_valuation = PortfolioValuation(
+            nav_total=initial_capital, 
+            nav_value=1.0, 
+            daily_return_pct=0.0, 
+            total_return_pct=0.0, 
+            last_valued_at=start_ts
+        )
+        return empty_snapshots, empty_quotes, empty_events, empty_history, empty_valuation, start_ts
     finally:
         pipeline.reset_weights()
 
@@ -884,7 +1085,10 @@ def _simulate_backtrack_active(
         for sym, pos in ats.positions.items():
             price = last_price_map.get(sym)
             if price is None:
-                price, _, _ = _price_on(sym, pd.Timestamp(end_date))
+                # 回退到最后已知时间点作为查价基准，避免在回测中总是使用最终 end_date 导致中间估值异常
+                last_time = last_price_time.get(sym)
+                ts = pd.Timestamp(last_time) if last_time is not None else pd.Timestamp(end_date)
+                price, _, _ = _price_on(sym, ts)
             if price is None:
                 continue
             total += float(pos.get("volume", 0)) * float(price)
@@ -897,6 +1101,13 @@ def _simulate_backtrack_active(
         holdings_snapshot: List[Dict[str, Any]],
         total_value: float,
     ) -> None:
+        # 记录调仓事件的核心信息到日志，便于排查权重/净值异常
+        try:
+            holdings_brief = [f"{h.get('symbol')}:{round(float(h.get('shares',0))*float(h.get('price') or 0),2)}" for h in holdings_snapshot]
+        except Exception:
+            holdings_brief = []
+        logger.debug("Rebalance event: time=%s type=%s total_value=%.2f holdings=%s", event_time, event_type, float(total_value or 0.0), holdings_brief)
+
         record = _build_rebalance_event_record(
             event_time=event_time,
             event_type=event_type,
@@ -920,6 +1131,19 @@ def _simulate_backtrack_active(
                     "shares": volume,
                     "price": price,
                     "entry_price": float(pos.get("entry_price", 0.0)),
+                }
+            )
+        # 加入现金为伪持仓，确保事件总值与快照合计一致
+        cash_amount = float(ats.current_capital)
+        if cash_amount > 0:
+            cash_weight = (cash_amount / total_value) if total_value > 0 else 0.0
+            snapshot.append(
+                {
+                    "symbol": "CASH",
+                    "weight": cash_weight,
+                    "shares": cash_amount,  # 以1元面值表示的"份额"
+                    "price": 1.0,
+                    "entry_price": 1.0,
                 }
             )
         return snapshot
@@ -953,7 +1177,9 @@ def _simulate_backtrack_active(
         target_volume = int(per_value // price)
         if target_volume <= 0:
             continue
+        logger.info("[BUILD] symbol=%s price=%s per_value=%s target_volume=%s current_capital_before=%s", pick.symbol, price, per_value, target_volume, ats.current_capital)
         trade = ats.execute_trade(symbol=pick.symbol, signal="BUY", price=price, volume=target_volume)
+        logger.info("[BUILD] trade result=%s current_capital_after=%s positions=%s", trade, ats.current_capital, len(ats.positions))
         if not trade.get("success"):
             logger.debug("建仓执行失败 %s: %s", pick.symbol, trade.get("error"))
             continue
@@ -971,11 +1197,15 @@ def _simulate_backtrack_active(
     if build_holdings_meta and total_value > 0:
         for meta in build_holdings_meta:
             meta["weight"] = (meta["shares"] * meta["price"]) / total_value if total_value > 0 else 0.0
+    # Use actual positions snapshot for recorded holdings to avoid mismatch between intended
+    # target volumes and executed positions (which may be adjusted by ATS). This ensures
+    # recorded shares/values reflect real positions used for valuation.
+    create_snapshot = _snapshot_holdings(last_price_map, total_value)
     _record_event(
         datetime.combine(start_ts.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15),
         "create",
-        f"回溯建仓 Top{len(build_holdings_meta)} 持仓",
-        build_holdings_meta,
+        f"回溯建仓 Top{len(create_snapshot)} 持仓",
+        create_snapshot,
         total_value,
     )
 
@@ -1027,11 +1257,22 @@ def _simulate_backtrack_active(
                     )
 
         if current.normalize() in rebal_set and current > start_date:
+            # 选股在current日（收盘后），实际成交按T+1执行：使用下一个有效交易日价格
             picks_now = pipeline.pick_stocks(as_of_date=current, candidates=candidate_symbols_all, top_n=top_n)
             target_symbols: List[str] = []
             pick_prices: Dict[str, float] = {}
+            # 计算T+1交易日
+            next_trade_day = None
+            try:
+                idx = list(business_days).index(pd.Timestamp(current.normalize()))
+                if idx is not None and idx + 1 < len(business_days):
+                    next_trade_day = business_days[idx + 1]
+            except Exception:
+                next_trade_day = None
+            price_ts = next_trade_day if next_trade_day is not None else current
+
             for pick in picks_now:
-                price, price_time, _ = _price_on(pick.symbol, current)
+                price, price_time, _ = _price_on(pick.symbol, price_ts)
                 if price is None or price <= 0:
                     continue
                 pick_prices[pick.symbol] = price
@@ -1040,6 +1281,27 @@ def _simulate_backtrack_active(
                     last_price_time[pick.symbol] = price_time.to_pydatetime()
                 target_symbols.append(pick.symbol)
 
+            # 对于仍缺失价格的 symbol，批量从本地 prices_daily 回填（减少逐 symbol 查询）
+            missing_for_db = [s for s in target_symbols if s not in pick_prices or pick_prices.get(s) in (None, 0.0)]
+            if missing_for_db:
+                try:
+                    df_latest = _db_manager.get_last_n_bars(symbols=missing_for_db, n=3)
+                except Exception:
+                    df_latest = None
+                if df_latest is not None and not df_latest.empty:
+                    # 按 symbol 处理 DataFrame，取每组最新一条记录填充
+                    for _, row in df_latest.iterrows():
+                        sym = row.get('symbol')
+                        if not sym or sym not in missing_for_db:
+                            continue
+                        try:
+                            price_val = float(row.get('close') or row.get('Close') or 0.0)
+                        except Exception:
+                            price_val = 0.0
+                        if price_val and price_val > 0:
+                            pick_prices[sym] = price_val
+                            last_price_map[sym] = price_val
+
             if target_symbols:
                 total_value_before = _portfolio_value()
                 per_value = total_value_before / len(target_symbols) if target_symbols else 0.0
@@ -1047,16 +1309,20 @@ def _simulate_backtrack_active(
                 existing_symbols = list(ats.positions.keys())
                 for sym in existing_symbols:
                     if sym not in target_symbols:
+                        # 卖出使用T+1价格
+                        # 若已取到T+1，直接用；否则回退到最近价
                         price = current_prices.get(sym) or last_price_map.get(sym)
                         if price is None:
                             continue
                         ats.close_position(sym, price)
                 total_value_after_close = _portfolio_value()
+                # event_total 用于后续权重计算，使用关闭不需要的仓位后的组合总价值
+                event_total = total_value_after_close
                 if target_symbols:
-                    per_value = total_value_after_close / len(target_symbols) if total_value_after_close > 0 else 0.0
-                holdings_snapshot: List[Dict[str, Any]] = []
-
+                    per_value = event_total / len(target_symbols) if event_total > 0 else 0.0
+                # Execute adjustments, then snapshot actual positions for the recorded holdings
                 for sym in target_symbols:
+                    # 买入使用T+1价格
                     price = pick_prices.get(sym) or last_price_map.get(sym)
                     if price is None or price <= 0:
                         continue
@@ -1067,19 +1333,11 @@ def _simulate_backtrack_active(
                     if not adjust.get("success"):
                         logger.debug("调仓失败 %s: %s", sym, adjust.get("error"))
                         continue
-                    holdings_snapshot.append(
-                        {
-                            "symbol": sym,
-                            "weight": per_value / total_value if total_value > 0 else 0.0,
-                            "shares": target_volume,
-                            "price": price,
-                            "entry_price": price,
-                        }
-                    )
+
+                # 重新计算 event_total，确保包含刚买入/卖出的影响
                 event_total = _portfolio_value()
-                if holdings_snapshot and event_total > 0:
-                    for meta in holdings_snapshot:
-                        meta["weight"] = (meta["shares"] * meta["price"]) / event_total if event_total > 0 else 0.0
+                # Use snapshot of actual positions to record holdings (consistent with valuation)
+                holdings_snapshot = _snapshot_holdings(current_prices, event_total)
 
                 event_time = datetime.combine(current.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
                 _record_event(event_time, "rebalance", f"{event_time.date()} 调仓", holdings_snapshot, event_total)
@@ -1160,15 +1418,116 @@ def _simulate_backtrack_active(
     return holdings_snapshots, quotes, rebalance_events, nav_history, valuation, last_nav_at
 
 
+def _build_event_meta(
+    holdings: List[Holding],
+    event_ts: pd.Timestamp,
+    prev_ts: Optional[pd.Timestamp],
+    initial_capital: float = 0.0,
+    commission_rate: float = 0.0,
+) -> List[Dict[str, Any]]:
+    # 内部定义_price_cache和_load_price_series函数
+    price_cache: Dict[str, pd.Series] = {}
+    
+    def _load_price_series(symbol: str, days: int) -> pd.Series:
+        cached = price_cache.get(symbol)
+        if cached is not None:
+            return cached
+        # 获取最近days天的数据
+        from datetime import datetime, timedelta
+        end_date = event_ts.date()
+        start_date = end_date - timedelta(days=days)
+        try:
+            from src.data.unified_data_access import get_unified_data_access
+            uda = get_unified_data_access()
+            df = uda.get_stock_daily(symbol, start_date=start_date, end_date=end_date)
+            if df is None or df.empty or "close" not in df.columns:
+                price_cache[symbol] = pd.Series(dtype=float)
+                return price_cache[symbol]
+            ser = df["close"].copy()
+            ser.index = pd.to_datetime(df.index)
+            ser = ser.sort_index().dropna()
+            price_cache[symbol] = ser
+            return ser
+        except Exception:
+            price_cache[symbol] = pd.Series(dtype=float)
+            return price_cache[symbol]
+    
+    # 内部定义_price_on函数
+    def _price_on(symbol: str, ts: pd.Timestamp, days: int = 90) -> Tuple[Optional[float], Optional[pd.Timestamp], Optional[float]]:
+        # 加载价格数据，默认获取最近90天数据以确保能获取到建仓价格
+        # 这比之前的30天要长很多，能够覆盖回溯模拟所需的历史数据范围
+        series = _load_price_series(symbol, days)
+        if series.empty:
+            # 如果初始获取失败，尝试获取更多历史数据（180天）
+            series = _load_price_series(symbol, 180)
+            if series.empty:
+                return None, None, None
+        try:
+            price = series.asof(ts)
+        except Exception:
+            price = None
+        if price is None or pd.isna(price):
+            return None, None, None
+        hist = series[series.index <= ts]
+        prev = hist.iloc[-2] if len(hist) >= 2 else None
+        price_time = hist.index[-1] if len(hist) >= 1 else None
+        return float(price), price_time, (float(prev) if prev is not None else None)
+    
+    price_map: Dict[str, float] = {}    
+    total_value = 0.0
+    for h in holdings:
+        price, _, _ = _price_on(h.symbol, event_ts)
+        price = float(price) if price else 0.0
+        price_map[h.symbol] = price
+        total_value += price * h.shares
+    meta: List[Dict[str, Any]] = []
+    for h in holdings:
+        price = price_map.get(h.symbol, 0.0)
+        prev_price = None
+        if prev_ts is not None:
+            prev_price, _, _ = _price_on(h.symbol, prev_ts)
+        # 使用统一的成本价格计算函数
+        if initial_capital > 0 and h.shares > 0:
+            # 计算归一化权重
+            weight = (price * h.shares / total_value) if total_value > 0 else h.weight
+            entry_price = _calculate_cost_price(
+                weight=weight, 
+                shares=h.shares, 
+                initial_capital=initial_capital, 
+                commission_rate=commission_rate, 
+                override_price=None
+            )
+        else:
+            # 如果无法使用统一计算方法，则回退到原有方式
+            entry_price = price if price > 0 else None
+        prev_price_val = float(prev_price) if prev_price else None
+        return_pct = 0.0
+        if prev_price_val and prev_price_val > 0 and price > 0:
+            return_pct = (price - prev_price_val) / prev_price_val
+        weight = (price * h.shares / total_value) if total_value > 0 else h.weight
+        meta.append(
+            {
+                "symbol": h.symbol,
+                "weight": weight,
+                "shares": h.shares,
+                "price": price if price > 0 else None,
+                "entry_price": entry_price,
+                "return_pct": return_pct,
+            }
+        )
+    return meta
+
 def _simulate_backtrack_passive(
-    *,
-    pipeline: PortfolioPipeline,
+    *,  # 使用关键字参数
+    pipeline: PortfolioPipeline,  # 修复参数类型
     start_ts: datetime,
     end_ts: datetime,
     top_n: int,
     initial_capital: float,
     candidate_limit: Optional[int],
 ) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
+    """回溯模拟被动调仓组合表现"""
+    # 确保_price_on函数作为内部函数定义
     price_cache: Dict[str, pd.Series] = {}
 
     def _load_price_series(symbol: str, days: int) -> pd.Series:
@@ -1185,11 +1544,15 @@ def _simulate_backtrack_passive(
         price_cache[symbol] = ser
         return ser
 
-    def _price_on(symbol: str, ts: pd.Timestamp) -> Tuple[Optional[float], Optional[pd.Timestamp], Optional[float]]:
-        days = max(5, pipeline.lookback_days + 5)
-        series = _load_price_series(symbol, days)
+    def _price_on(symbol: str, ts: pd.Timestamp, days: int = 90) -> Tuple[Optional[float], Optional[pd.Timestamp], Optional[float]]:
+        # 使用指定的天数或回测所需的最大天数
+        days_to_fetch = max(days, pipeline.lookback_days + 5)
+        series = _load_price_series(symbol, days_to_fetch)
         if series.empty:
-            return None, None, None
+            # 如果初始获取失败，尝试获取更多历史数据（180天）
+            series = _load_price_series(symbol, 180)
+            if series.empty:
+                return None, None, None
         try:
             price = series.asof(ts)
         except Exception:
@@ -1200,42 +1563,6 @@ def _simulate_backtrack_passive(
         prev = hist.iloc[-2] if len(hist) >= 2 else None
         price_time = hist.index[-1] if len(hist) >= 1 else None
         return float(price), price_time, (float(prev) if prev is not None else None)
-
-    def _build_event_meta(
-        holdings: List[Holding],
-        event_ts: pd.Timestamp,
-        prev_ts: Optional[pd.Timestamp],
-    ) -> List[Dict[str, Any]]:
-        price_map: Dict[str, float] = {}
-        total_value = 0.0
-        for h in holdings:
-            price, _, _ = _price_on(h.symbol, event_ts)
-            price = float(price) if price else 0.0
-            price_map[h.symbol] = price
-            total_value += price * h.shares
-        meta: List[Dict[str, Any]] = []
-        for h in holdings:
-            price = price_map.get(h.symbol, 0.0)
-            prev_price = None
-            if prev_ts is not None:
-                prev_price, _, _ = _price_on(h.symbol, prev_ts)
-            entry_price = price if price > 0 else None
-            prev_price_val = float(prev_price) if prev_price else None
-            return_pct = 0.0
-            if prev_price_val and prev_price_val > 0 and price > 0:
-                return_pct = (price - prev_price_val) / prev_price_val
-            weight = (price * h.shares / total_value) if total_value > 0 else h.weight
-            meta.append(
-                {
-                    "symbol": h.symbol,
-                    "weight": weight,
-                    "shares": h.shares,
-                    "price": price if price > 0 else None,
-                    "entry_price": entry_price,
-                    "return_pct": return_pct,
-                }
-            )
-        return meta
 
     start_date = pd.Timestamp(start_ts.date())
     end_date = pd.Timestamp(end_ts.date())
@@ -1268,7 +1595,7 @@ def _simulate_backtrack_passive(
     last_nav_at = initial_nav_time
     capital = initial_capital
 
-    create_holdings_meta = _build_event_meta(holdings_current, start_date, None)
+    create_holdings_meta = _build_event_meta(holdings_current, start_date, None, initial_capital=initial_capital, commission_rate=0.0)
     rebalance_events.append(
         _build_rebalance_event_record(
             event_time=initial_nav_time,
@@ -1319,7 +1646,7 @@ def _simulate_backtrack_passive(
             continue
         holdings_current = new_holdings
         event_time = datetime.combine(dt.date(), datetime.min.time(), tzinfo=start_ts.tzinfo) + timedelta(hours=15)
-        holdings_meta = _build_event_meta(holdings_current, pd.Timestamp(dt), prev_rebalance_ts)
+        holdings_meta = _build_event_meta(holdings_current, pd.Timestamp(dt), prev_rebalance_ts, initial_capital=capital, commission_rate=0.0)
         rebalance_events.append(
             _build_rebalance_event_record(
                 event_time=event_time,
@@ -1637,6 +1964,40 @@ def _update_portfolio(
             cursor.close()
 
 
+def _calculate_cost_price(
+    weight: float,
+    shares: float,
+    initial_capital: float,
+    commission_rate: float = 0.0,
+    override_price: Optional[float] = None,
+) -> float:
+    """
+    统一计算股票持仓的成本价格
+    
+    参数:
+        weight: 持仓权重
+        shares: 持仓份额
+        initial_capital: 初始资金
+        commission_rate: 佣金率，默认为0
+        override_price: 覆盖的成本价格，如不为None且大于0则直接使用
+    
+    返回:
+        计算得到的成本价格
+    """
+    if override_price is not None and override_price > 0:
+        return float(override_price)
+    
+    if shares <= 0 or initial_capital <= 0:
+        return 0.0
+    
+    alloc = initial_capital * weight
+    # 确保分配资金大于0，避免除以零或产生极小值
+    if alloc <= 0:
+        return 0.0
+        
+    return (alloc * (1 - commission_rate)) / shares
+
+
 def _build_holding_snapshots(
     holdings: List[Holding],
     *,
@@ -1653,11 +2014,13 @@ def _build_holding_snapshots(
         code = _strip_suffix(symbol)
         name = _resolve_stock_name(symbol, code)
         override = cost_price_map.get(symbol) if cost_price_map else None
-        if override is not None and override > 0:
-            cost_price = float(override)
-        else:
-            alloc = initial_capital * h.weight
-            cost_price = (alloc * (1 - commission)) / h.shares if h.shares > 0 else 0.0
+        cost_price = _calculate_cost_price(
+            h.weight,
+            h.shares,
+            initial_capital,
+            commission,
+            override
+        )
         opened_at_value = (
             opened_at_map.get(symbol)
             if opened_at_map and opened_at_map.get(symbol)
@@ -1713,16 +2076,18 @@ def _calculate_portfolio_valuation(
     symbols = [h.symbol for h in detail.holdings]
     if symbols:
         try:
-            batch_data = pipeline.data_access.get_stock_data_batch(symbols, start_date=(end_ts - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), end_date=end_ts.strftime("%Y-%m-%d"))  # type: ignore[attr-defined]
+            # 获取更多历史数据（90天）以确保回溯计算时数据完整性
+            batch_data = pipeline.data_access.get_stock_data_batch(symbols, start_date=(end_ts - pd.Timedelta(days=90)).strftime("%Y-%m-%d"), end_date=end_ts.strftime("%Y-%m-%d"))  # type: ignore[attr-defined]
         except AttributeError:
-            batch_data = {sym: pipeline._fetch_history(sym, end_date=end_ts, days=10) for sym in symbols}
+            batch_data = {sym: pipeline._fetch_history(sym, end_date=end_ts, days=90) for sym in symbols}
     else:
         batch_data = {}
 
     for holding in detail.holdings:
         df = batch_data.get(holding.symbol)
         if df is None or df.empty:
-            df = pipeline._fetch_history(holding.symbol, end_date=end_ts, days=10)
+            # 如果初始获取失败，尝试获取更多历史数据（180天）
+            df = pipeline._fetch_history(holding.symbol, end_date=end_ts, days=180)
         if df is None or df.empty:
             quotes[holding.symbol] = PriceQuote(latest_price=0.0, previous_price=None, last_trade_at=None)
             continue
@@ -1814,6 +2179,18 @@ def _calculate_portfolio_valuation(
                     "total_value": round(total_value, 2),
                 }
             )
+
+    # ---------------------------------------------------------------------
+    # 去重处理：有些数据源索引可能出现重复日期（如 1970-01-01），
+    # 这会导致写入 portfolio_nav_history 表时违反唯一索引约束。
+    # 使用字典确保日期唯一，然后保持日期顺序输出。
+    # ---------------------------------------------------------------------
+    if nav_history:
+        unique_map: Dict[str, Dict[str, Any]] = {}
+        for row in nav_history:
+            unique_map[row["date"]] = row  # 后出现的记录会覆盖之前的值，保持更靠后的价格
+        # 按日期顺序排序，保留最近 180 条
+        nav_history = [unique_map[d] for d in sorted(unique_map.keys())]
 
     return valuation, quotes, nav_history[-180:]
 
@@ -1982,6 +2359,28 @@ def create_portfolio_auto(
                 cost_price_map_auto[symbol] = float(price_val)  # type: ignore[arg-type]
             except Exception:
                 continue
+        # 为了确保创建组合时净值为1.0，我们需要确保成本价格与初始资本一致
+        # 构建一个基于初始资本的成本价格映射
+        if holdings_raw:
+            # 计算基于初始资本的每股价格
+            total_weight = sum(h.weight for h in holdings_raw)
+            if total_weight > 0:
+                for h in holdings_raw:
+                    # 确保成本价格映射存在
+                    if not cost_price_map_auto:
+                        cost_price_map_auto = {}
+                    # 使用基于权重和初始资本计算的价格，而不是市场价格
+                    # 这确保了初始净值计算为1.0
+                    # 使用归一化权重计算成本价格
+                    normalized_weight = h.weight / total_weight
+                    cost_price_map_auto[h.symbol] = _calculate_cost_price(
+                        normalized_weight,
+                        h.shares,
+                        initial_capital,
+                        0.0,  # 这里不使用佣金，因为目的是确保初始净值为1.0
+                        None
+                    )
+        
         snapshots = _build_holding_snapshots(
             holdings_raw,
             pipeline=pipeline,

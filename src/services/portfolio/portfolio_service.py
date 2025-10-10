@@ -94,12 +94,17 @@ def generate_portfolio_holdings(
         holdings_objs = pipeline._equal_weight_holdings(picks, as_of_date=as_of_date_dt, capital=initial_capital)
         holdings: List[Dict[str, Any]] = []
         for h in holdings_objs:
-            # 获取当前价格
-            df_price = pipeline._fetch_history(h.symbol, end_date=as_of_date_dt, days=5)
+            # 获取当前价格，使用更多历史数据（90天）以确保回溯建仓时数据完整性
+            df_price = pipeline._fetch_history(h.symbol, end_date=as_of_date_dt, days=90)
             if df_price is None or df_price.empty:
-                price = 0.0
+                # 如果初始获取失败，尝试获取更多历史数据（180天）
+                df_price = pipeline._fetch_history(h.symbol, end_date=as_of_date_dt, days=180)
+                if df_price is None or df_price.empty:
+                    price = 0.0
+                else:
+                    price = float(df_price["close"].iloc[-1]) if "close" in df_price.columns else 0.0
             else:
-                price = float(df_price["close"].iloc[-1])
+                price = float(df_price["close"].iloc[-1]) if "close" in df_price.columns else 0.0
             holdings.append(_holding_to_dict(h, price))
 
         resp = {

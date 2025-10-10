@@ -320,11 +320,14 @@ class AdaptiveTradingSystem:
 
             diff = target_volume - current_volume
             if diff > 0:
-                additional_cost = diff * price
+                # 买入增仓：考虑佣金
+                commission_rate = float(getattr(self.current_params, 'commission', 0.0) or 0.0)
+                additional_cost_gross = diff * price
+                additional_cost = additional_cost_gross * (1.0 + commission_rate)
                 if additional_cost > self.current_capital:
                     return {'success': False, 'error': '资金不足'}
                 self.current_capital -= additional_cost
-                total_cost = position['entry_price'] * current_volume + additional_cost
+                total_cost = position['entry_price'] * current_volume + additional_cost_gross  # 成本价按净成交额加权
                 position['entry_price'] = total_cost / target_volume if target_volume > 0 else price
                 position['volume'] = target_volume
                 position['stop_loss'] = position['entry_price'] * (1 - self.current_params.stop_loss)
@@ -345,7 +348,10 @@ class AdaptiveTradingSystem:
 
             # diff < 0，减仓
             reduce_volume = -diff
-            proceeds = reduce_volume * price
+            # 卖出减仓：考虑佣金
+            commission_rate = float(getattr(self.current_params, 'commission', 0.0) or 0.0)
+            proceeds_gross = reduce_volume * price
+            proceeds = proceeds_gross * (1.0 - commission_rate)
             self.current_capital += proceeds
             position['volume'] = target_volume
             position['last_adjust_time'] = datetime.now()
@@ -354,7 +360,7 @@ class AdaptiveTradingSystem:
                 'action': 'SELL',
                 'price': price,
                 'volume': reduce_volume,
-                'total_cost': proceeds,
+                'total_cost': proceeds,  # 卖出净额
                 'timestamp': datetime.now(),
                 'market_state': self.market_state.value,
                 'risk_level': self.risk_level.value
