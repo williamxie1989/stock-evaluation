@@ -18,7 +18,7 @@ class AkshareDataProvider:
         self.retry_delay = retry_delay
         logger.info(f"AkshareDataProvider retries configured: max_retries={max_retries}, retry_delay={retry_delay}s")
     
-    def get_stock_data(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    def get_stock_data(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> Optional[pd.DataFrame]:
         """获取股票历史数据"""
         # 转换股票代码格式，akshare只需要纯数字
         clean_symbol = symbol.replace('.SH', '').replace('.SZ', '').replace('sh', '').replace('sz', '')
@@ -34,10 +34,22 @@ class AkshareDataProvider:
         if '-' in end_date:
             end_date = end_date.replace('-', '')
         
+        # 规范化复权参数：akshare使用 ""(不复权)、"qfq"(前复权)、"hfq"(后复权)
+        if adjust is None:
+            adjust = ""
+        adjust = adjust.lower()
+        if adjust in ("none", "raw", "no", ""):
+            adjust_param = ""
+        elif adjust in ("qfq", "hfq"):
+            adjust_param = adjust
+        else:
+            logger.warning(f"未知的复权参数: {adjust}，使用不复权")
+            adjust_param = ""
+
         for attempt in range(self.max_retries):
             try:
                 # 使用akshare获取股票数据
-                df = ak.stock_zh_a_hist(symbol=clean_symbol, period="daily", start_date=start_date, end_date=end_date, adjust="")
+                df = ak.stock_zh_a_hist(symbol=clean_symbol, period="daily", start_date=start_date, end_date=end_date, adjust=adjust_param)
                 if not df.empty:
                     # 将中文列名转换为英文标准列名
                     column_mapping = {
@@ -63,7 +75,7 @@ class AkshareDataProvider:
                     if 'date' in df.columns:
                         df['date'] = pd.to_datetime(df['date'])
                     
-                    logger.info(f"成功获取 {symbol} 数据: {len(df)} 条记录")
+                    logger.info(f"成功获取 {symbol} 数据: {len(df)} 条记录 (adjust={adjust_param or 'none'})")
                     return df
             except Exception as e:
                 logger.warning(f"获取 {symbol} 数据失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
@@ -73,6 +85,75 @@ class AkshareDataProvider:
         
         logger.error(f"无法获取 {symbol} 的股票数据")
         return None
+
+
+    def get_stock_data_with_adjust(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        一次性获取不复权、前复权、后复权三种模式的日线数据，并合并到一个DataFrame：
+        包含列：open, high, low, close（不复权）以及 open_qfq/high_qfq/low_qfq/close_qfq、open_hfq/high_hfq/low_hfq/close_hfq。
+        明确使用akshare的新浪接口（stock_zh_a_hist adjust参数）获取复权数据。
+        """
+        try:
+            # 明确使用新浪接口
+            raw = self.get_stock_data(symbol, start_date, end_date, adjust="")
+            qfq = self.get_stock_data(symbol, start_date, end_date, adjust="qfq")
+            hfq = self.get_stock_data(symbol, start_date, end_date, adjust="hfq")
+        except Exception as e:
+            logger.warning(f"获取三种复权数据失败: {symbol} {e}")
+            return None
+
+        if raw is None and qfq is None and hfq is None:
+            return None
+
+        def _basic(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if df is None or df.empty:
+                return None
+            out = df.copy()
+            if 'date' in out.columns:
+                out['date'] = pd.to_datetime(out['date'])
+            keep = [c for c in ['date', 'open', 'high', 'low', 'close', 'volume', 'amount'] if c in out.columns]
+            return out[keep]
+
+        raw_b = _basic(raw)
+        qfq_b = _basic(qfq)
+        hfq_b = _basic(hfq)
+
+        # 合并时加suffixes，避免重复列
+        result = None
+        if raw_b is not None:
+            result = raw_b.sort_values('date').reset_index(drop=True)
+        elif qfq_b is not None:
+            result = qfq_b.sort_values('date').reset_index(drop=True)
+        elif hfq_b is not None:
+            result = hfq_b.sort_values('date').reset_index(drop=True)
+        else:
+            return None
+
+        # 合并前复权
+        if qfq_b is not None:
+            qfq_part = qfq_b.rename(columns={
+                'open': 'open_qfq', 'high': 'high_qfq', 'low': 'low_qfq', 'close': 'close_qfq'
+            })[['date', 'open_qfq', 'high_qfq', 'low_qfq', 'close_qfq']]
+            result = pd.merge(result, qfq_part, on='date', how='outer', suffixes=(None, '_qfq'))
+
+        # 合并后复权
+        if hfq_b is not None:
+            hfq_part = hfq_b.rename(columns={
+                'open': 'open_hfq', 'high': 'high_hfq', 'low': 'low_hfq', 'close': 'close_hfq'
+            })[['date', 'open_hfq', 'high_hfq', 'low_hfq', 'close_hfq']]
+            result = pd.merge(result, hfq_part, on='date', how='outer', suffixes=(None, '_hfq'))
+
+        # 只保留目标列
+        keep_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount',
+                     'open_qfq', 'high_qfq', 'low_qfq', 'close_qfq',
+                     'open_hfq', 'high_hfq', 'low_hfq', 'close_hfq']
+        for col in keep_cols:
+            if col not in result.columns:
+                result[col] = None
+        result = result[keep_cols]
+        result['symbol'] = symbol
+        result = result.sort_values('date').drop_duplicates(subset=['date'])
+        return result
     
     def get_realtime_data(self, symbols: Union[str, List[str]]) -> Optional[Union[Dict[str, Any], Dict[str, Dict[str, Any]]]]:
         """获取实时股票数据

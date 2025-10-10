@@ -47,6 +47,63 @@ class DataQualityMetrics:
 
 
 class UnifiedDataProvider(UnifiedDataProviderInterface):
+    def add_akshare_provider_with_adjust(self, as_primary: bool = True):
+        """
+        快捷注册AkshareDataProvider，支持复权扩展能力
+        """
+        try:
+            from src.data.providers.akshare_provider import AkshareDataProvider
+        except ImportError:
+            from .akshare_provider import AkshareDataProvider
+
+        class AkshareUnifiedAdapter(DataProviderInterface):
+            def __init__(self):
+                self.provider = AkshareDataProvider()
+
+            def get_stock_data(self, symbol: str, start_date: str, end_date: str, adjust: str = ""):
+                # 兼容unified接口，支持adjust参数
+                if hasattr(self.provider, 'get_stock_data'):
+                    return self.provider.get_stock_data(symbol, start_date, end_date, adjust=adjust)
+                return None
+
+            def get_stock_data_with_adjust(self, symbol: str, start_date: str, end_date: str):
+                if hasattr(self.provider, 'get_stock_data_with_adjust'):
+                    return self.provider.get_stock_data_with_adjust(symbol, start_date, end_date)
+                return None
+
+            def get_realtime_data(self, symbols):
+                return self.provider.get_realtime_data(symbols)
+
+            def get_financial_data(self, symbol):
+                return self.provider.get_financial_data(symbol)
+
+            def get_market_overview(self):
+                # 可选实现
+                return {}
+
+        adapter = AkshareUnifiedAdapter()
+        if as_primary:
+            self.add_primary_provider(adapter)
+        else:
+            self.add_fallback_provider(adapter)
+
+    def get_stock_data_with_adjust(self, symbol: str, start_date: str, end_date: str):
+        """
+        统一接口：获取三种复权价（如底层provider支持）
+        """
+        # 优先主provider
+        for provider in self.primary_providers:
+            if hasattr(provider, 'get_stock_data_with_adjust'):
+                df = provider.get_stock_data_with_adjust(symbol, start_date, end_date)
+                if df is not None:
+                    return df
+        # 再尝试fallback
+        for provider in self.fallback_providers:
+            if hasattr(provider, 'get_stock_data_with_adjust'):
+                df = provider.get_stock_data_with_adjust(symbol, start_date, end_date)
+                if df is not None:
+                    return df
+        return None
     """统一数据提供者 - 整合多个数据源"""
     
     def __init__(self, cache_ttl: int = 300, max_workers: int = 8):
