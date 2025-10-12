@@ -1457,15 +1457,24 @@ class UnifiedDataAccessLayer:
             df = self._get_from_l1_cache(cache_key)
             if df is not None:
                 source = "l1"
+                # 从L1缓存获取数据后，需要重新填充L0缓存
+                await self._save_to_l0_cache(symbol, start_dt, end_dt, fields, df, adjust_mode)
             else:
                 df = self._get_from_l2_cache(cache_key)
                 if df is not None:
                     source = "l2"
                     self._save_to_l1_cache(cache_key, df)
 
+
         if df is None:
             try:
-                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
+                try:
+                    df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
+                except TypeError as e:
+                    if "unexpected keyword argument 'fields'" in str(e):
+                        df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
+                    else:
+                        raise
             except AttributeError:
                 df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
 

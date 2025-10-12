@@ -1438,6 +1438,7 @@ class UnifiedModelTrainer:
     def _train_linear_model(self, X: pd.DataFrame, y: pd.Series, model_type: str, 
                           use_grid_search: bool = 1) -> Dict[str, Any]:
         """训练线性回归模型"""
+        import os
         from sklearn.model_selection import train_test_split, GridSearchCV
         from sklearn.preprocessing import StandardScaler
         from sklearn.linear_model import Ridge, Lasso, ElasticNet
