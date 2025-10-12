@@ -14,6 +14,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional
+from contextlib import contextmanager
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,6 +29,37 @@ if TYPE_CHECKING:
     from src.data.unified_data_access import UnifiedDataAccessLayer
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _suppress_provider_logs():
+    """临时抑制provider组件的INFO级别日志输出"""
+    # 获取provider相关的日志器
+    akshare_logger = logging.getLogger('src.data.providers.akshare_provider')
+    base_logger = logging.getLogger('src.data.providers.base_provider')
+    providers_logger = logging.getLogger('src.data.providers')
+    dbmanager_logger=logging.getLogger('src.data.db.unified_database_manager')
+    
+    # 保存原始级别
+    original_akshare_level = akshare_logger.level
+    original_base_level = base_logger.level
+    original_providers_level = providers_logger.level
+    original_dbmanager_level=dbmanager_logger.level
+    
+    # 临时设置为WARNING级别
+    akshare_logger.setLevel(logging.ERROR)
+    base_logger.setLevel(logging.ERROR)
+    providers_logger.setLevel(logging.ERROR)
+    dbmanager_logger.setLevel(logging.ERROR)
+    
+    try:
+        yield
+    finally:
+        # 恢复原始级别
+        akshare_logger.setLevel(original_akshare_level)
+        base_logger.setLevel(original_base_level)
+        providers_logger.setLevel(original_providers_level)
+        providers_logger.setLevel(original_dbmanager_level)
 
 
 def _parse_symbol_list(env_val: str) -> List[str]:
@@ -82,13 +114,17 @@ class CachePrefetchScheduler:
             f"[CachePrefetchScheduler] 开始预取 {len(self.symbols)} 支股票数据，日期范围: {start_date} - {end_date}"
         )
         successes, failures = 0, 0
-        for symbol in self.symbols:
-            try:
-                await self.uda.get_historical_data(symbol, start_date, end_date)
-                successes += 1
-            except Exception as e:
-                logger.error(f"预取 {symbol} 失败: {e}")
-                failures += 1
+        
+        # 在预取期间临时抑制provider的INFO级别日志
+        with _suppress_provider_logs():
+            for symbol in self.symbols:
+                try:
+                    await self.uda.get_historical_data(symbol, start_date, end_date)
+                    successes += 1
+                except Exception as e:
+                    logger.error(f"预取 {symbol} 失败: {e}")
+                    failures += 1
+        
         logger.info(
             f"[CachePrefetchScheduler] 预取任务完成，成功 {successes} 支，失败 {failures} 支。"
         )

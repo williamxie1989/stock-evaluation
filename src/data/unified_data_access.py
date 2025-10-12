@@ -73,6 +73,137 @@ class CacheFetchResult:
 class UnifiedDataAccessLayer:
     """统一数据访问层 - 整合数据库和外部数据源"""
 
+    PRICE_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
+        "open": (
+            "open",
+            "open_qfq",
+            "open_hfq",
+            "openprice",
+            "open_price",
+            "开盘",
+            "开盘价",
+        ),
+        "close": (
+            "close",
+            "close_qfq",
+            "close_hfq",
+            "closeprice",
+            "close_price",
+            "收盘",
+            "收盘价",
+        ),
+        "high": (
+            "high",
+            "high_qfq",
+            "high_hfq",
+            "最高",
+            "最高价",
+        ),
+        "low": (
+            "low",
+            "low_qfq",
+            "low_hfq",
+            "最低",
+            "最低价",
+        ),
+    }
+
+    @staticmethod
+    def _normalize_column_label(label: Any) -> str:
+        if isinstance(label, tuple):
+            parts = [str(part) for part in label if part is not None]
+            normalized = "_".join(parts)
+        else:
+            normalized = str(label)
+        return normalized.strip().lower()
+
+    @classmethod
+    def _price_data_complete(
+        cls,
+        frame: pd.DataFrame,
+        requested_fields: Tuple[str, ...],
+        mode: Optional[str],
+    ) -> bool:
+        if frame is None or frame.empty:
+            return False
+
+        tokens: Set[str] = set()
+        for field in requested_fields or ():
+            base = str(field).lower()
+            for token in ("open", "close", "high", "low"):
+                if token in base:
+                    tokens.add(token)
+
+        if not tokens:
+            tokens = {"close"}
+
+        normalized_columns = [
+            (col, cls._normalize_column_label(col)) for col in frame.columns
+        ]
+        price_mapping = cls._get_price_fields_mapping(mode)
+
+        for token in tokens:
+            alias_candidates = set(cls.PRICE_COLUMN_ALIASES.get(token, (token,)))
+
+            mapped_field = price_mapping.get(token)
+            if mapped_field:
+                alias_candidates.add(str(mapped_field).lower())
+
+            for field in requested_fields or ():
+                field_str = str(field)
+                if token in field_str.lower():
+                    alias_candidates.add(cls._normalize_column_label(field_str))
+
+            matches: List[Any] = [
+                original
+                for original, normalized in normalized_columns
+                if any(alias in normalized for alias in alias_candidates)
+            ]
+
+            if not matches:
+                logger.debug(
+                    "Price completeness check missing columns for token %s (available: %s)",
+                    token,
+                    [str(col) for col, _ in normalized_columns],
+                )
+                return False
+
+            valid = False
+            for col in matches:
+                try:
+                    series = frame[col]
+                except Exception:
+                    continue
+
+                if series is None:
+                    continue
+
+                try:
+                    if isinstance(series, pd.DataFrame):
+                        valid_count = series.notna().to_numpy().sum()
+                    else:
+                        valid_count = series.notna().sum()
+                except AttributeError:
+                    logger.debug(
+                        "Price completeness check encountered AttributeError for column %s (type %s)",
+                        col,
+                        type(series),
+                    )
+                    continue
+
+                if valid_count > 0:
+                    valid = True
+                    break
+
+            if not valid:
+                logger.debug(
+                    "Price completeness check found only empty columns for token %s",
+                    token,
+                )
+                return False
+
+        return True
+
     def clear_all_caches(self) -> None:
         """清空内部缓存，用于测试或重置"""
         try:
@@ -146,6 +277,7 @@ class UnifiedDataAccessLayer:
                         fields_key,
                         auto_sync_flag,
                         adjust_mode,
+                        force_refresh=False,
                     )
                 )
             finally:
@@ -279,9 +411,9 @@ class UnifiedDataAccessLayer:
             from src.data.providers.akshare_provider import AkshareDataProvider
             from src.data.providers.enhanced_realtime_provider import EnhancedRealtimeProvider
             from src.data.providers.optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
-            from src.data.providers.domestic.eastmoney_provider import EastmoneyDataProvider
-            from src.data.providers.domestic.tencent_provider import TencentDataProvider
-            from src.data.providers.domestic.netease_provider import NeteaseDataProvider
+            # from src.data.providers.domestic.eastmoney_provider import EastmoneyDataProvider
+            # from src.data.providers.domestic.tencent_provider import TencentDataProvider
+            # from src.data.providers.domestic.netease_provider import NeteaseDataProvider
             from src.data.providers.domestic.tushare_provider import TushareDataProvider
             from src.data.providers.domestic.sina_provider import SinaDataProvider
             
@@ -289,9 +421,9 @@ class UnifiedDataAccessLayer:
                 'akshare': AkshareDataProvider(),
                 'enhanced_realtime': EnhancedRealtimeProvider(),
                 'optimized_enhanced': OptimizedEnhancedDataProvider(),
-                'eastmoney': EastmoneyDataProvider(),
-                'tencent': TencentDataProvider(),
-                'netease': NeteaseDataProvider(),
+                # 'eastmoney': EastmoneyDataProvider(),
+                # 'tencent': TencentDataProvider(),
+                # 'netease': NeteaseDataProvider(),
                 'tushare': TushareDataProvider(),
                 'sina': SinaDataProvider()
             }
@@ -1282,11 +1414,47 @@ class UnifiedDataAccessLayer:
         start_dt: datetime,
         end_dt: datetime,
         fields: Tuple[str, ...],
+        adjust_mode: str = None,
     ) -> str:  # noqa: D401
-        """生成缓存键，包含 symbol + 日期范围 + 字段列表"""
+        """生成缓存键，包含 symbol + 日期范围 + 字段列表 + 复权类型
+        
+        Args:
+            symbol: 股票代码
+            start_dt: 开始日期
+            end_dt: 结束日期
+            fields: 字段列表
+            adjust_mode: 复权类型 (None, 'qfq', 'hfq')，确保不同复权类型使用不同缓存
+        """
 
         fields_part = ",".join(fields) if fields else "all"
-        return f"{symbol}|{start_dt.strftime('%Y-%m-%d')}|{end_dt.strftime('%Y-%m-%d')}|{fields_part}"
+        # 包含复权类型以避免缓存混淆
+        adjust_part = adjust_mode if adjust_mode else "none"
+        return f"{symbol}|{start_dt.strftime('%Y-%m-%d')}|{end_dt.strftime('%Y-%m-%d')}|{fields_part}|{adjust_part}"
+
+    def _invalidate_cache(self, cache_key: str) -> None:
+        """清除指定键的 L0/L1/L2 缓存，避免返回陈旧数据."""
+
+        if not self.config.use_cache:
+            return
+        try:
+            if hasattr(self, "_l1_cache") and getattr(self, "_l1_cache") is not None:
+                try:
+                    self._l1_cache.delete(cache_key)
+                except AttributeError:
+                    pass
+        except Exception as exc:  # pragma: no cover
+            logger.debug("L1 cache invalidate failed: %s", exc)
+        try:
+            cache_path = self._l2_cache_path(cache_key)
+            if cache_path.exists():
+                cache_path.unlink()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("L2 cache invalidate failed: %s", exc)
+        try:
+            if hasattr(self, "_l0_cached_loader"):
+                self._l0_cached_loader.cache_clear()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("L0 cache invalidate failed: %s", exc)
 
 
 
@@ -1341,9 +1509,12 @@ class UnifiedDataAccessLayer:
         if not self.config.use_cache or df is None or df.empty:
             return
         try:
+            import uuid
             path = self._l2_cache_path(cache_key)
-            tmp_path = path.with_suffix(".tmp")
+            # 使用唯一临时文件名避免并发写入冲突
+            tmp_path = path.parent / f"{path.stem}_{uuid.uuid4().hex}.tmp"
             df.to_parquet(tmp_path, index=False)
+            # 原子性重命名（在POSIX系统上）
             tmp_path.replace(path)
         except Exception as exc:
             logger.warning("Save L2 cache failed: %s", exc)
@@ -1410,6 +1581,9 @@ class UnifiedDataAccessLayer:
             else:
                 self._cache_stats['misses'] += 1
         else:
+            if force_refresh and self.config.use_cache:
+                cache_key = self._make_cache_key(standardized_symbol, start_dt, end_dt, fields_tuple, effective_adjust_mode)
+                self._invalidate_cache(cache_key)
             result = await self._load_historical_data_uncached(
                 standardized_symbol,
                 start_dt,
@@ -1417,6 +1591,7 @@ class UnifiedDataAccessLayer:
                 fields_tuple,
                 auto_sync_flag,
                 effective_adjust_mode,
+                force_refresh=force_refresh,
             )
             cache_source = result.source
             if self.config.use_cache:
@@ -1445,20 +1620,20 @@ class UnifiedDataAccessLayer:
         fields: Tuple[str, ...],
         auto_sync_flag: bool,
         adjust_mode: str = None,
+        *,
+        force_refresh: bool = False,
     ) -> CacheFetchResult:
         """实际加载数据的实现，供 L0 缓存包装器调用"""
 
-        cache_key = self._make_cache_key(symbol, start_dt, end_dt, fields)
+        cache_key = self._make_cache_key(symbol, start_dt, end_dt, fields, adjust_mode)
         source = "db"
 
         df: pd.DataFrame | None = None
 
-        if self.config.use_cache:
+        if self.config.use_cache and not force_refresh:
             df = self._get_from_l1_cache(cache_key)
             if df is not None:
                 source = "l1"
-                # 从L1缓存获取数据后，需要重新填充L0缓存
-                await self._save_to_l0_cache(symbol, start_dt, end_dt, fields, df, adjust_mode)
             else:
                 df = self._get_from_l2_cache(cache_key)
                 if df is not None:
@@ -1468,15 +1643,17 @@ class UnifiedDataAccessLayer:
 
         if df is None:
             try:
+                field_list = list(fields) if fields else None
                 try:
-                    df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
+                    df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=field_list)
                 except TypeError as e:
                     if "unexpected keyword argument 'fields'" in str(e):
                         df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt)
                     else:
                         raise
             except AttributeError:
-                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=list(fields))
+                field_list = list(fields) if fields else None
+                df = await self.db_manager.get_stock_data(symbol, start_dt, end_dt, fields=field_list)
 
             if df is None:
                 df = pd.DataFrame()
@@ -1498,6 +1675,55 @@ class UnifiedDataAccessLayer:
         if df is None:
             df = pd.DataFrame()
 
+        def _needs_price_fields(requested_fields: Tuple[str, ...]) -> bool:
+            if not requested_fields:
+                return True
+            for field in requested_fields:
+                base = field.lower()
+                if any(token in base for token in ("open", "close", "high", "low")):
+                    return True
+            return False
+
+        # 在字段过滤前先检查价格完整性，避免过滤后列缺失导致误判
+        # 注意：从缓存加载的数据已经过字段过滤和重命名，跳过完整性检查
+        if (_needs_price_fields(fields) and not df.empty and 
+            source not in ("l1", "l2") and  # 缓存数据已验证，跳过检查
+            not self._price_data_complete(df, fields, adjust_mode) and 
+            not force_refresh):
+            logger.warning(
+                "Detected incomplete price data for %s [%s,%s], forcing refresh (columns: %s, fields: %s, adjust_mode: %s)",
+                symbol,
+                start_dt.strftime("%Y-%m-%d"),
+                end_dt.strftime("%Y-%m-%d"),
+                list(df.columns),
+                fields,
+                adjust_mode,
+            )
+            self._invalidate_cache(cache_key)
+            return await self._load_historical_data_uncached(
+                symbol,
+                start_dt,
+                end_dt,
+                fields,
+                auto_sync_flag,
+                adjust_mode,
+                force_refresh=True,
+            )
+
+        if _needs_price_fields(fields) and df.empty and not force_refresh:
+            # 某些缓存会存储空数据，尝试强制刷新一次
+            self._invalidate_cache(cache_key)
+            return await self._load_historical_data_uncached(
+                symbol,
+                start_dt,
+                end_dt,
+                fields,
+                auto_sync_flag,
+                adjust_mode,
+                force_refresh=True,
+            )
+
+        # 完整性检查后，先做字段过滤（使用映射后的字段名）
         if fields:
             available_fields = [field for field in fields if field in df.columns]
             if available_fields:
@@ -1507,7 +1733,7 @@ class UnifiedDataAccessLayer:
         else:
             df = df.copy()
 
-        # 如果使用了复权模式，需要将复权字段重命名为标准字段名
+        # 字段过滤后再将复权字段重命名为标准字段名
         if adjust_mode in ["qfq", "hfq"] and df is not None and not df.empty:
             price_mapping = self._get_price_fields_mapping(adjust_mode)
             # 创建反向映射：从复权字段名到标准字段名

@@ -303,7 +303,65 @@ class PortfolioPipeline:
                 break
         return symbols
 
+    def _normalize_dataframe_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """统一DataFrame列名格式（同时支持大小写）"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        
+        # 统一列名（lowercase）
+        cols = {c.lower(): c for c in df.columns}
+        def get_col(name):
+            return df[cols[name]] if name in cols else df.get(name)
+        
+        out = pd.DataFrame({
+            'open': get_col('open'),
+            'close': get_col('close'),
+            'high': get_col('high'),
+            'low': get_col('low'),
+            'volume': get_col('volume') if 'volume' in cols or 'volume' in df.columns else df.get('turnover')
+        }, index=df.index)
+        out = out.dropna()
+        
+        # 统一数值列为 float，避免 decimal 与 float 运算冲突
+        for col in out.columns:
+            if not np.issubdtype(out[col].dtype, np.number) or out[col].dtype == 'object':
+                out[col] = pd.to_numeric(out[col], errors='coerce')
+        num_cols = out.select_dtypes(include=[np.number]).columns
+        out[num_cols] = out[num_cols].astype(float)
+        
+        # 兼容大小写列名需求（同时保留大小写版本）
+        for lower, upper in [('open','Open'),('close','Close'),('high','High'),('low','Low'),('volume','Volume')]:
+            if lower in out.columns and upper not in out.columns:
+                out[upper] = out[lower]
+            if upper in out.columns and lower not in out.columns:
+                out[lower] = out[upper]
+        
+        return out
+
     def _fetch_history(self, symbol: str, end_date: Optional[pd.Timestamp] = None, days: int = 120) -> pd.DataFrame:
+        """获取历史数据，优先使用预加载缓存（性能优化）"""
+        # ======================================================================
+        # P0性能优化: 优先使用预加载缓存
+        # ======================================================================
+        if hasattr(self, '_preload_cache') and symbol in self._preload_cache:
+            cached_df = self._preload_cache[symbol]
+            if cached_df is not None and not cached_df.empty:
+                # 根据end_date和days筛选缓存数据的时间范围
+                if end_date is None:
+                    end_date = pd.Timestamp(datetime.now().date())
+                start_date = end_date - pd.Timedelta(days=days)
+                
+                # 筛选时间范围内的数据
+                mask = (cached_df.index >= start_date) & (cached_df.index <= end_date)
+                filtered_df = cached_df[mask].copy()
+                
+                if not filtered_df.empty:
+                    # 应用列名标准化处理
+                    return self._normalize_dataframe_columns(filtered_df)
+        
+        # ======================================================================
+        # 回退到原有逻辑：从数据访问层获取数据
+        # ======================================================================
         if end_date is None:
             end_date = pd.Timestamp(datetime.now().date())
         start_date = end_date - pd.Timedelta(days=days)
@@ -329,33 +387,9 @@ class PortfolioPipeline:
                 df = loop.run_until_complete(res)
             finally:
                 loop.close()
-        if df is None:
-            return pd.DataFrame()
-        # 统一列名（lowercase）
-        cols = {c.lower(): c for c in df.columns}
-        def get_col(name):
-            return df[cols[name]] if name in cols else df.get(name)
-        out = pd.DataFrame({
-            'open': get_col('open'),
-            'close': get_col('close'),
-            'high': get_col('high'),
-            'low': get_col('low'),
-            'volume': get_col('volume') if 'volume' in cols or 'volume' in df.columns else df.get('turnover')
-        }, index=df.index)
-        out = out.dropna()
-        # 统一数值列为 float，避免 decimal 与 float 运算冲突
-        for col in out.columns:
-            if not np.issubdtype(out[col].dtype, np.number) or out[col].dtype == 'object':
-                out[col] = pd.to_numeric(out[col], errors='coerce')
-        num_cols = out.select_dtypes(include=[np.number]).columns
-        out[num_cols] = out[num_cols].astype(float)
-        # 兼容大小写列名需求
-        for lower, upper in [('open','Open'),('close','Close'),('high','High'),('low','Low'),('volume','Volume')]:
-            if lower in out.columns and upper not in out.columns:
-                out[upper] = out[lower]
-            if upper in out.columns and lower not in out.columns:
-                out[lower] = out[upper]
-        return out
+        
+        # 应用列名标准化处理
+        return self._normalize_dataframe_columns(df)
 
     def _compute_model_score(self, df: pd.DataFrame) -> float:
         """根据模型输出计算得分，若模型缺失则返回0"""
@@ -400,32 +434,67 @@ class PortfolioPipeline:
             return 0.0
         return float(np.mean(score_parts))
 
-    def pick_stocks(self, as_of_date: Optional[pd.Timestamp] = None, candidates: Optional[List[str]] = None, top_n: Optional[int] = None) -> List[PickResult]:
-        """基于信号与风险评分的选股（首版）"""
+    def pick_stocks(self, as_of_date: Optional[pd.Timestamp] = None, candidates: Optional[List[str]] = None, top_n: Optional[int] = None, skip_signals: bool = False) -> List[PickResult]:
+        """基于信号与风险评分的选股（首版）
+        
+        Args:
+            as_of_date: 截止日期
+            candidates: 候选股票列表
+            top_n: 返回的股票数量
+            skip_signals: 是否跳过信号生成（用于被动调仓模式，显著提升性能）
+        """
         if as_of_date is None:
             as_of_date = pd.Timestamp(datetime.now().date())
         syms = candidates or self._get_stock_pool(limit=3000)
         if not syms:
             return []
+        
+        # ======================================================================
+        # 诊断日志：记录筛选统计
+        # ======================================================================
+        total_candidates = len(syms)
+        skip_empty = 0
+        skip_insufficient = 0
+        
         results: List[PickResult] = []
         for sym in syms:
             df = self._fetch_history(sym, end_date=as_of_date, days=self.lookback_days)
-            if df is None or df.empty or len(df) < 30:
+            if df is None or df.empty:
+                skip_empty += 1
+                continue
+            if len(df) < 30:
+                skip_insufficient += 1
                 continue
             # 模型分数
             model_score = self._compute_model_score(df)
-            # 生成信号
-            signals = self.signal_gen.generate_signals(df, symbol=sym) or []
-            latest_signal = signals[-1] if len(signals) > 0 else None
+            
+            # 根据 skip_signals 参数决定是否生成信号
+            latest_signal = None
+            signal_strength = 0.0
+            if not skip_signals:
+                # 生成信号
+                signals = self.signal_gen.generate_signals(df, symbol=sym) or []
+                latest_signal = signals[-1] if len(signals) > 0 else None
+                # 信号强度
+                signal_strength = float(latest_signal.strength) if latest_signal else 0.0
+            
             # 风险评分
             risk_info = self.risk_manager.assess_signal_risk(df, {'type': latest_signal.signal_type if latest_signal else 'HOLD'})
             risk_score = float(risk_info.get('risk_score', 0.5))
-            # 信号强度
-            signal_strength = float(latest_signal.strength) if latest_signal else 0.0
+            
             # 综合分数
             score = self.w_model * model_score + self.w_signal * signal_strength - self.w_risk * risk_score
             reason = f"model={model_score:.2f}|sig={signal_strength:.2f}|risk={risk_score:.2f}"
             results.append(PickResult(symbol=sym, score=score, reason=reason, signal=latest_signal, risk_score=risk_score))
+        
+        # ======================================================================
+        # 诊断日志：输出筛选统计
+        # ======================================================================
+        logger.info(
+            f"[pick_stocks筛选] 候选={total_candidates} 空数据={skip_empty} "
+            f"数据不足(<30行)={skip_insufficient} 有效={len(results)}"
+        )
+        
         # 排序
         k = top_n or self.top_n
         results.sort(key=lambda x: x.score, reverse=True)
@@ -450,8 +519,6 @@ class PortfolioPipeline:
             return []
         n = len(picks)
         target_weight = 1.0 / n
-        holdings: List[Holding] = []
-    
         symbols = [p.symbol for p in picks]
         # 批量获取最近5个交易日的历史数据，避免高频逐只调用
         start_date = (as_of_date - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
@@ -461,15 +528,35 @@ class PortfolioPipeline:
         except AttributeError:
             # 兼容旧版本 data_access，不支持 batch 时回退逐只调用
             batch_data = {sym: self._fetch_history(sym, end_date=as_of_date, days=5) for sym in symbols}
-    
+
+        prepared: List[Tuple[str, float, int]] = []  # (symbol, actual_value, shares)
+        total_invested = 0.0
+
         for p in picks:
             df = batch_data.get(p.symbol)
             if df is None or df.empty:
                 continue
             price = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
+            if price <= 0:
+                continue
             alloc = capital * target_weight
-            shares = (alloc * (1 - self.commission_rate)) / price if price > 0 else 0
-            holdings.append(Holding(symbol=p.symbol, weight=target_weight, shares=shares))
+            # 使用整数股数，避免出现 NAV mismatch
+            shares = int((alloc * (1 - self.commission_rate)) // price)
+            if shares <= 0:
+                continue
+            actual_value = shares * price
+            if actual_value <= 0:
+                continue
+            prepared.append((p.symbol, actual_value, shares))
+            total_invested += actual_value
+
+        if not prepared or total_invested <= 0:
+            return []
+
+        holdings: List[Holding] = []
+        for symbol, actual_value, shares in prepared:
+            weight = actual_value / total_invested if total_invested > 0 else 0.0
+            holdings.append(Holding(symbol=symbol, weight=weight, shares=shares))
         return holdings
 
     def _portfolio_nav(self, holdings: List[Holding], start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Series:
@@ -518,69 +605,82 @@ class PortfolioPipeline:
         return nav
 
     def run(self, start_date: str, end_date: str, candidates: Optional[List[str]] = None) -> Dict[str, Any]:
-        """执行：初始选股建仓→30天调仓→组合净值与指标"""
+        """执行：初始选股建仓→定期调仓→输出净值与指标"""
         start_dt = pd.Timestamp(start_date)
         end_dt = pd.Timestamp(end_date)
-        # 初始选股与建仓（以start_dt为as_of_date）
+
         picks0 = self.pick_stocks(as_of_date=start_dt, candidates=candidates)
         holdings = self._equal_weight_holdings(picks0, as_of_date=start_dt, capital=self.initial_capital)
-        # 生成调仓时间点（月末近似）
+
         rebal_dates = pd.date_range(start=start_dt, end=end_dt, freq=self.rebalance_freq)
+        if rebal_dates.empty or rebal_dates[0] != start_dt:
+            rebal_dates = pd.DatetimeIndex([start_dt]).append(rebal_dates)
+
         picks_history: List[Dict[str, Any]] = []
         nav_full = pd.Series(dtype=float)
         last_date = start_dt
         capital = self.initial_capital
 
-        for i, dt in enumerate(rebal_dates):
-            # 区间净值
+        for idx, dt in enumerate(rebal_dates):
             seg_nav = self._portfolio_nav(holdings, start_date=last_date, end_date=dt)
             if seg_nav is not None and not seg_nav.empty:
-                nav_full = pd.concat([nav_full, seg_nav])
+                nav_full = pd.concat([nav_full, seg_nav]) if not nav_full.empty else seg_nav
                 capital = float(seg_nav.iloc[-1])
-            # 记录当前持仓的价值与选股结果
-            picks_history.append({
-                'date': dt.strftime('%Y-%m-%d'),
-                'picks': [p.symbol for p in (picks0 if i == 0 else self.pick_stocks(as_of_date=dt, candidates=candidates))]
-            })
-            # 调仓：以dt为as_of_date的重新等权
-            picks_now = self.pick_stocks(as_of_date=dt, candidates=candidates)
-            holdings = self._equal_weight_holdings(picks_now, as_of_date=dt, capital=capital)
-            last_date = dt
 
-        # 最后区间
+            snapshot_picks = picks0 if idx == 0 else self.pick_stocks(as_of_date=dt, candidates=candidates)
+            picks_history.append(
+                {
+                    "date": dt.strftime("%Y-%m-%d"),
+                    "picks": [p.symbol for p in snapshot_picks],
+                }
+            )
+
+            if idx < len(rebal_dates) - 1:
+                picks_now = self.pick_stocks(as_of_date=dt, candidates=candidates)
+                holdings = self._equal_weight_holdings(picks_now, as_of_date=dt, capital=capital)
+                last_date = dt
+
         if last_date < end_dt:
             seg_nav = self._portfolio_nav(holdings, start_date=last_date, end_date=end_dt)
             if seg_nav is not None and not seg_nav.empty:
-                nav_full = pd.concat([nav_full, seg_nav])
+                nav_full = pd.concat([nav_full, seg_nav]) if not nav_full.empty else seg_nav
 
-        # 指标计算
-        metrics = {}
-        if nav_full is not None and not nav_full.empty:
-            initial = float(nav_full.iloc[0]) if nav_full.iloc[0] > 0 else self.initial_capital
-            final = float(nav_full.iloc[-1])
-            total_return = (final - initial) / initial if initial > 0 else 0.0
+        if nav_full.empty:
+            nav_full = pd.Series([self.initial_capital], index=pd.DatetimeIndex([start_dt]))
+
+        initial = float(nav_full.iloc[0])
+        final = float(nav_full.iloc[-1])
+        total_return = (final - initial) / initial if initial > 0 else 0.0
+
+        if len(nav_full.index) >= 2:
             days = max((nav_full.index[-1] - nav_full.index[0]).days, 1)
-            try:
-                annualized = ((1 + total_return) ** (365.0 / days) - 1) if (1 + total_return) > 0 else -1.0
-            except Exception:
-                annualized = 0.0
-            # 最大回撤
-            cum = nav_full.values
+        else:
+            days = max((end_dt - start_dt).days, 1)
+        try:
+            annualized = (1 + total_return) ** (365 / days) - 1 if days > 0 else total_return
+        except Exception:
+            annualized = total_return
+
+        cum = nav_full.values
+        if len(cum) == 0:
+            max_dd = 0.0
+        else:
             running_max = np.maximum.accumulate(cum)
             drawdowns = (cum - running_max) / running_max
-            max_dd = float(np.min(drawdowns)) if len(drawdowns) > 0 else 0.0
-            metrics = {
-                'initial_value': initial,
-                'final_value': final,
-                'total_return': total_return,
-                'annualized_return': annualized,
-                'max_drawdown': abs(max_dd)
-            }
+            max_dd = float(drawdowns.min()) if len(drawdowns) else 0.0
+
+        metrics = {
+            "initial_value": initial,
+            "final_value": final,
+            "total_return": total_return,
+            "annualized_return": annualized,
+            "max_drawdown": abs(max_dd),
+        }
 
         return {
-            'nav': nav_full,
-            'picks_history': picks_history,
-            'metrics': metrics
+            "nav": nav_full,
+            "picks_history": picks_history,
+            "metrics": metrics,
         }
 
 

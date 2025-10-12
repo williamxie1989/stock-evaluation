@@ -7,6 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.tailwindcss.com/?plugins=typography"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.0/dist/chartjs-plugin-zoom.min.js"></script>
     <script>
         const API_BASE = window.API_BASE || window.location.origin;
         function api(path) {
@@ -83,6 +84,20 @@
             </div>
             <canvas id="navChart" height="220" class="w-full"></canvas>
             <div id="navChartEmpty" class="text-center text-gray-500 text-sm mt-4 hidden">暂无净值历史数据</div>
+            <div id="navChartControls" class="mt-4 hidden">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="flex items-center gap-3 text-sm text-gray-600">
+                        <span class="whitespace-nowrap">显示范围</span>
+                        <input type="range" id="navChartWindow" min="30" max="180" value="180" class="w-52">
+                        <span id="navChartWindowLabel" class="tabular-nums"></span>
+                    </div>
+                    <div class="flex items-center gap-3 text-sm text-gray-600">
+                        <span class="hidden sm:block">交互提示</span>
+                        <span class="sm:hidden text-xs text-gray-500">滚轮缩放 / 拖拽查看</span>
+                        <button id="navChartReset" type="button" class="text-blue-600 hover:underline">重置视图</button>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- 持仓表 -->
@@ -138,10 +153,59 @@ const holdingsEmpty = document.getElementById('holdingsEmpty');
 const navChartCanvas = document.getElementById('navChart');
 const navChartEmpty = document.getElementById('navChartEmpty');
 const navChartRange = document.getElementById('navChartRange');
+const navChartControls = document.getElementById('navChartControls');
+const navChartWindow = document.getElementById('navChartWindow');
+const navChartWindowLabel = document.getElementById('navChartWindowLabel');
+const navChartReset = document.getElementById('navChartReset');
 const rebalanceList = document.getElementById('rebalanceList');
 const rebalanceEmpty = document.getElementById('rebalanceEmpty');
 
 let navChartInstance = null;
+let navChartRawData = [];
+
+function _bindNavChartControls() {
+    if (!navChartWindow || navChartWindow.dataset.bound === '1') {
+        return;
+    }
+    navChartWindow.addEventListener('input', () => {
+        const days = Number(navChartWindow.value) || navChartRawData.length;
+        updateNavChartView(days);
+    });
+    if (navChartReset) {
+        navChartReset.addEventListener('click', () => {
+            if (!navChartRawData.length) return;
+            if (navChartWindow) {
+                navChartWindow.value = Math.min(navChartRawData.length, Number(navChartWindow.max) || navChartRawData.length);
+            }
+            if (navChartInstance && navChartInstance.resetZoom) {
+                navChartInstance.resetZoom();
+            }
+            updateNavChartView(navChartRawData.length);
+        });
+    }
+    navChartWindow.dataset.bound = '1';
+}
+
+function updateNavChartView(windowSize) {
+    if (!navChartInstance || !navChartRawData.length) {
+        return;
+    }
+    const totalPoints = navChartRawData.length;
+    const clampedSize = Math.min(Math.max(Math.floor(windowSize) || totalPoints, 2), totalPoints);
+    const view = navChartRawData.slice(-clampedSize);
+    const labels = view.map(item => item.date);
+    const numericData = view.map(item => item.value);
+    navChartInstance.data.labels = labels;
+    navChartInstance.data.datasets[0].data = numericData;
+    navChartInstance.update('none');
+    navChartRange.textContent = labels.length ? `${labels[0]} ~ ${labels[labels.length - 1]}` : '';
+    if (navChartWindowLabel) {
+        navChartWindowLabel.textContent = `${clampedSize} 天`;
+    }
+    if (navChartWindow && Number(navChartWindow.value) !== clampedSize) {
+        navChartWindow.value = clampedSize;
+    }
+}
 
 function formatNumber(value, digits = 2) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -265,10 +329,14 @@ function renderNavChart(history = []) {
         seenDates.add(date);
         cleaned.push({ date, value });
     });
+    navChartRawData = cleaned;
     const limited = cleaned.slice(-180);
     if (!limited || limited.length < 2) {
         navChartEmpty.classList.remove('hidden');
         navChartRange.textContent = '';
+        if (navChartControls) {
+            navChartControls.classList.add('hidden');
+        }
         return;
     }
     navChartEmpty.classList.add('hidden');
@@ -294,6 +362,22 @@ function renderNavChart(history = []) {
         axisMax = center + 0.02;
     }
     navChartRange.textContent = `${labels[0]} ~ ${labels[labels.length - 1]}`;
+    if (navChartControls) {
+        const maxWindow = cleaned.length;
+        const minWindow = Math.min(30, maxWindow);
+        const initialWindow = Math.min(Math.max(minWindow, Number(navChartWindow?.value) || maxWindow), maxWindow);
+        if (navChartWindow) {
+            navChartWindow.max = String(maxWindow);
+            navChartWindow.min = String(Math.max(2, minWindow));
+            navChartWindow.step = '1';
+            navChartWindow.value = String(initialWindow);
+        }
+        if (navChartWindowLabel) {
+            navChartWindowLabel.textContent = `${initialWindow} 天`;
+        }
+        navChartControls.classList.toggle('hidden', maxWindow < 3);
+        _bindNavChartControls();
+    }
     navChartInstance = new Chart(navChartCanvas, {
         type: 'line',
         data: {
@@ -323,6 +407,28 @@ function renderNavChart(history = []) {
                             return `净值 ${value.toFixed(4)}`;
                         }
                     }
+                },
+                zoom: {
+                    limits: {
+                        x: { minRange: 7 }
+                    },
+                    pan: {
+                        enabled: true,
+                        mode: 'x',
+                        modifierKey: 'shift'
+                    },
+                    zoom: {
+                        wheel: {
+                            enabled: true,
+                        },
+                        pinch: {
+                            enabled: true,
+                        },
+                        drag: {
+                            enabled: false,
+                        },
+                        mode: 'x',
+                    }
                 }
             },
             scales: {
@@ -345,6 +451,9 @@ function renderNavChart(history = []) {
             }
         }
     });
+
+    const windowSize = navChartWindow ? Number(navChartWindow.value) : limited.length;
+    updateNavChartView(windowSize || limited.length);
 }
 
 function renderHoldings(holdings = []) {
