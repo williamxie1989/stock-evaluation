@@ -96,12 +96,15 @@ def check_data_completeness(conn, symbol, start_date, end_date):
     
     return missing_dates
 
-def get_missing_date_ranges(missing_dates):
+def get_missing_date_ranges(missing_dates, threshold_days=20):
     """
     将连续的缺失日期合并为日期范围，提高处理效率
     
+    优化策略：如果缺失天数超过阈值，直接进行完整同步
+    
     Args:
         missing_dates: 缺失日期列表
+        threshold_days: 阈值天数，超过此天数则进行完整同步
         
     Returns:
         list: 日期范围列表，每个元素为(start_date, end_date)
@@ -110,6 +113,13 @@ def get_missing_date_ranges(missing_dates):
         return []
     
     missing_dates.sort()
+    
+    # 如果总缺失天数超过阈值，直接返回完整范围
+    total_missing_days = (missing_dates[-1] - missing_dates[0]).days + 1
+    if total_missing_days > threshold_days:
+        # 直接返回完整范围，避免按小范围逐个处理
+        return [(missing_dates[0], missing_dates[-1])]
+    
     ranges = []
     current_start = missing_dates[0]
     current_end = missing_dates[0]
@@ -119,11 +129,23 @@ def get_missing_date_ranges(missing_dates):
         if (missing_dates[i] - current_end).days == 1:
             current_end = missing_dates[i]
         else:
-            ranges.append((current_start, current_end))
+            # 检查当前范围的天数是否超过阈值
+            current_range_days = (current_end - current_start).days + 1
+            if current_range_days > threshold_days:
+                # 当前范围超过阈值，直接使用完整范围
+                ranges.append((current_start, current_end))
+            else:
+                ranges.append((current_start, current_end))
             current_start = missing_dates[i]
             current_end = missing_dates[i]
     
-    ranges.append((current_start, current_end))
+    # 处理最后一个范围
+    current_range_days = (current_end - current_start).days + 1
+    if current_range_days > threshold_days:
+        ranges.append((current_start, current_end))
+    else:
+        ranges.append((current_start, current_end))
+    
     return ranges
 
 def update_adjusted_prices(conn, symbol, df):
@@ -233,10 +255,14 @@ def main():
             
             if missing_dates:
                 # 有缺失数据，进行智能增量更新
-                missing_ranges = get_missing_date_ranges(missing_dates)
+                missing_ranges = get_missing_date_ranges(missing_dates, threshold_days=20)
                 total_missing += len(missing_dates)
                 
                 print(f"  -> 发现 {len(missing_dates)} 个缺失数据点，合并为 {len(missing_ranges)} 个日期范围")
+                
+                # 检查是否有大量缺失数据（超过阈值）
+                if len(missing_ranges) == 1 and len(missing_dates) > 20:
+                    print(f"  -> 检测到大量缺失数据（{len(missing_dates)}天），将进行完整同步")
                 
                 # 记录缺失数据信息
                 record_missing_data(symbol, missing_ranges, "数据完整性检查发现缺失")
@@ -244,7 +270,13 @@ def main():
                 # 对每个缺失日期范围进行增量更新
                 range_updated = 0
                 for range_idx, (range_start, range_end) in enumerate(missing_ranges):
-                    print(f"    [{range_idx+1}/{len(missing_ranges)}] 处理范围: {range_start} ~ {range_end}")
+                    range_days = (range_end - range_start).days + 1
+                    
+                    # 根据范围大小调整处理策略
+                    if range_days > 20:
+                        print(f"    [{range_idx+1}/{len(missing_ranges)}] 处理大范围: {range_start} ~ {range_end} ({range_days}天)")
+                    else:
+                        print(f"    [{range_idx+1}/{len(missing_ranges)}] 处理范围: {range_start} ~ {range_end} ({range_days}天)")
                     
                     # 获取缺失日期范围的数据
                     df = provider.get_stock_data_with_adjust(symbol, str(range_start), str(range_end))
@@ -255,8 +287,13 @@ def main():
                     else:
                         print(f"      -> 无数据，跳过")
                     
-                    # 小范围间隔，避免请求过快
-                    time.sleep(SLEEP_BETWEEN_STOCKS / 2)
+                    # 根据范围大小调整间隔时间
+                    if range_days > 20:
+                        # 大范围处理，适当增加间隔
+                        time.sleep(SLEEP_BETWEEN_STOCKS)
+                    else:
+                        # 小范围处理，使用较短间隔
+                        time.sleep(SLEEP_BETWEEN_STOCKS / 2)
                 
                 total_updated += range_updated
                 print(f"  -> 该股票共更新了 {range_updated} 条记录")
