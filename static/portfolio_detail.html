@@ -260,6 +260,20 @@ function formatWeight(weight) {
     return `${(Number(weight) * 100).toFixed(2)}%`;
 }
 
+function buildXueqiuUrl(symbol) {
+    if (!symbol) return '#';
+    
+    let cleanSymbol = symbol;
+    // 去掉.SH、.SZ等市场后缀
+    if (cleanSymbol.includes('.')) {
+        cleanSymbol = cleanSymbol.split('.')[0];
+    }
+    // 确保有正确的市场前缀
+    const finalSymbol = cleanSymbol.startsWith('SH') || cleanSymbol.startsWith('SZ') ? cleanSymbol : 
+                  (cleanSymbol.startsWith('0') || cleanSymbol.startsWith('3') ? 'SZ' + cleanSymbol : 'SH' + cleanSymbol);
+    return `https://xueqiu.com/S/${finalSymbol}`;
+}
+
 function renderStrategyTags(tags = []) {
     strategyTagsEl.innerHTML = '';
     (tags || []).forEach(tag => {
@@ -470,9 +484,13 @@ function renderHoldings(holdings = []) {
             const tr = document.createElement('tr');
             const dailyClass = percentClass(holding.daily_return_pct);
             const pnlClass = percentClass(holding.pnl_pct);
+            
+            // 构建雪球链接
+            const xueqiuUrl = buildXueqiuUrl(holding.symbol || holding.code);
+            
             tr.innerHTML = `
                 <td class="px-4 py-3 align-top">
-                    <div class="font-medium text-gray-800">${holding.name || holding.symbol}</div>
+                    <div class="font-medium text-blue-600 hover:text-blue-800 cursor-pointer" onclick="window.open('${xueqiuUrl}', '_blank');">${holding.name || holding.symbol}</div>
                     <div class="text-xs text-gray-500 mt-1">${holding.code || holding.symbol}</div>
                 </td>
                 <td class="px-4 py-3 align-top text-gray-700">¥${formatCurrency(holding.latest_price, 2)}</td>
@@ -510,7 +528,12 @@ function renderRebalance(history = []) {
                 const weightText = (h.weight_pct !== undefined && h.weight_pct !== null)
                     ? `${Number(h.weight_pct).toFixed(2)}%`
                     : formatWeight(h.weight);
-                return `${displayName}${symbolText} ${weightText}`;
+                
+                // 构建雪球链接
+                const xueqiuUrl = buildXueqiuUrl(h.symbol || h.code);
+                const nameWithLink = `<a href="${xueqiuUrl}" target="_blank" class="text-blue-600 hover:text-blue-800 hover:underline">${displayName}</a>`;
+                
+                return `${nameWithLink}${symbolText} ${weightText}`;
             })
             .join('，');
         const preview = previewItems
