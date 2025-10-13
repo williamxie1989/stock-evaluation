@@ -25,20 +25,35 @@ from ...trading.signals.signal_generator import SignalGenerator
 from ...services.stock.stock_status_filter import StockStatusFilter
 # 引入字段映射工具，统一字段名
 from src.data.field_mapping import FieldMapper
+# 导入性能优化配置
+from config.prediction_config import (
+    MAX_STOCK_POOL_SIZE,
+    ENABLE_FEATURE_CACHE,
+    FEATURE_CACHE_TTL,
+    FEATURE_CACHE_DIR,
+    ENABLE_SYMBOL_CACHE,
+    SYMBOL_CACHE_TTL,
+)
 import logging
 import re
 
 # 导入增强预处理pipeline
-from src.ml.features.enhanced_preprocessing import EnhancedPreprocessingPipeline, create_enhanced_preprocessing_config
+from src.ml.features.enhanced_preprocessing import (
+    EnhancedPreprocessingPipeline,
+    create_enhanced_preprocessing_config,
+)
+# 导入V2统一特征构建器
+from src.ml.features.unified_feature_builder import UnifiedFeatureBuilder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class IntelligentStockSelector:
     """
     智能选股服务
     """
-    
+
     # 新增: 工具方法 – 统一替换匿名特征名，避免多处重复实现
     def _replace_anonymous_feature_names(self, model, actual_column_names):
         """如果模型的 feature_names_in_ 为匿名的 feature_0、feature_1 等，占位名字，则使用实际列名替换。
@@ -113,6 +128,19 @@ class IntelligentStockSelector:
             self.feature_generator = EnhancedFeatureGenerator()
         else:
             self.feature_generator = FeatureGenerator()
+        
+        # 新增：为V2模型创建统一特征构建器
+        try:
+            self.unified_feature_builder = UnifiedFeatureBuilder(
+                data_access=self.data_access,
+                db_manager=self.db,
+                lookback_days=180  # 与V2训练一致
+            )
+            logger.info("✅ UnifiedFeatureBuilder 初始化成功")
+        except Exception as e:
+            logger.warning(f"UnifiedFeatureBuilder 初始化失败: {e}，V2模型功能不可用")
+            self.unified_feature_builder = None
+        
         self.signal_generator = SignalGenerator()
         self.stock_filter = StockStatusFilter()
         
@@ -126,6 +154,12 @@ class IntelligentStockSelector:
         self.reg_model_data = None
         self.cls_feature_names = None
         self.reg_feature_names = None
+        self.cls_model_bundle = None
+        self.reg_model_bundle = None
+        self.cls_metadata = {}
+        self.reg_metadata = {}
+        self.cls_calibrator = None
+        self.reg_calibrator = None
         
         # 增强预处理pipeline
         self.cls_preprocessor = None
@@ -151,7 +185,7 @@ class IntelligentStockSelector:
                 if not os.path.exists(models_dir):
                     logger.warning(f"模型目录不存在: {models_dir}")
                     return 0
-                
+
                 # 查找所有pkl文件
                 model_files = [f for f in os.listdir(models_dir) if f.endswith('.pkl')]
                 if not model_files:
@@ -167,9 +201,7 @@ class IntelligentStockSelector:
             
             if os.path.exists(model_path):
                 # 加载模型文件
-                import pickle
-                with open(model_path, 'rb') as f:
-                    model_data = pickle.load(f)
+                model_data = joblib.load(model_path)
                 
                 # 检查模型文件结构
                 if isinstance(model_data, dict):
@@ -272,6 +304,227 @@ class IntelligentStockSelector:
         return (cls_path if cls_path and os.path.exists(cls_path) else None,
                 reg_path if reg_path and os.path.exists(reg_path) else None)
 
+    @staticmethod
+    def _infer_period_from_name(name: str) -> Optional[str]:
+        if not name:
+            return None
+        lowered = name.lower()
+        for token in ("30d", "20d", "15d", "10d", "7d", "5d"):
+            if token in lowered:
+                return token
+        return None
+
+    @staticmethod
+    def _infer_task_from_name(name: str) -> Optional[str]:
+        if not name:
+            return None
+        lowered = name.lower()
+        if any(key in lowered for key in ("cls", "class", "classification")):
+            return "classification"
+        if any(key in lowered for key in ("reg", "regr", "regression")):
+            return "regression"
+        return None
+
+    def _as_model_bundle(self, data: Any, source: str, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """将模型artifact转换为统一结构，便于后续处理。"""
+        bundle: Dict[str, Any] = {
+            'artifact': None,
+            'is_v2': False,
+            'task': None,
+            'period': None,
+            'priority': 0,
+            'pipeline': None,
+            'fitted_model': None,
+            'model': None,
+            'calibrator': None,
+            'selected_features': [],
+            'feature_names': [],
+            'metadata': {},
+            'metrics': {},
+            'is_best': False,
+            'source': source,
+            'name': filename or source
+        }
+
+        artifact = data
+        task = None
+        period = None
+        priority = 0
+
+        try:
+            if isinstance(data, dict):
+                if 'pipeline' in data:  # V2格式
+                    bundle['is_v2'] = True
+                    task = data.get('task')
+                    config_period = data.get('config', {}).get('prediction_period')
+                    if config_period:
+                        period = f"{config_period}d" if isinstance(config_period, (int, float)) else str(config_period)
+                    bundle['pipeline'] = data.get('pipeline')
+                    bundle['fitted_model'] = data.get('pipeline')
+                    bundle['model'] = data.get('pipeline')
+                    bundle['calibrator'] = data.get('calibrator')
+                    bundle['selected_features'] = list(data.get('selected_features') or [])
+                    bundle['feature_names'] = list(data.get('selected_features') or [])
+                    bundle['metadata'] = {
+                        'task': data.get('task'),
+                        'model_type': data.get('model_type'),
+                        'training_date': data.get('training_date'),
+                        'is_best': data.get('is_best'),
+                        'is_v2': True,
+                        'config': data.get('config', {}),
+                        'metrics': data.get('metrics', {})
+                    }
+                    bundle['metrics'] = data.get('metrics', {})
+                    bundle['is_best'] = bool(data.get('is_best'))
+                    priority = 100 if bundle['is_best'] else 50
+                else:  # V1格式
+                    task = data.get('metadata', {}).get('task') or data.get('metadata', {}).get('type')
+                    period = data.get('metadata', {}).get('period')
+                    bundle['model'] = data.get('model')
+                    bundle['fitted_model'] = data.get('model')
+                    bundle['calibrator'] = data.get('calibrator')
+                    bundle['feature_names'] = list(data.get('feature_names') or [])
+                    bundle['metadata'] = {**data.get('metadata', {}), 'is_v2': False, 'metrics': data.get('metrics', {})}
+                    bundle['metrics'] = data.get('metrics', {})
+                    artifact = data
+                    priority = 10
+            else:
+                # 最旧格式：直接存储模型/管道对象
+                task = None
+                period = None
+                wrapper: Dict[str, Any] = {'model': data, 'feature_names': []}
+                if hasattr(data, 'feature_names_in_'):
+                    wrapper['feature_names'] = list(getattr(data, 'feature_names_in_'))
+                artifact = wrapper
+                bundle['model'] = data
+                bundle['fitted_model'] = data
+                bundle['feature_names'] = list(wrapper['feature_names'])
+                priority = 5
+
+            if task is None and filename:
+                task = self._infer_task_from_name(filename)
+            if period is None and filename:
+                period = self._infer_period_from_name(filename)
+
+            bundle['artifact'] = artifact
+            bundle['task'] = task
+            bundle['period'] = period
+            bundle['priority'] = priority
+
+            if bundle['is_v2'] and bundle['pipeline'] is None:
+                raise ValueError("V2模型缺少pipeline字段")
+
+            # 若仍缺少关键字段则返回None
+            if bundle['task'] is None:
+                return None
+
+            return bundle
+        except Exception as parse_err:
+            logger.debug(f"解析模型artifact失败 ({source}): {parse_err}")
+            return None
+
+    def _load_bundle_from_path(self, path: str, source_label: str, expected_period: str) -> Optional[Dict[str, Any]]:
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data = joblib.load(path)
+            bundle = self._as_model_bundle(data, source_label, filename=os.path.basename(path))
+            if not bundle:
+                logger.warning(f"忽略模型 {path}：无法解析")
+                return None
+            if bundle['period'] and expected_period and bundle['period'] != expected_period:
+                logger.warning(f"忽略模型 {path}：周期 {bundle['period']} 与期望 {expected_period} 不匹配")
+                return None
+            return bundle
+        except Exception as err:
+            logger.warning(f"加载模型失败 {path}: {err}")
+            return None
+
+    def _apply_model_bundle(self, bundle: Dict[str, Any], model_kind: str) -> None:
+        if not bundle:
+            return
+
+        artifact = bundle.get('artifact')
+        features = list(bundle.get('feature_names') or [])
+        selected_features = list(bundle.get('selected_features') or [])
+        fitted_model = bundle.get('fitted_model')
+        pipeline = bundle.get('pipeline')
+        metadata = bundle.get('metadata') or {}
+        calibrator = bundle.get('calibrator')
+
+        if not features and selected_features:
+            features = selected_features
+
+        # 若仍无特征名，尝试从模型对象获取
+        if not features and fitted_model is not None and hasattr(fitted_model, 'feature_names_in_'):
+            try:
+                features = list(getattr(fitted_model, 'feature_names_in_'))
+            except Exception:
+                features = []
+
+        # 若特征名仍为空或为匿名 feature_ 序列，从缓存补充
+        def _maybe_inject_from_cache(current: List[str], cache_path: str) -> List[str]:
+            if current and not all(str(name).startswith('feature_') for name in current):
+                return current
+            if not os.path.exists(cache_path):
+                logger.debug(f"特征缓存文件不存在: {cache_path}")
+                return current
+            try:
+                with open(cache_path, 'r') as fc:
+                    cached = json.load(fc)
+                if not current or len(cached) == len(current):
+                    logger.info(f"已从缓存注入特征名，共 {len(cached)} 个")
+                    return cached
+            except Exception as cache_err:
+                logger.debug(f"读取特征缓存失败: {cache_err}")
+            return current
+
+        cache_file = os.path.join('feature_cache', 'selected_features.json')
+        features = _maybe_inject_from_cache(features, cache_file)
+
+        # 更新模型对象的 feature_names_in_
+        def _update_feature_names(model_obj: Any, names: List[str]) -> None:
+            if not model_obj or not names:
+                return
+            try:
+                model_obj.feature_names_in_ = np.array(names)
+            except Exception:
+                pass
+
+        _update_feature_names(fitted_model, features)
+        if pipeline is not None and pipeline is not fitted_model:
+            _update_feature_names(pipeline, features)
+
+        # 写回 bundle，便于后续任务使用
+        bundle['feature_names'] = features
+
+        if model_kind == 'cls':
+            self.cls_model_bundle = bundle
+            self.cls_model_data = artifact
+            self.cls_feature_names = features
+            self.cls_metadata = metadata
+            self.cls_calibrator = calibrator
+        else:
+            self.reg_model_bundle = bundle
+            self.reg_model_data = artifact
+            self.reg_feature_names = features
+            self.reg_metadata = metadata
+            self.reg_calibrator = calibrator
+
+        metrics = bundle.get('metrics') or {}
+        model_type = metadata.get('model_type') or bundle.get('name')
+        if bundle.get('is_v2') and metrics:
+            try:
+                if model_kind == 'cls' and 'val_auc' in metrics:
+                    logger.info(f"  V2模型 {model_type} 验证AUC={metrics['val_auc']:.4f}")
+                elif model_kind == 'reg' and ('val_r2' in metrics or 'val_mse' in metrics):
+                    if 'val_r2' in metrics:
+                        logger.info(f"  V2模型 {model_type} 验证R²={metrics['val_r2']:.4f}")
+                    else:
+                        logger.info(f"  V2模型 {model_type} 验证MSE={metrics['val_mse']:.4f}")
+            except Exception:
+                pass
+
     # 新增：同时加载30d的分类与回归模型
     def load_models(self, period: str = '30d') -> bool:
         try:
@@ -279,169 +532,56 @@ class IntelligentStockSelector:
             if not os.path.exists(models_dir):
                 logger.warning(f"模型目录不存在: {models_dir}")
                 return 0
-            import pickle
-            cls_candidates = []
-            reg_candidates = []
+            cls_candidates: List[Dict[str, Any]] = []
+            reg_candidates: List[Dict[str, Any]] = []
             for fname in sorted([f for f in os.listdir(models_dir) if f.endswith('.pkl')]):
                 fpath = os.path.join(models_dir, fname)
                 try:
-                    with open(fpath, 'rb') as f:
-                        data = pickle.load(f)
-                    if isinstance(data, dict):
-                        meta = data.get('metadata', {}) or {}
-                        task = meta.get('task') or meta.get('type')
-                        per = meta.get('period')
-                        if per != period:
-                            # 尝试从文件名推断周期
-                            fname_lower = fname.lower()
-                            inferred_period = '30d' if '30d' in fname_lower else ('10d' if '10d' in fname_lower else None)
-                            if inferred_period != period:
-                                continue
-                        if task == 'classification':
-                            cls_candidates.append((fname, data))
-                        elif task == 'regression':
-                            reg_candidates.append((fname, data))
-                    else:
-                        # 兼容旧格式：直接保存了Estimator/Pipeline
-                        fname_lower = fname.lower()
-                        inferred_task = 'classification' if ('logistic' in fname_lower or 'cls' in fname_lower or 'classification' in fname_lower) else ('regression' if 'reg' in fname_lower or 'regression' in fname_lower else None)
-                        inferred_period = '30d' if '30d' in fname_lower else ('10d' if '10d' in fname_lower else None)
-                        if inferred_task and (inferred_period == period or inferred_period is None):
-                            # 对于Pipeline对象，尝试获取feature_names_in_属性
-                            feature_names = []
-                            if hasattr(data, 'feature_names_in_'):
-                                feature_names = data.feature_names_in_.tolist()
-                            
-                            wrapper = {'model': data, 'feature_names': feature_names, 'metadata': {'task': inferred_task, 'period': inferred_period}}
-                            if inferred_task == 'classification':
-                                cls_candidates.append((fname, wrapper))
-                            elif inferred_task == 'regression':
-                                reg_candidates.append((fname, wrapper))
-                except Exception as e:
-                    logger.debug(f"读取模型失败 {fpath}: {e}")
+                    data = joblib.load(fpath)
+                except Exception as load_err:
+                    logger.debug(f"读取模型失败 {fpath}: {load_err}")
                     continue
+
+                bundle = self._as_model_bundle(data, source=f"file:{fname}", filename=fname)
+                if not bundle:
+                    continue
+                if bundle['period'] and period and bundle['period'] != period:
+                    continue
+
+                if bundle['task'] == 'classification':
+                    cls_candidates.append(bundle)
+                elif bundle['task'] == 'regression':
+                    reg_candidates.append(bundle)
             # ========= 新增: 优先使用配置文件/环境变量指定模型 =========
             cls_cfg_path, reg_cfg_path = self._get_config_model_paths()
-            cfg_loaded = False
-            if cls_cfg_path and os.path.exists(cls_cfg_path):
-                try:
-                    with open(cls_cfg_path, 'rb') as f:
-                        self.cls_model_data = pickle.load(f)
-                    logger.info(f"已根据配置加载分类模型: {cls_cfg_path}")
-                    cfg_loaded = True
-                    # 处理特征名
-                    if isinstance(self.cls_model_data, dict):
-                        self.cls_feature_names = self.cls_model_data.get('feature_names') or []
-                    else:
-                        if hasattr(self.cls_model_data, 'feature_names_in_'):
-                            self.cls_feature_names = list(self.cls_model_data.feature_names_in_)
-                except Exception as e:
-                    logger.warning(f"配置的分类模型加载失败: {e}")
-            if reg_cfg_path and os.path.exists(reg_cfg_path):
-                try:
-                    with open(reg_cfg_path, 'rb') as f:
-                        self.reg_model_data = pickle.load(f)
-                    logger.info(f"已根据配置加载回归模型: {reg_cfg_path}")
-                    cfg_loaded = True
-                    if isinstance(self.reg_model_data, dict):
-                        self.reg_feature_names = self.reg_model_data.get('feature_names') or []
-                    else:
-                        if hasattr(self.reg_model_data, 'feature_names_in_'):
-                            self.reg_feature_names = list(self.reg_model_data.feature_names_in_)
-                except Exception as e:
-                    logger.warning(f"配置的回归模型加载失败: {e}")
-            if cfg_loaded:
-                # 若已通过配置成功加载任一模型，则直接返回
-                return bool(self.cls_model_data or self.reg_model_data)
-            # ========= 结束新增优先逻辑 =========
-            if cls_candidates:
-                # 优先选择xgboost模型，如果没有则选择最新模型
-                xgboost_candidates = [(fname, data) for fname, data in cls_candidates if 'xgboost' in fname.lower()]
-                if xgboost_candidates:
-                    # 如果有xgboost模型，选择最新的xgboost模型
-                    self.cls_model_data = xgboost_candidates[-1][1]
-                    selected_model = xgboost_candidates[-1][0]
-                else:
-                    # 否则选择最新模型
-                    self.cls_model_data = cls_candidates[-1][1]
-                    selected_model = cls_candidates[-1][0]
-                
-                # 优先从字典中获取特征名称，如果是Pipeline对象则从feature_names_in_属性获取
-                if isinstance(self.cls_model_data, dict):
-                    self.cls_feature_names = self.cls_model_data.get('feature_names') or []
-                    # 若仍为空，尝试从内部model获取
-                    if (not self.cls_feature_names) and isinstance(self.cls_model_data.get('model'), object):
-                        inner_model = self.cls_model_data.get('model')
-                        if hasattr(inner_model, 'feature_names_in_'):
-                            self.cls_feature_names = list(inner_model.feature_names_in_)
-                else:
-                    # 对于Pipeline对象，尝试获取feature_names_in_属性
-                    if hasattr(self.cls_model_data, 'feature_names_in_'):
-                        self.cls_feature_names = self.cls_model_data.feature_names_in_.tolist()
-                    else:
-                        self.cls_feature_names = []
-                # 如果仍然无法获取特征名，尝试从feature_cache注入
-                if not self.cls_feature_names or all(str(n).startswith('feature_') for n in self.cls_feature_names):
-                    feature_cache_file = os.path.join('feature_cache', 'selected_features.json')
-                    try:
-                        if os.path.exists(feature_cache_file):
-                            with open(feature_cache_file, 'r') as fc:
-                                cache_names = json.load(fc)
-                            # 仅当特征数量一致或当前为空时才替换，防止错误映射
-                            if len(cache_names) == len(self.cls_feature_names) or not self.cls_feature_names:
-                                self.cls_feature_names = cache_names
-                                logger.info(f"分类模型特征名已从缓存注入，共 {len(self.cls_feature_names)} 个特征")
-                        else:
-                            logger.debug("分类模型特征缓存文件不存在")
-                    except Exception as e:
-                        logger.debug(f"注入分类模型特征名失败: {e}")
-                # 同步更新模型对象的 feature_names_in_ 属性，避免预测时特征不匹配
-                try:
-                    target_model = self.cls_model_data.get('model') if isinstance(self.cls_model_data, dict) else self.cls_model_data
-                    if target_model is not None and self.cls_feature_names:
-                        target_model.feature_names_in_ = np.array(self.cls_feature_names)
-                except Exception as up_err:
-                    logger.debug(f"更新分类模型 feature_names_in_ 失败: {up_err}")
-            else:
-                logger.warning("未找到30d分类模型")
-            if reg_candidates:
-                self.reg_model_data = reg_candidates[-1][1]
-                # 优先从字典或内部模型获取特征名称
-                if isinstance(self.reg_model_data, dict):
-                    self.reg_feature_names = self.reg_model_data.get('feature_names') or []
-                    if (not self.reg_feature_names) and isinstance(self.reg_model_data.get('model'), object):
-                        inner_model_r = self.reg_model_data.get('model')
-                        if hasattr(inner_model_r, 'feature_names_in_'):
-                            self.reg_feature_names = list(inner_model_r.feature_names_in_)
-                else:
-                    if hasattr(self.reg_model_data, 'feature_names_in_'):
-                        self.reg_feature_names = self.reg_model_data.feature_names_in_.tolist()
-                    else:
-                        self.reg_feature_names = []
+            cfg_cls_bundle = self._load_bundle_from_path(cls_cfg_path, 'config:classification', period) if cls_cfg_path else None
+            cfg_reg_bundle = self._load_bundle_from_path(reg_cfg_path, 'config:regression', period) if reg_cfg_path else None
 
-                # 如果仍然无法获取特征名，尝试从feature_cache注入
-                if not self.reg_feature_names or all(str(n).startswith('feature_') for n in self.reg_feature_names):
-                    feature_cache_file = os.path.join('feature_cache', 'selected_features.json')
-                    try:
-                        if os.path.exists(feature_cache_file):
-                            with open(feature_cache_file, 'r') as fc:
-                                cache_names = json.load(fc)
-                            if len(cache_names) == len(self.reg_feature_names) or not self.reg_feature_names:
-                                self.reg_feature_names = cache_names
-                                logger.info(f"回归模型特征名已从缓存注入，共 {len(self.reg_feature_names)} 个特征")
-                        else:
-                            logger.debug("回归模型特征缓存文件不存在")
-                    except Exception as e:
-                        logger.debug(f"注入回归模型特征名失败: {e}")
-                # 同步更新模型对象的 feature_names_in_ 属性，避免预测时特征不匹配
-                try:
-                    target_model_r = self.reg_model_data.get('model') if isinstance(self.reg_model_data, dict) else self.reg_model_data
-                    if target_model_r is not None and self.reg_feature_names:
-                        target_model_r.feature_names_in_ = np.array(self.reg_feature_names)
-                except Exception as up_err:
-                    logger.debug(f"更新回归模型 feature_names_in_ 失败: {up_err}")
+            if cfg_cls_bundle:
+                logger.info(f"✅ 根据配置加载分类模型: {cfg_cls_bundle['name']}")
+                self._apply_model_bundle(cfg_cls_bundle, 'cls')
+            if cfg_reg_bundle:
+                logger.info(f"✅ 根据配置加载回归模型: {cfg_reg_bundle['name']}")
+                self._apply_model_bundle(cfg_reg_bundle, 'reg')
+            if cfg_cls_bundle or cfg_reg_bundle:
+                return bool(self.cls_model_data or self.reg_model_data)
+
+            if cls_candidates:
+                cls_candidates.sort(key=lambda x: x['priority'], reverse=True)
+                chosen_cls = cls_candidates[0]
+                logger.info(f"✅ 选择分类模型: {chosen_cls['name']} (优先级={chosen_cls['priority']})")
+                self._apply_model_bundle(chosen_cls, 'cls')
             else:
-                logger.warning("未找到30d回归模型")
+                logger.warning(f"未找到{period}分类模型")
+
+            if reg_candidates:
+                reg_candidates.sort(key=lambda x: x['priority'], reverse=True)
+                chosen_reg = reg_candidates[0]
+                logger.info(f"✅ 选择回归模型: {chosen_reg['name']} (优先级={chosen_reg['priority']})")
+                self._apply_model_bundle(chosen_reg, 'reg')
+            else:
+                logger.warning(f"未找到{period}回归模型")
+
             return bool(self.cls_model_data or self.reg_model_data)
         except Exception as e:
             logger.error(f"加载模型集合失败: {e}")
@@ -537,6 +677,46 @@ class IntelligentStockSelector:
 
         return normalized
 
+    def get_latest_features_v2(self, symbols: List[str], 
+                              end_date: Optional[str] = None) -> pd.DataFrame:
+        """
+        使用UnifiedFeatureBuilder获取V2模型所需的特征
+        适用于V2模型（基于价量+市场+行业特征）
+        """
+        if self.unified_feature_builder is None:
+            logger.error("UnifiedFeatureBuilder 未初始化，无法构建V2特征")
+            return pd.DataFrame()
+        
+        try:
+            logger.info(f"开始使用UnifiedFeatureBuilder为 {len(symbols)} 只股票构建特征...")
+            
+            # 使用统一特征构建器
+            features_df = self.unified_feature_builder.build_features(
+                symbols=symbols,
+                as_of_date=end_date,
+                return_labels=False
+            )
+            
+            if features_df.empty:
+                logger.warning("UnifiedFeatureBuilder 返回空结果")
+                return pd.DataFrame()
+            
+            # 确保有symbol列
+            if 'symbol' not in features_df.columns:
+                logger.error("特征DataFrame缺少symbol列")
+                return pd.DataFrame()
+            
+            logger.info(f"✅ V2特征构建完成: {len(features_df)} 行 x {len(features_df.columns)} 列")
+            logger.debug(f"特征列: {list(features_df.columns[:20])}...")
+            
+            return features_df
+            
+        except Exception as e:
+            logger.error(f"V2特征构建失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return pd.DataFrame()
+    
     def get_latest_features(self, symbols: List[str], 
                            end_date: Optional[str] = None) -> pd.DataFrame:
         """获取最新特征数据，并优先走统一数据访问层的批量缓存。"""
@@ -628,23 +808,57 @@ class IntelligentStockSelector:
         if not (self.cls_model_data or self.reg_model_data or self.model):
             logger.error("模型未加载")
             return []
+        
+        # � 性能优化: 限制股票池大小，避免处理全市场
+        original_count = len(symbols)
+        if original_count > MAX_STOCK_POOL_SIZE:
+            logger.warning(
+                f"📊 股票池优化: 原始={original_count}只 → 限制={MAX_STOCK_POOL_SIZE}只 "
+                f"(可通过环境变量 MAX_STOCK_POOL_SIZE 调整)"
+            )
+            symbols = symbols[:MAX_STOCK_POOL_SIZE]
+        else:
+            logger.info(f"📊 股票池大小: {original_count}只 (限制={MAX_STOCK_POOL_SIZE}只)")
+        
+        # �🔧 检测是否为V2模型
+        # V2模型的metadata存储在单独的变量中
+        is_v2_cls = False
+        if self.cls_model_data and isinstance(self.cls_model_data, dict):
+            # 检查artifact本身的is_v2标记
+            if 'pipeline' in self.cls_model_data and 'task' in self.cls_model_data:
+                is_v2_cls = True
+                logger.debug("检测到V2分类模型（基于pipeline和task字段）")
+            # 检查metadata
+            elif hasattr(self, 'cls_metadata') and self.cls_metadata.get('is_v2'):
+                is_v2_cls = True
+                logger.debug("检测到V2分类模型（基于cls_metadata）")
+        
+        is_v2_reg = False
+        if self.reg_model_data and isinstance(self.reg_model_data, dict):
+            if 'pipeline' in self.reg_model_data and 'task' in self.reg_model_data:
+                is_v2_reg = True
+                logger.debug("检测到V2回归模型（基于pipeline和task字段）")
+            elif hasattr(self, 'reg_metadata') and self.reg_metadata.get('is_v2'):
+                is_v2_reg = True
+                logger.debug("检测到V2回归模型（基于reg_metadata）")
+        
+        is_v2_model = is_v2_cls or is_v2_reg
+        logger.info(f"模型版本检测: V2分类={is_v2_cls}, V2回归={is_v2_reg}")
+        
+        # 🔧 根据模型类型选择特征构建方法
+        if is_v2_model:
+            logger.info("检测到V2模型，使用UnifiedFeatureBuilder构建特征")
+            features_df = self.get_latest_features_v2(symbols)
+        else:
+            logger.info("使用传统特征构建方法")
+            features_df = self.get_latest_features(symbols)
             
-        # 获取最新特征
-        features_df = self.get_latest_features(symbols)
         if features_df.empty:
             logger.warning("无法获取特征数据")
             return []
             
-        # -------- 统一特征列名称大小写及数值类型，避免不一致导致特征缺失 --------
-        try:
-            # 将所有非symbol列名统一为小写，方便与模型训练阶段保持一致
-            new_cols = []
-            for c in features_df.columns:
-                new_cols.append(c if c == 'symbol' else c.lower())
-            features_df.columns = new_cols
-        except Exception as e:
-            logger.debug(f"特征列名统一失败: {e}")
-
+        # -------- 统一数值类型，避免类型不一致 --------
+        # 注意：不再统一列名大小写，V2模型使用原始大小写特征名（如ADV_20）
         try:
             for col in features_df.columns:
                 if col == 'symbol':
@@ -660,65 +874,128 @@ class IntelligentStockSelector:
         preds_cls = np.array([0] * len(features_df))
         exp_returns = np.array([0.0] * len(features_df))
         
-        # 分类模型预测（优先使用新结构的cls_model_data，否则回退到旧的self.model）
+        # 分类模型预测
         try:
             if self.cls_model_data:
-                model = self.cls_model_data['model']
-                expected_features = self.cls_feature_names or []
+                # V2格式使用'pipeline'，V1格式使用'model'
+                if isinstance(self.cls_model_data, dict) and 'pipeline' in self.cls_model_data:
+                    model = self.cls_model_data['pipeline']
+                    # V2检测：有pipeline和task字段即为V2
+                    is_v2 = 'task' in self.cls_model_data
+                    logger.debug(f"使用V2 pipeline进行分类预测 (is_v2={is_v2})")
+                elif isinstance(self.cls_model_data, dict):
+                    model = self.cls_model_data['model']
+                    is_v2 = False
+                else:
+                    model = self.cls_model_data
+                    is_v2 = False
+                
+                # 🔧 V2模型：使用selected_features或pipeline的feature_names_in_
+                if is_v2:
+                    selected_features = self.cls_model_data.get('selected_features')
+                    
+                    # 如果selected_features为None，尝试从pipeline获取
+                    if selected_features is None or len(selected_features) == 0:
+                        pipeline = self.cls_model_data.get('pipeline')
+                        if hasattr(pipeline, 'feature_names_in_'):
+                            expected_features = list(pipeline.feature_names_in_)
+                            logger.info(f"V2模型从pipeline获取特征: {len(expected_features)} 个")
+                        else:
+                            # 使用训练配置中的特征列表
+                            logger.warning("V2模型无selected_features且pipeline无feature_names_in_，使用所有数值特征")
+                            expected_features = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
+                    else:
+                        expected_features = selected_features
+                        logger.info(f"V2模型使用selected_features: {len(expected_features)} 个特征")
+                else:
+                    # V1模型：使用cls_feature_names
+                    expected_features = self.cls_feature_names or []
+                    logger.debug(f"V1模型使用feature_names: {len(expected_features)} 个特征")
+                
                 Xc = features_df.copy()
                 
                 # 当未提供特征名时，回退为使用数值型特征（排除symbol）
                 if not expected_features:
                     candidate_cols = [c for c in Xc.columns if c != 'symbol']
-                    # 仅选择数值列
                     expected_features = [c for c in candidate_cols if np.issubdtype(Xc[c].dtype, np.number)]
+                    logger.warning(f"未找到特征列表，使用所有数值特征: {len(expected_features)} 个")
                 
-                # 如果expected_features在特征表中缺失严重，尝试回退到交集或全部数值特征
+                # 检查特征可用性
                 available = [c for c in expected_features if c in Xc.columns]
-                if len(available) <= max(3, len(expected_features)*0.3):
-                    logger.warning(f"分类模型所需特征缺失严重({len(available)}/{len(expected_features)}), 回退到数值特征全集")
-                    available = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
-                # 确保所有期望特征均存在于特征矩阵中，不存在的填充0
+                missing = [c for c in expected_features if c not in Xc.columns]
+                
+                if missing:
+                    logger.warning(f"缺失 {len(missing)} 个特征: {missing[:10]}...")
+                
+                # V2模型：如果缺失特征过多，报错而不是回退
+                if is_v2 and len(available) < len(expected_features) * 0.8:
+                    logger.error(f"V2模型缺失过多特征 ({len(available)}/{len(expected_features)})")
+                    logger.error(f"可用特征: {available[:10]}...")
+                    logger.error(f"特征DataFrame列: {list(Xc.columns[:10])}...")
+                    # 不回退，直接使用可用特征
+                    expected_features = available
+                
+                # V1模型：允许回退
+                if not is_v2 and len(available) <= max(3, len(expected_features)*0.3):
+                    logger.warning(f"V1模型所需特征缺失严重({len(available)}/{len(expected_features)}), 回退到数值特征全集")
+                    expected_features = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
+                
+                # 确保所有期望特征均存在
                 for col in expected_features:
                     if col not in Xc.columns:
                         Xc[col] = 0
+                
                 Xc = Xc[expected_features].fillna(0)
-                # 若整体方差为0，说明全部为常数列，再回退为所有数值特征
-                if np.isclose(Xc.var().sum(), 0):
-                    logger.error("分类特征矩阵方差为0，回退到原始数值特征全集")
+                
+                # 方差检查（仅对V1模型）
+                if not is_v2 and np.isclose(Xc.var().sum(), 0):
+                    logger.error("V1分类特征矩阵方差为0，回退到原始数值特征全集")
                     Xc = features_df[[c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]].fillna(0)
                 
-                # 使用类级别工具方法替换匿名特征名（已移至类定义）
+                # 🔧 V2模型：Pipeline已包含预处理，直接使用
+                if is_v2:
+                    logger.debug("V2模型使用pipeline直接预测（pipeline包含预处理）")
+                    Xc_input = Xc
+                    
+                    # V2模型：使用calibrator（如果存在）
+                    calibrator = self.cls_model_data.get('calibrator')
+                    if calibrator is not None:
+                        logger.debug("使用V2 calibrator进行校准预测")
+                        # calibrator已经包装了完整的pipeline，直接传入数据
+                        probs = calibrator.predict_proba(Xc_input)[:, 1]
+                        preds_cls = calibrator.predict(Xc_input)
+                    else:
+                        logger.debug("V2模型无calibrator，使用pipeline直接预测")
+                        probs = model.predict_proba(Xc_input)[:, 1]
+                        preds_cls = model.predict(Xc_input)
                 
-                # 在预测前动态替换模型匿名特征名
-                self._replace_anonymous_feature_names(model, list(Xc.columns))
-                
-                # 应用增强预处理pipeline
-                if self.use_enhanced_preprocessing and self.cls_preprocessor is not None:
-                    logger.info("使用增强预处理pipeline处理分类特征")
+                # V1模型：应用增强预处理或传统预处理
+                elif self.use_enhanced_preprocessing and self.cls_preprocessor is not None:
+                    logger.info("V1模型使用增强预处理pipeline")
                     Xc_input = self.cls_preprocessor.transform(Xc)
+                    probs = model.predict_proba(Xc_input)[:, 1]
+                    preds_cls = model.predict(Xc_input)
                 else:
-                    # 原有的预处理逻辑
+                    # V1原有的预处理逻辑
                     use_pipeline_scaler = hasattr(model, 'named_steps') and 'scaler' in getattr(model, 'named_steps', {})
                     if use_pipeline_scaler:
                         Xc_input = Xc
                     else:
                         scaler = self.cls_model_data.get('scaler')
                         if scaler is None:
-                            # 在线标准化，避免数值尺度造成的概率饱和
                             try:
                                 col_std = Xc.std().replace(0, 1e-6)
                                 Xc_norm = (Xc - Xc.mean()) / col_std
                                 Xc_input = Xc_norm.clip(-5, 5).fillna(0)
-                                logger.info("未找到标准化器，已对特征进行在线标准化处理")
+                                logger.info("V1模型在线标准化")
                             except Exception:
-                                logger.warning("在线标准化失败，退回原始特征")
+                                logger.warning("在线标准化失败")
                                 Xc_input = Xc
                         else:
                             Xc_input = scaler.transform(Xc)
-                
-                probs = model.predict_proba(Xc_input)[:, 1]
-                preds_cls = model.predict(Xc_input)
+                    
+                    probs = model.predict_proba(Xc_input)[:, 1]
+                    preds_cls = model.predict(Xc_input)
                 
             elif self.model:
                 # 兼容旧逻辑
@@ -759,40 +1036,87 @@ class IntelligentStockSelector:
         # 回归模型预测（预期收益）
         try:
             if self.reg_model_data:
-                model_r = self.reg_model_data['model']
-                expected_features_r = self.reg_feature_names or []
+                # V2格式使用'pipeline'，V1格式使用'model'
+                if isinstance(self.reg_model_data, dict) and 'pipeline' in self.reg_model_data:
+                    model_r = self.reg_model_data['pipeline']
+                    is_v2_reg = 'task' in self.reg_model_data
+                    logger.debug(f"使用V2 pipeline进行回归预测 (is_v2={is_v2_reg})")
+                elif isinstance(self.reg_model_data, dict):
+                    model_r = self.reg_model_data['model']
+                    is_v2_reg = False
+                else:
+                    model_r = self.reg_model_data
+                    is_v2_reg = False
+                
+                # 🔧 V2模型：使用selected_features或pipeline的feature_names_in_
+                if is_v2_reg:
+                    selected_features_r = self.reg_model_data.get('selected_features')
+                    
+                    # 如果selected_features为None，尝试从pipeline获取
+                    if selected_features_r is None or len(selected_features_r) == 0:
+                        pipeline_r = self.reg_model_data.get('pipeline')
+                        if hasattr(pipeline_r, 'feature_names_in_'):
+                            expected_features_r = list(pipeline_r.feature_names_in_)
+                            logger.info(f"V2回归模型从pipeline获取特征: {len(expected_features_r)} 个")
+                        else:
+                            logger.warning("V2回归模型无selected_features且pipeline无feature_names_in_，使用所有数值特征")
+                            expected_features_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
+                    else:
+                        expected_features_r = selected_features_r
+                        logger.info(f"V2回归模型使用selected_features: {len(expected_features_r)} 个特征")
+                else:
+                    expected_features_r = self.reg_feature_names or []
+                    logger.debug(f"V1回归模型使用feature_names: {len(expected_features_r)} 个特征")
+                
                 Xr = features_df.copy()
                 
                 # 当未提供特征名时，回退为使用数值型特征（排除symbol）
                 if not expected_features_r:
                     candidate_cols = [c for c in Xr.columns if c != 'symbol']
-                    # 仅选择数值列
                     expected_features_r = [c for c in candidate_cols if np.issubdtype(Xr[c].dtype, np.number)]
-                    logger.warning(f"回归模型特征名称为空，回退到使用数值型特征，数量: {len(expected_features_r)}")
+                    logger.warning(f"回归模型特征名为空，使用数值特征: {len(expected_features_r)} 个")
                 
+                # 检查特征可用性
                 available_r = [c for c in expected_features_r if c in Xr.columns]
-                if len(available_r) <= max(3, len(expected_features_r)*0.3):
-                    logger.warning(f"回归模型所需特征缺失严重({len(available_r)}/{len(expected_features_r)}), 回退到数值特征全集")
-                    available_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
+                missing_r = [c for c in expected_features_r if c not in Xr.columns]
+                
+                if missing_r:
+                    logger.warning(f"回归模型缺失 {len(missing_r)} 个特征: {missing_r[:10]}...")
+                
+                # V2模型：如果缺失特征过多，报错
+                if is_v2_reg and len(available_r) < len(expected_features_r) * 0.8:
+                    logger.error(f"V2回归模型缺失过多特征 ({len(available_r)}/{len(expected_features_r)})")
+                    expected_features_r = available_r
+                
+                # V1模型：允许回退
+                if not is_v2_reg and len(available_r) <= max(3, len(expected_features_r)*0.3):
+                    logger.warning(f"V1回归模型所需特征缺失严重({len(available_r)}/{len(expected_features_r)}), 回退")
+                    expected_features_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
+                
+                # 确保所有期望特征均存在
                 for col in expected_features_r:
                     if col not in Xr.columns:
                         Xr[col] = 0
+                
                 Xr = Xr[expected_features_r].fillna(0)
-                if np.isclose(Xr.var().sum(), 0):
-                    logger.error("回归特征矩阵方差为0，回退到原始数值特征全集")
+                
+                # 方差检查（仅对V1模型）
+                if not is_v2_reg and np.isclose(Xr.var().sum(), 0):
+                    logger.error("V1回归特征矩阵方差为0，回退")
                     Xr = features_df[[c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]].fillna(0)
                 
-                # 使用类级别工具方法替换匿名特征名（已移至类定义）
+                # 🔧 V2模型：Pipeline已包含预处理，直接使用
+                if is_v2_reg:
+                    logger.debug("V2回归模型使用pipeline直接预测")
+                    exp_returns = model_r.predict(Xr)
                 
-                # 在预测前动态替换模型匿名特征名
-                self._replace_anonymous_feature_names(model_r, list(Xr.columns))
-                
-                # 应用增强预处理pipeline
-                if self.use_enhanced_preprocessing and self.reg_preprocessor is not None:
-                    logger.info("使用增强预处理pipeline处理回归特征")
+                # V1模型：应用增强预处理或传统预处理
+                elif self.use_enhanced_preprocessing and self.reg_preprocessor is not None:
+                    logger.info("V1回归模型使用增强预处理pipeline")
                     Xr_input = self.reg_preprocessor.transform(Xr)
+                    exp_returns = model_r.predict(Xr_input)
                 else:
-                    # 原有的预处理逻辑
+                    # V1原有的预处理逻辑
                     use_pipeline_scaler_r = hasattr(model_r, 'named_steps') and 'scaler' in getattr(model_r, 'named_steps', {})
                     scaler_r = self.reg_model_data.get('scaler')
                     if use_pipeline_scaler_r:
@@ -800,7 +1124,7 @@ class IntelligentStockSelector:
                     elif scaler_r is not None:
                         Xr_input = scaler_r.transform(Xr)
                     else:
-                        # stacking 回归模型，禁用在线标准化回退逻辑，保持与训练阶段一致。
+                        # stacking模型检测
                         is_stacking_model = False
                         try:
                             meta = self.reg_model_data.get('metadata', {}) if self.reg_model_data else {}
@@ -809,20 +1133,20 @@ class IntelligentStockSelector:
                             pass
                         if is_stacking_model:
                             Xr_input = Xr
-                            logger.info("检测到 stacking 回归模型且无外部 scaler，已跳过在线标准化")
+                            logger.info("stacking回归模型跳过在线标准化")
                         else:
-                            # 在线标准化，避免数值尺度问题
                             try:
                                 col_std = Xr.std().replace(0, 1e-6)
                                 Xr_norm = (Xr - Xr.mean()) / col_std
                                 Xr_input = Xr_norm.clip(-5, 5).fillna(0)
-                                logger.info("回归模型未找到标准化器，已对特征进行在线标准化处理")
+                                logger.info("V1回归模型在线标准化")
                             except Exception:
-                                logger.warning("回归模型在线标准化失败，退回原始特征")
+                                logger.warning("在线标准化失败")
                                 Xr_input = Xr
+                    
+                    exp_returns = model_r.predict(Xr_input)
                 
-                exp_returns = model_r.predict(Xr_input)
-                logger.info(f"回归模型预测成功，样本数: {len(exp_returns)}")
+                logger.info(f"回归预测成功，样本数: {len(exp_returns)}")
         except Exception as e:
             logger.error(f"回归预测失败: {e}")
             # 设置默认返回值

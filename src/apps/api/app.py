@@ -21,6 +21,7 @@ from ...apps.scripts.concurrent_data_sync_service import ConcurrentDataSyncServi
 from src.cache.prefetch_scheduler import CachePrefetchScheduler
 from src.services.portfolio.portfolio_service import generate_portfolio_holdings
 from src.trading.portfolio.portfolio_pipeline import resolve_candidate_limit
+from src.ml.prediction.enhanced_predictor_v2 import EnhancedPredictorV2
 
 # EnhancedDataProvider 已在第四阶段被归档，使用统一数据访问层替代
 # from ...data.providers.optimized_enhanced_data_provider import OptimizedEnhancedDataProvider
@@ -51,6 +52,7 @@ def _local_now() -> datetime:
     return datetime.now(_APP_TZ).replace(tzinfo=None)
 
 cache_prefetch_scheduler: CachePrefetchScheduler | None = None
+predictor_v2: EnhancedPredictorV2 | None = None  # V2预测器全局实例
 
 
 def _parse_bool_param(value, default: Optional[bool] = None) -> Optional[bool]:
@@ -124,6 +126,16 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 class StockRequest(BaseModel):
     symbol: str
 
+class PredictRequestV2(BaseModel):
+    """V2预测请求模型"""
+    symbol: str
+    as_of_date: Optional[str] = None  # YYYY-MM-DD格式，None表示最新日期
+
+class BatchPredictRequestV2(BaseModel):
+    """V2批量预测请求模型"""
+    symbols: List[str]
+    as_of_date: Optional[str] = None
+
 # analyzer = StockAnalyzer()  # 已在第四阶段被归档，使用其他服务替代
 # 初始化统一数据访问层（替代原有的分散数据提供者）
 try:
@@ -158,7 +170,16 @@ async def startup_event():
     """
     应用启动时智能初始化数据
     """
-    global selector_service, signal_generator, stock_list_manager, cache_prefetch_scheduler
+    global selector_service, signal_generator, stock_list_manager, cache_prefetch_scheduler, predictor_v2
+    
+    # 初始化V2预测器
+    try:
+        v2_models_dir = os.getenv("V2_MODELS_DIR", "models/v2_test_validation")
+        predictor_v2 = EnhancedPredictorV2(models_dir=v2_models_dir)
+        logger.info(f"✅ V2预测器初始化成功 (模型目录: {v2_models_dir})")
+    except Exception as e:
+        logger.warning(f"⚠️  V2预测器初始化失败: {e}, 将使用V1模式")
+        predictor_v2 = None
     
     # 复用全局实例并在启动时预加载模型
     selector_service = IntelligentStockSelector(_db)
@@ -576,7 +597,202 @@ async def get_stock_picks(top_n: int = 60, limit_symbols: Optional[int] = 3000, 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """健康检查端点,包含V2预测器状态"""
+    global predictor_v2
+    v2_status = {
+        "initialized": predictor_v2 is not None,
+        "models_loaded": {}
+    }
+    if predictor_v2:
+        v2_status["models_loaded"] = {
+            "classification": predictor_v2.models.get('classification') is not None,
+            "regression": predictor_v2.models.get('regression') is not None
+        }
+    return {
+        "status": "ok",
+        "v2_predictor": v2_status
+    }
+
+# ---------- V2预测端点 ----------
+
+@app.post("/api/v2/predict")
+async def predict_v2(request: PredictRequestV2):
+    """
+    V2单股预测端点
+    
+    Parameters
+    ----------
+    request : PredictRequestV2
+        symbol: 股票代码 (如: 000001, 600000)
+        as_of_date: 预测日期 (可选, 格式: YYYY-MM-DD)
+    
+    Returns
+    -------
+    dict
+        {
+            "success": bool,
+            "data": {
+                "symbol": str,
+                "as_of_date": str,
+                "classification": {...},
+                "regression": {...},
+                "features_used": [...]
+            },
+            "error": str (仅失败时)
+        }
+    """
+    global predictor_v2
+    
+    if predictor_v2 is None:
+        raise HTTPException(
+            status_code=503,
+            detail="V2预测器未初始化,请检查模型文件是否存在"
+        )
+    
+    try:
+        result = predictor_v2.predict(
+            symbol=request.symbol,
+            as_of_date=request.as_of_date
+        )
+        return {
+            "success": True,
+            "data": result
+        }
+    except Exception as e:
+        logger.error(f"V2预测失败 {request.symbol}: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.post("/api/v2/predict/batch")
+async def predict_batch_v2(request: BatchPredictRequestV2):
+    """
+    V2批量预测端点
+    
+    Parameters
+    ----------
+    request : BatchPredictRequestV2
+        symbols: 股票代码列表
+        as_of_date: 预测日期 (可选, 格式: YYYY-MM-DD)
+    
+    Returns
+    -------
+    dict
+        {
+            "success": bool,
+            "data": {
+                "symbol1": {...},
+                "symbol2": {...},
+                ...
+            },
+            "stats": {
+                "total": int,
+                "successful": int,
+                "failed": int
+            },
+            "error": str (仅失败时)
+        }
+    """
+    global predictor_v2
+    
+    if predictor_v2 is None:
+        raise HTTPException(
+            status_code=503,
+            detail="V2预测器未初始化,请检查模型文件是否存在"
+        )
+    
+    try:
+        results = predictor_v2.predict_batch(
+            symbols=request.symbols,
+            as_of_date=request.as_of_date
+        )
+        
+        # 统计成功/失败数量
+        successful = sum(1 for r in results.values() if 'error' not in r)
+        failed = len(results) - successful
+        
+        return {
+            "success": True,
+            "data": results,
+            "stats": {
+                "total": len(results),
+                "successful": successful,
+                "failed": failed
+            }
+        }
+    except Exception as e:
+        logger.error(f"V2批量预测失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/api/v2/models")
+async def get_v2_models_info():
+    """
+    获取V2模型信息
+    
+    Returns
+    -------
+    dict
+        {
+            "success": bool,
+            "data": {
+                "models_dir": str,
+                "classification": {...} | None,
+                "regression": {...} | None
+            }
+        }
+    """
+    global predictor_v2
+    
+    if predictor_v2 is None:
+        return {
+            "success": False,
+            "error": "V2预测器未初始化"
+        }
+    
+    try:
+        info = {
+            "models_dir": str(predictor_v2.models_dir),
+            "classification": None,
+            "regression": None
+        }
+        
+        # 提取分类模型信息
+        if predictor_v2.models['classification']:
+            cls_model = predictor_v2.models['classification']
+            info["classification"] = {
+                "task": cls_model.get('task', 'classification'),
+                "model_type": cls_model.get('model_type', 'unknown'),
+                "is_best": cls_model.get('is_best', False),
+                "has_calibrator": cls_model.get('calibrator') is not None,
+                "num_features": len(cls_model.get('selected_features', [])),
+                "metrics": cls_model.get('metrics', {})
+            }
+        
+        # 提取回归模型信息
+        if predictor_v2.models['regression']:
+            reg_model = predictor_v2.models['regression']
+            info["regression"] = {
+                "task": reg_model.get('task', 'regression'),
+                "model_type": reg_model.get('model_type', 'unknown'),
+                "is_best": reg_model.get('is_best', False),
+                "num_features": len(reg_model.get('selected_features', [])),
+                "metrics": reg_model.get('metrics', {})
+            }
+        
+        return {
+            "success": True,
+            "data": info
+        }
+    except Exception as e:
+        logger.error(f"获取V2模型信息失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 # ---------- Portfolios CRUD ----------
 from fastapi.responses import JSONResponse

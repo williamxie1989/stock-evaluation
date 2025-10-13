@@ -1513,7 +1513,8 @@ class UnifiedDataAccessLayer:
             path = self._l2_cache_path(cache_key)
             # 使用唯一临时文件名避免并发写入冲突
             tmp_path = path.parent / f"{path.stem}_{uuid.uuid4().hex}.tmp"
-            df.to_parquet(tmp_path, index=False)
+            # 🔧 修复：保存索引信息，确保date索引不丢失
+            df.to_parquet(tmp_path, index=True)  # 改为index=True保留索引
             # 原子性重命名（在POSIX系统上）
             tmp_path.replace(path)
         except Exception as exc:
