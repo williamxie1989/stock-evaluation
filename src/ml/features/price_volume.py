@@ -39,6 +39,12 @@ class PriceVolumeFeatureGenerator:
         Returns:
             添加了所有价量特征的 DataFrame
         """
+        # 🔧 确保数值列为float类型（避免Decimal类型问题）
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'turnover']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+        
         # 确保数据按时间排序
         df = df.sort_index()
         
