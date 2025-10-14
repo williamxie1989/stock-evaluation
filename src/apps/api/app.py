@@ -9,7 +9,7 @@ import json
 import os
 from ...data.db.unified_database_manager import UnifiedDatabaseManager  # 使用统一数据库管理器
 from ...core.unified_data_access_factory import get_unified_data_access  # 统一数据访问层
-from core.factories import get_data_provider, get_realtime_provider
+# from ...core.factories import get_data_provider, get_realtime_provider  # 已废弃,不再使用
 import pandas as pd
 import re
 from ...trading.signals.signal_generator import SignalGenerator
@@ -172,17 +172,28 @@ async def startup_event():
     """
     global selector_service, signal_generator, stock_list_manager, cache_prefetch_scheduler, predictor_v2
     
+    # 读取预测周期配置
+    api_prediction_period = int(os.getenv('API_PREDICTION_PERIOD', 
+                                          os.getenv('PREDICTION_PERIOD_DAYS', '30')))
+    logger.info(f"API 预测周期配置: {api_prediction_period}天")
+    
     # 初始化V2预测器
     try:
         v2_models_dir = os.getenv("V2_MODELS_DIR", "models/v2_test_validation")
-        predictor_v2 = EnhancedPredictorV2(models_dir=v2_models_dir)
-        logger.info(f"✅ V2预测器初始化成功 (模型目录: {v2_models_dir})")
+        predictor_v2 = EnhancedPredictorV2(
+            models_dir=v2_models_dir, 
+            prediction_period=api_prediction_period  # 动态周期
+        )
+        logger.info(f"✅ V2预测器初始化成功 (周期={api_prediction_period}天, 目录={v2_models_dir})")
     except Exception as e:
         logger.warning(f"⚠️  V2预测器初始化失败: {e}, 将使用V1模式")
         predictor_v2 = None
     
     # 复用全局实例并在启动时预加载模型
-    selector_service = IntelligentStockSelector(_db)
+    selector_service = IntelligentStockSelector(
+        _db, 
+        prediction_period=api_prediction_period  # 动态周期
+    )
     try:
         loaded = selector_service.load_models(period='30d') or selector_service.load_model()
         if loaded:

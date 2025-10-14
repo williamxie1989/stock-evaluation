@@ -27,6 +27,7 @@ from ...services.stock.stock_status_filter import StockStatusFilter
 from src.data.field_mapping import FieldMapper
 # 导入性能优化配置
 from config.prediction_config import (
+    PREDICTION_PERIOD_DAYS,
     MAX_STOCK_POOL_SIZE,
     ENABLE_FEATURE_CACHE,
     FEATURE_CACHE_TTL,
@@ -105,10 +106,23 @@ class IntelligentStockSelector:
     
     def __init__(self, db_manager: UnifiedDatabaseManager = None, use_enhanced_features: bool = 1, 
                  use_enhanced_preprocessing: bool = 1, preprocessing_complexity: str = 'medium',
-                 model_config_path: str = 'config/selector_models.json'):
+                 model_config_path: str = 'config/selector_models.json', prediction_period: Optional[int] = None):
         """
         初始化智能选股器
+        
+        Parameters
+        ----------
+        prediction_period : int, optional
+            预测周期（天数），默认读取 SELECTOR_PREDICTION_PERIOD 环境变量，
+            未设置则使用 PREDICTION_PERIOD_DAYS
         """
+        # 确定预测周期
+        if prediction_period is None:
+            prediction_period = int(os.getenv('SELECTOR_PREDICTION_PERIOD', 
+                                             str(PREDICTION_PERIOD_DAYS)))
+        self.prediction_period = prediction_period
+        logger.info(f"IntelligentStockSelector 初始化 (预测周期={prediction_period}天)")
+        
         self.db = db_manager or UnifiedDatabaseManager(db_type='mysql')
         self.data_access = get_unified_data_access()
         if self.data_access is None:
@@ -1287,6 +1301,8 @@ class IntelligentStockSelector:
             result = {
                 'symbol': symbol,
                 'name': stock_info.get('name', ''),
+            # 预测周期信息
+            'prediction_period': self.prediction_period,
                 # 新字段
                 'prob_up_30d': round(prob, 3),
                 'expected_return_30d': round(exp_ret, 4),
@@ -1630,11 +1646,17 @@ class IntelligentStockSelector:
         获取智能选股结果
         """
         try:
-            # 加载模型（优先加载30天的分类与回归模型）
-            if not self.load_models(period='30d'):
-                # 优先回退到10d周期的新接口
-                if not self.load_models(period='10d'):
-                    # 回退到旧的单模型加载逻辑
+            # 加载模型（使用动态周期）
+            period_str = f'{self.prediction_period}d'
+            if not self.load_models(period=period_str):
+                # 回退逻辑：尝试其他常见周期
+                for fallback_period in ['30d', '10d', '5d']:
+                    if fallback_period != period_str and self.load_models(period=fallback_period):
+                        logger.warning(f"首选周期 {period_str} 模型不存在，使用 {fallback_period}")
+                        self.prediction_period = int(fallback_period.replace('d', ''))
+                        break
+                else:
+                    # 所有周期都失败，尝试旧接口
                     if not self.load_model():
                         return self._fallback_stock_picks(top_n)
                     else:

@@ -183,7 +183,7 @@ class AdaptiveTradingSystem:
             
             # 根据市场状态调整
             if market_state == MarketState.TRENDING_UP:
-                params.position_size = 0.15  # 增加仓位
+                params.position_sadapize = 0.15  # 增加仓位
                 params.take_profit = 0.20    # 提高止盈
                 params.stop_loss = 0.08     # 放宽止损
                 params.max_positions = 8    # 增加最大持仓数
