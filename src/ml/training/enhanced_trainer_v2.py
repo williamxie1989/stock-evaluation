@@ -15,7 +15,7 @@ import os
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
@@ -619,7 +619,7 @@ class EnhancedTrainerV2:
                     1 - self.config['winsor_clip_quantile']
                 )
             )),
-            ('scaler', StandardScaler())
+            ('scaler', RobustScaler(quantile_range=(5, 95)))
         ])
         
         # 类别特征 pipeline
@@ -937,14 +937,21 @@ class EnhancedTrainerV2:
         if model_type == 'lightgbm':
             import lightgbm as lgb
             from lightgbm import LGBMRegressor
+            
+            # 使用优化的回归参数（如果未提供自定义参数）
+            from src.ml.training.toolkit.params import get_optimized_lgbm_regression_params
+            optimized_params = get_optimized_lgbm_regression_params()
+            
             estimator = LGBMRegressor(
                 n_estimators=model_params.get('n_estimators', 800),
-                max_depth=model_params.get('max_depth', 5),
-                learning_rate=model_params.get('learning_rate', 0.05),
-                subsample=model_params.get('subsample', 0.8),
-                colsample_bytree=model_params.get('colsample_bytree', 0.8),
-                reg_alpha=model_params.get('reg_alpha', 0.1),
-                reg_lambda=model_params.get('reg_lambda', 1.0),
+                num_leaves=model_params.get('num_leaves', optimized_params.get('num_leaves', 63)),
+                max_depth=model_params.get('max_depth', optimized_params.get('max_depth', 8)),
+                learning_rate=model_params.get('learning_rate', optimized_params.get('learning_rate', 0.02)),
+                subsample=model_params.get('subsample', optimized_params.get('bagging_fraction', 0.8)),
+                colsample_bytree=model_params.get('colsample_bytree', optimized_params.get('feature_fraction', 0.9)),
+                min_child_samples=model_params.get('min_child_samples', optimized_params.get('min_data_in_leaf', 50)),
+                reg_alpha=model_params.get('reg_alpha', optimized_params.get('lambda_l1', 0.1)),
+                reg_lambda=model_params.get('reg_lambda', optimized_params.get('lambda_l2', 0.1)),
                 random_state=42,
                 verbosity=-1
             )

@@ -37,6 +37,11 @@ predictor_v2 = None
 def init_predictor():
     """初始化预测器（同时初始化V1和V2）"""
     global predictor, predictor_v2
+    
+    # 读取预测周期配置
+    api_prediction_period = int(os.getenv('API_PREDICTION_PERIOD', '30'))
+    logger.info(f"预测API周期配置: {api_prediction_period}天")
+    
     success_v1 = False
     success_v2 = False
     
@@ -44,8 +49,11 @@ def init_predictor():
     try:
         models_v2_dir = project_root / "models" / "v2"
         if models_v2_dir.exists():
-            predictor_v2 = EnhancedPredictorV2(models_dir=str(models_v2_dir))
-            logger.info("V2预测器初始化成功")
+            predictor_v2 = EnhancedPredictorV2(
+                models_dir=str(models_v2_dir),
+                prediction_period=api_prediction_period  # 动态周期
+            )
+            logger.info(f"V2预测器初始化成功 (周期={api_prediction_period}天)")
             success_v2 = True
         else:
             logger.warning(f"V2模型目录不存在: {models_v2_dir}")
