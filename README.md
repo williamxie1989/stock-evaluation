@@ -1,6 +1,12 @@
 # 智能股票分析系统
 
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](https://github.com/williamxie1989/stock-evaluation/releases/tag/v0.5.0)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
 基于大模型的股票技术分析与投资建议系统，能够自动获取股票数据并生成专业的买卖点建议。支持A股及主要指数分析。
+
+> **当前版本**: v0.5.0 | [查看更新日志](CHANGELOG.md) | [发布历史](https://github.com/williamxie1989/stock-evaluation/releases)
 
 ## 功能特点
 
@@ -88,14 +94,58 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 3. AI分析结果仅供参考，投资需谨慎
 4. 请合理使用OpenAI API，避免超额费用
 
-## 开发计划
+## 版本历史
+
+### v0.5.0（当前版本）- 2025-10-07
+- ✅ 组合管理系统
+- ✅ 三级缓存系统（L0/L1/L2）
+- ✅ Redis跨进程缓存
+- ✅ 批量数据读取接口
+- ✅ 组合列表和详情界面
+
+### v0.4.0 - 2025-10-05
+- ✅ 参数优化系统（网格搜索）
+- ✅ 回测引擎增强
+- ✅ 多时间框架回测
+
+### v0.3.0 - 2025-10-03
+- ✅ 网络连接优化（重试机制）
+- ✅ 数据缓存机制
+- ✅ 降级策略和离线支持
+
+### v0.2.0 - 2025-10-01
+- ✅ 高级信号生成器
+- ✅ 自适应交易系统
+- ✅ 智能仓位管理
+
+### v0.1.0 - 2025-09-25
+- ✅ 基础功能实现
+- ✅ 智能选股系统
+- ✅ 机器学习模块
+- ✅ Web界面
+
+详细变更请查看 [CHANGELOG.md](CHANGELOG.md)
+
+## 开发路线图
 
 - [x] 添加更多技术指标
 - [x] 支持自定义分析参数
 - [x] 添加历史回测功能
 - [x] 集成更多数据源
-- [ ] 添加多因子分析
-- [ ] 支持策略优化
+- [x] 参数优化和回测系统
+- [x] 组合管理系统
+- [ ] 评估与验证改造（v0.6.0计划）
+- [ ] 特征管道化与特征选择（v0.6.0计划）
+- [ ] 添加多因子分析（v1.0.0计划）
+- [ ] 支持策略优化（v1.0.0计划）
+
+## 文档
+
+- [完整项目文档](PROJECT_DOCUMENTATION.md)
+- [模块依赖图](MODULE_DEPENDENCY_GRAPH.md)
+- [系统介绍](Introduction.md)
+- [优化任务清单](todo.md)
+- [更新日志](CHANGELOG.md)
 
 ## 许可证
 
