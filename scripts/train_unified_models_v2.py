@@ -758,13 +758,17 @@ def train_models(
         )
         cls_models['lightgbm'] = cls_lgb
         
-        # Logistic Regression (基线)
-        logger.info("\n训练 Logistic 分类器 (基线)...")
+        # Logistic Regression (✅ 使用优化后的超参数)
+        logger.info("\n训练 Logistic 分类器 (优化超参数)...")
         cls_logistic = trainer.train_classification_model(
             X, y_cls,
             model_type='logistic',
             dates=dates_series,
-            max_iter=1000
+            C=LOGISTIC_PARAMS.get('C', 0.1),
+            max_iter=LOGISTIC_PARAMS.get('max_iter', 2000),
+            solver=LOGISTIC_PARAMS.get('solver', 'saga'),
+            penalty=LOGISTIC_PARAMS.get('penalty', 'elasticnet'),
+            l1_ratio=LOGISTIC_PARAMS.get('l1_ratio', 0.5)
         )
         cls_models['logistic'] = cls_logistic
 
