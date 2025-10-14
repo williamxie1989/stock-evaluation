@@ -746,13 +746,26 @@ class EnhancedTrainerV2:
             )
         elif model_type == 'logistic':
             from sklearn.linear_model import LogisticRegression
-            estimator = LogisticRegression(
-                max_iter=model_params.get('max_iter', 1000),
-                C=model_params.get('C', 1.0),
-                penalty=model_params.get('penalty', 'l2'),
-                random_state=42,
-                class_weight='balanced'
-            )
+            
+            # 获取参数
+            penalty = model_params.get('penalty', 'l2')
+            solver = model_params.get('solver', 'lbfgs')
+            
+            # 构建LogisticRegression参数
+            lr_params = {
+                'max_iter': model_params.get('max_iter', 1000),
+                'C': model_params.get('C', 1.0),
+                'penalty': penalty,
+                'solver': solver,
+                'random_state': 42,
+                'class_weight': 'balanced'
+            }
+            
+            # 如果使用elasticnet惩罚，需要添加l1_ratio参数
+            if penalty == 'elasticnet':
+                lr_params['l1_ratio'] = model_params.get('l1_ratio', 0.5)
+            
+            estimator = LogisticRegression(**lr_params)
             estimator.fit(X_train_trans, y_train)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
