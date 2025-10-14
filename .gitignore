@@ -26,6 +26,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.pyc
 
 # 虚拟环境
 venv/
@@ -49,6 +50,7 @@ venv.bak/
 stock_data.db
 stock_data.sqlite3
 stocks.db
+*.sql
 
 # 日志文件
 *.log
@@ -60,6 +62,7 @@ models/*.pkl
 models/*.joblib
 models/*.h5
 models/*.model
+models/*
 
 # 缓存和临时文件
 l2_cache/
@@ -124,3 +127,15 @@ import_*.py
 comprehensive_*.py
 detailed_*.py
 stock_data.db
+
+# 开发记录文件
+FEATURE_*.md
+BACKTRACK_*.md
+TRAINING_*.md
+V2_*.md
+PHASE*_*.md
+PREDICTION_*.md
+R2_*.md
+*_SUMMARY.md
+*_REPORT.md
+
