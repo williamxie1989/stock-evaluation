@@ -12,12 +12,14 @@ from datetime import datetime
 import joblib
 import os
 
+from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import precision_score, recall_score, roc_curve, f1_score
 
 # 导入配置
 import sys
@@ -27,10 +29,138 @@ if project_root not in sys.path:
 
 from config.prediction_config import *
 from src.ml.preprocessing.winsorizer import Winsorizer
-from src.ml.preprocessing.feature_selection import select_features_separately
 
 logger = logging.getLogger(__name__)
 
+
+class PreprocessedModel(BaseEstimator):
+    """Wraps a fitted preprocessor and estimator for safe reuse."""
+
+    def __init__(
+        self,
+        preprocessor: ColumnTransformer,
+        estimator: Any,
+        task: str,
+        feature_columns: Optional[List[str]] = None
+    ):
+        self.preprocessor = preprocessor
+        self.estimator = estimator
+        self.task = task
+        self.feature_columns = list(feature_columns) if feature_columns is not None else None
+        self.feature_names_in_ = (np.array(self.feature_columns)
+                                  if self.feature_columns is not None
+                                  else getattr(preprocessor, 'feature_names_in_', None))
+        if hasattr(estimator, 'classes_'):
+            self.classes_ = estimator.classes_
+        if hasattr(estimator, 'n_features_in_'):
+            self.n_features_in_ = estimator.n_features_in_
+        self._has_decision_function = hasattr(estimator, 'decision_function')
+
+    def _ensure_dataframe(self, X: Any) -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            if self.feature_columns is not None:
+                # 按训练列顺序对齐，避免列缺失或乱序
+                return X.loc[:, self.feature_columns]
+            return X
+        if self.feature_columns is not None:
+            return pd.DataFrame(X, columns=self.feature_columns)
+        # 无列信息时退化为范围索引
+        return pd.DataFrame(X)
+
+    def _transform(self, X: pd.DataFrame) -> Any:
+        df = self._ensure_dataframe(X)
+        return self.preprocessor.transform(df)
+
+    def fit(self, X: Any, y: Any):
+        if isinstance(X, pd.DataFrame):
+            self.feature_columns = list(X.columns)
+        elif self.feature_columns is None and isinstance(X, np.ndarray):
+            self.feature_columns = list(range(X.shape[1]))
+        self.preprocessor.fit(X)
+        Xt = self.preprocessor.transform(X)
+        self.estimator.fit(Xt, y)
+        if hasattr(self.estimator, 'classes_'):
+            self.classes_ = self.estimator.classes_
+        if hasattr(self.estimator, 'n_features_in_'):
+            self.n_features_in_ = self.estimator.n_features_in_
+        return self
+
+    def predict(self, X: Any) -> np.ndarray:
+        X_t = self._transform(X)
+        return self.estimator.predict(X_t)
+
+    def predict_proba(self, X: Any) -> np.ndarray:
+        if not hasattr(self.estimator, 'predict_proba'):
+            raise AttributeError("Estimator does not support predict_proba")
+        X_t = self._transform(X)
+        return self.estimator.predict_proba(X_t)
+
+    def decision_function(self, X: Any) -> np.ndarray:
+        X_t = self._transform(X)
+        if self._has_decision_function:
+            try:
+                return self.estimator.decision_function(X_t)
+            except AttributeError:
+                pass
+        if hasattr(self.estimator, 'predict_proba'):
+            proba = self.estimator.predict_proba(X_t)
+            if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] == 2:
+                return proba[:, 1]
+            return proba
+        raise AttributeError("Estimator does not support decision_function or predict_proba")
+
+    @property
+    def named_steps(self) -> Dict[str, Any]:
+        return {'preprocessor': self.preprocessor, 'estimator': self.estimator}
+
+    def get_params(self, deep: bool = False) -> Dict[str, Any]:
+        return {'preprocessor': self.preprocessor, 'estimator': self.estimator, 'task': self.task}
+
+
+class XGBoostClassifierWrapper(BaseEstimator):
+    """封装原生 XGBoost Booster 以满足 sklearn 接口需求"""
+
+    def __init__(
+        self,
+        booster: Any,
+        best_iteration: int,
+        feature_count: Optional[int] = None,
+        feature_names: Optional[List[str]] = None
+    ):
+        import numpy as _np  # 局部导入避免全局依赖
+
+        self.booster = booster
+        self.best_iteration = best_iteration
+        self.n_features_in_ = feature_count if feature_count is not None else 0
+        self.feature_names = feature_names
+        self.classes_ = _np.array([0, 1])
+
+    def predict_proba(self, X: Any) -> np.ndarray:
+        iteration_range = (0, self.best_iteration + 1) if self.best_iteration is not None else None
+        proba = self.booster.inplace_predict(
+            X,
+            iteration_range=iteration_range
+        )
+        if proba.ndim == 1:
+            proba = np.column_stack([1 - proba, proba])
+        return proba
+
+    def predict(self, X: Any) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return (proba[:, 1] >= 0.5).astype(int)
+
+
+class XGBoostRegressorWrapper(BaseEstimator):
+    """封装回归 Booster"""
+
+    def __init__(self, booster: Any, best_iteration: int, feature_count: Optional[int] = None):
+        self.booster = booster
+        self.best_iteration = best_iteration
+        self.n_features_in_ = feature_count if feature_count is not None else 0
+
+    def predict(self, X: Any) -> np.ndarray:
+        iteration_range = (0, self.best_iteration + 1) if self.best_iteration is not None else None
+        return self.booster.inplace_predict(X, iteration_range=iteration_range)
 
 class EnhancedTrainerV2:
     """
@@ -43,10 +173,12 @@ class EnhancedTrainerV2:
     4. 新模型持久化格式
     """
     
-    def __init__(self,
-                 numerical_features: List[str],
-                 categorical_features: List[str],
-                 config: Optional[Dict] = None):
+    def __init__(
+        self,
+        numerical_features: List[str],
+        categorical_features: List[str],
+        config: Optional[Dict] = None
+    ):
         """
         初始化训练器
         
@@ -61,11 +193,18 @@ class EnhancedTrainerV2:
         """
         self.numerical_features = numerical_features
         self.categorical_features = categorical_features
-        self.config = config or self._get_default_config()
+        base_config = self._get_default_config()
+        if config:
+            base_config.update(config)
+        self.config = base_config
         
         logger.info("初始化 EnhancedTrainerV2")
         logger.info(f"  数值特征: {len(numerical_features)}")
         logger.info(f"  类别特征: {len(categorical_features)}")
+
+        self.cv_fold_info: List[Dict[str, Any]] = []
+        self._cv_sorted_frames: Optional[Tuple[pd.DataFrame, pd.Series, pd.Series]] = None
+        self._cv_pairs: List[Dict[str, Any]] = []
     
     def _get_default_config(self) -> Dict:
         """获取默认配置"""
@@ -77,8 +216,390 @@ class EnhancedTrainerV2:
             'min_features': 10,
             'max_features': None,
             'cls_threshold': CLS_THRESHOLD,
-            'prediction_period': PREDICTION_PERIOD_DAYS
+            'prediction_period': PREDICTION_PERIOD_DAYS,
+            'enable_time_series_split': ENABLE_TIME_SERIES_SPLIT,
+            'cv_n_splits': CV_N_SPLITS,
+            'cv_embargo': CV_EMBARGO,
+            'cv_allow_future': CV_ALLOW_FUTURE,
+            'use_rolling_cv': False,
+            'classification_metrics': CLASSIFICATION_METRICS,
+            'regression_metrics': REGRESSION_METRICS,
+            'top_k_values': TOP_K_VALUES
         }
+
+    def _prepare_timeseries_split(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        dates: Optional[pd.Series] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """按时间序列切分训练/验证集 (使用改进的时间分割策略)"""
+        self.cv_fold_info = []
+        self._cv_pairs = []
+        self._cv_sorted_frames = None
+        
+        if dates is None or not self.config.get('enable_time_series_split', False):
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y if y.nunique() == 2 else None
+            )
+            return X_train, X_val, y_train, y_val
+
+        # 🔧 使用改进的时间序列分割 (5天禁用期, 连续时间窗口)
+        from src.ml.training.toolkit import improved_time_series_split, rolling_window_split
+        from config.prediction_config import (
+            USE_ROLLING_WINDOW, 
+            ROLLING_TRAIN_YEARS, 
+            ROLLING_VAL_YEARS,
+            ROLLING_EMBARGO_DAYS
+        )
+        
+        try:
+            # 根据配置选择切分方式
+            if USE_ROLLING_WINDOW:
+                X_train, X_val, y_train, y_val = rolling_window_split(
+                    X=X,
+                    y=y,
+                    dates=dates,
+                    train_years=ROLLING_TRAIN_YEARS,
+                    val_years=ROLLING_VAL_YEARS,
+                    embargo_days=ROLLING_EMBARGO_DAYS,
+                    verbose=True
+                )
+            else:
+                X_train, X_val, y_train, y_val = improved_time_series_split(
+                    X=X,
+                    y=y, 
+                    dates=dates,
+                    test_size_ratio=0.2,
+                    embargo_days=5,  # 添加5天禁用期防止信息泄露
+                    verbose=True
+                )
+            
+            # 保存折叠信息用于日志
+            dates_dt = pd.to_datetime(dates)
+            self.cv_fold_info = [{
+                'fold_id': 0,
+                'train_size': len(X_train),
+                'val_size': len(X_val),
+                'train_start': dates_dt.min(),
+                'train_end': dates_dt.max(),
+                'val_start': dates_dt.min(),
+                'val_end': dates_dt.max(),
+                'train_pos_rate': float(y_train.mean()),
+                'val_pos_rate': float(y_val.mean())
+            }]
+            
+            return X_train, X_val, y_train, y_val
+            
+        except Exception as e:
+            logger.warning(f"改进的时间分割失败,回退到常规分割: {e}")
+            # 回退到常规切分
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42,
+                stratify=y if (y.nunique() == 2 and len(y.unique()) > 1) else None
+            )
+            self._cv_pairs = []
+            return X_train, X_val, y_train, y_val
+
+    @staticmethod
+    def _compute_ks_score(y_true: pd.Series, y_score: np.ndarray) -> float:
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        return float(np.max(np.abs(tpr - fpr))) if len(fpr) > 0 else np.nan
+
+    @staticmethod
+    def _compute_top_k_hit_rates(y_true: pd.Series, y_score: np.ndarray, ks: List[int]) -> Dict[int, float]:
+        if len(y_true) == 0:
+            return {k: np.nan for k in ks}
+        order = np.argsort(-y_score)
+        hits = {}
+        y_array = y_true.to_numpy()
+        for k in ks:
+            k_eff = min(k, len(order))
+            if k_eff == 0:
+                hits[k] = np.nan
+                continue
+            top_hit = y_array[order[:k_eff]].mean()
+            hits[k] = float(top_hit)
+        return hits
+
+    @staticmethod
+    def _find_optimal_threshold(y_true: pd.Series, y_score: np.ndarray) -> Tuple[float, Dict[str, float]]:
+        # 覆盖更细颗粒度并强制包含配置阈值，避免遗漏0.03等业务设定
+        base_grid = np.linspace(0.01, 0.99, 99)
+        thresholds = np.unique(np.concatenate([base_grid, np.array([CLS_THRESHOLD])]))
+        best_threshold = 0.5
+        best_f1 = -1.0
+        best_metrics = {'precision': np.nan, 'recall': np.nan, 'f1': np.nan}
+
+        for thresh in thresholds:
+            preds = (y_score >= thresh).astype(int)
+            if preds.sum() == 0:
+                continue
+            precision = precision_score(y_true, preds, zero_division=0)
+            recall = recall_score(y_true, preds, zero_division=0)
+            f1 = f1_score(y_true, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = float(thresh)
+                best_metrics = {
+                    'precision': float(precision),
+                    'recall': float(recall),
+                    'f1': float(f1)
+                }
+
+        return best_threshold, best_metrics
+
+    def _log_fold_classification_diagnostics(
+        self,
+        model_wrapper: PreprocessedModel,
+        calibrator: Optional[CalibratedClassifierCV],
+        reference_threshold: float
+    ) -> None:
+        if not self._cv_pairs or self._cv_sorted_frames is None:
+            return
+
+        from sklearn.metrics import roc_auc_score, brier_score_loss, precision_score, recall_score, f1_score
+
+        X_sorted, y_sorted, dates_sorted = self._cv_sorted_frames
+        fold_meta_map = {info['fold_id']: info for info in self.cv_fold_info} if self.cv_fold_info else {}
+
+        logger.info("折别回放诊断(分类):")
+        for pair in self._cv_pairs:
+            val_idx = pair['val_idx']
+            if len(val_idx) == 0:
+                continue
+            fold_id = pair['fold_id']
+            y_true = y_sorted.iloc[val_idx].reset_index(drop=True)
+            X_val_fold = X_sorted.iloc[val_idx].reset_index(drop=True)
+            start_dt = dates_sorted.iloc[val_idx[0]].strftime('%Y-%m-%d')
+            end_dt = dates_sorted.iloc[val_idx[-1]].strftime('%Y-%m-%d')
+
+            try:
+                proba_raw = model_wrapper.predict_proba(X_val_fold)[:, 1]
+            except Exception as exc:  # pragma: no cover - 诊断日志
+                logger.warning("  折%02d 预测失败: %s", fold_id, exc)
+                continue
+
+            proba_cal = None
+            if calibrator is not None:
+                try:
+                    proba_cal = calibrator.predict_proba(X_val_fold)[:, 1]
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("  折%02d 校准预测失败: %s", fold_id, exc)
+
+            auc_raw = float('nan')
+            auc_cal = float('nan')
+            if y_true.nunique() > 1:
+                auc_raw = float(roc_auc_score(y_true, proba_raw))
+                if proba_cal is not None:
+                    auc_cal = float(roc_auc_score(y_true, proba_cal))
+
+            brier_raw = float(brier_score_loss(y_true, proba_raw))
+            brier_cal = float('nan')
+            if proba_cal is not None:
+                brier_cal = float(brier_score_loss(y_true, proba_cal))
+
+            cfg_threshold = self.config.get('cls_threshold', 0.5)
+            preds_cfg = (proba_raw >= cfg_threshold).astype(int)
+            precision_cfg = precision_score(y_true, preds_cfg, zero_division=0)
+            recall_cfg = recall_score(y_true, preds_cfg, zero_division=0)
+            f1_cfg = f1_score(y_true, preds_cfg, zero_division=0)
+            pos_rate_cfg = float(preds_cfg.mean())
+
+            preds_ref = (proba_raw >= reference_threshold).astype(int)
+            precision_ref = precision_score(y_true, preds_ref, zero_division=0)
+            recall_ref = recall_score(y_true, preds_ref, zero_division=0)
+            f1_ref = f1_score(y_true, preds_ref, zero_division=0)
+            pos_rate_ref = float(preds_ref.mean())
+
+            meta = fold_meta_map.get(fold_id, {})
+            logger.info(
+                "  折%02d 验证[%s ~ %s] 样本%5d 正样本率%.2f%% | AUC(raw)=%.4f AUC(cal)=%.4f | Brier(raw)=%.4f Brier(cal)=%.4f | F1@阈值(%.3f)=%.4f(预测占比%.2f%%) F1@最优%.3f=%.4f(预测占比%.2f%%)",
+                fold_id,
+                start_dt,
+                end_dt,
+                len(val_idx),
+                meta.get('val_pos_rate', y_true.mean()) * 100,
+                auc_raw,
+                auc_cal,
+                brier_raw,
+                brier_cal,
+                cfg_threshold,
+                f1_cfg,
+                pos_rate_cfg * 100,
+                reference_threshold,
+                f1_ref,
+                pos_rate_ref * 100
+            )
+
+    def _log_fold_regression_diagnostics(
+        self,
+        model_wrapper: PreprocessedModel
+    ) -> None:
+        if not self._cv_pairs or self._cv_sorted_frames is None:
+            return
+
+        from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+        import math
+
+        X_sorted, y_sorted, dates_sorted = self._cv_sorted_frames
+        fold_meta_map = {info['fold_id']: info for info in self.cv_fold_info} if self.cv_fold_info else {}
+
+        logger.info("折别回放诊断(回归):")
+        for pair in self._cv_pairs:
+            val_idx = pair['val_idx']
+            if len(val_idx) == 0:
+                continue
+            fold_id = pair['fold_id']
+            y_true = y_sorted.iloc[val_idx].reset_index(drop=True)
+            X_val_fold = X_sorted.iloc[val_idx].reset_index(drop=True)
+            start_dt = dates_sorted.iloc[val_idx[0]].strftime('%Y-%m-%d')
+            end_dt = dates_sorted.iloc[val_idx[-1]].strftime('%Y-%m-%d')
+
+            try:
+                preds = model_wrapper.predict(X_val_fold)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("  折%02d 回归预测失败: %s", fold_id, exc)
+                continue
+
+            r2 = float('nan')
+            if y_true.nunique() > 1:
+                r2 = float(r2_score(y_true, preds))
+            mae = float(mean_absolute_error(y_true, preds))
+            rmse = float(math.sqrt(mean_squared_error(y_true, preds)))
+
+            meta = fold_meta_map.get(fold_id, {})
+            logger.info(
+                "  折%02d 验证[%s ~ %s] 样本%5d 均值%.4f | R²=%.4f MAE=%.4f RMSE=%.4f",
+                fold_id,
+                start_dt,
+                end_dt,
+                len(val_idx),
+                y_true.mean(),
+                r2,
+                mae,
+                rmse
+            )
+
+    def _train_xgboost_classifier(
+        self,
+        X_train: np.ndarray,
+        y_train: pd.Series,
+        X_val: np.ndarray,
+        y_val: pd.Series,
+        early_stopping_rounds: Optional[int],
+        model_params: Dict[str, Any]
+    ) -> XGBoostClassifierWrapper:
+        import xgboost as xgb
+
+        params = {
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'eta': model_params.get('learning_rate', 0.05),
+            'max_depth': model_params.get('max_depth', 5),
+            'subsample': model_params.get('subsample', 0.8),
+            'colsample_bytree': model_params.get('colsample_bytree', 0.8),
+            'reg_alpha': model_params.get('reg_alpha', 0.1),
+            'reg_lambda': model_params.get('reg_lambda', 1.0),
+            'tree_method': model_params.get('tree_method', 'hist'),
+            'seed': 42
+        }
+
+        dtrain = xgb.DMatrix(X_train, label=y_train.to_numpy())
+        dval = xgb.DMatrix(X_val, label=y_val.to_numpy())
+        callbacks = []
+        if early_stopping_rounds:
+            callbacks.append(xgb.callback.EarlyStopping(
+                rounds=early_stopping_rounds,
+                maximize=True,
+                data_name='validation',
+                metric_name='auc',
+                save_best=True
+            ))
+
+        num_boost_round = model_params.get('n_estimators', 800)
+        evals = [(dtrain, 'train'), (dval, 'validation')]
+        booster = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=evals,
+            callbacks=callbacks,
+            verbose_eval=False
+        )
+
+        best_iteration = booster.best_iteration
+        if best_iteration is None:
+            best_iteration = num_boost_round - 1
+
+        logger.info(
+            "XGBoost 分类训练完成: best_iteration=%d, best_score=%.4f",
+            best_iteration,
+            float(booster.best_score) if booster.best_score is not None else float('nan')
+        )
+
+        estimator = XGBoostClassifierWrapper(booster, best_iteration, X_train.shape[1])
+        return estimator
+
+    def _train_xgboost_regressor(
+        self,
+        X_train: np.ndarray,
+        y_train: pd.Series,
+        X_val: np.ndarray,
+        y_val: pd.Series,
+        early_stopping_rounds: Optional[int],
+        model_params: Dict[str, Any]
+    ) -> XGBoostRegressorWrapper:
+        import xgboost as xgb
+
+        params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'eta': model_params.get('learning_rate', 0.05),
+            'max_depth': model_params.get('max_depth', 5),
+            'subsample': model_params.get('subsample', 0.8),
+            'colsample_bytree': model_params.get('colsample_bytree', 0.8),
+            'reg_alpha': model_params.get('reg_alpha', 0.1),
+            'reg_lambda': model_params.get('reg_lambda', 1.0),
+            'tree_method': model_params.get('tree_method', 'hist'),
+            'seed': 42
+        }
+
+        dtrain = xgb.DMatrix(X_train, label=y_train.to_numpy())
+        dval = xgb.DMatrix(X_val, label=y_val.to_numpy())
+        callbacks = []
+        if early_stopping_rounds:
+            callbacks.append(xgb.callback.EarlyStopping(
+                rounds=early_stopping_rounds,
+                maximize=False,
+                data_name='validation',
+                metric_name='rmse',
+                save_best=True
+            ))
+
+        num_boost_round = model_params.get('n_estimators', 800)
+        evals = [(dtrain, 'train'), (dval, 'validation')]
+        booster = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=evals,
+            callbacks=callbacks,
+            verbose_eval=False
+        )
+
+        best_iteration = booster.best_iteration
+        if best_iteration is None:
+            best_iteration = num_boost_round - 1
+
+        logger.info(
+            "XGBoost 回归训练完成: best_iteration=%d, best_score=%.4f",
+            best_iteration,
+            float(booster.best_score) if booster.best_score is not None else float('nan')
+        )
+
+        estimator = XGBoostRegressorWrapper(booster, best_iteration, X_train.shape[1])
+        return estimator
     
     def create_preprocessing_pipeline(self) -> ColumnTransformer:
         """
@@ -122,14 +643,18 @@ class EnhancedTrainerV2:
         logger.info("创建预处理管道:")
         logger.info(f"  数值管道: Imputer → Winsorizer → Scaler")
         logger.info(f"  类别管道: Imputer → OneHot")
+        logger.info("  提示: 行业与板块在OneHot后会作为稠密列输入模型，跳过的是原始列级特征选择")
         
         return preprocessor
     
-    def train_classification_model(self,
-                                     X: pd.DataFrame,
-                                     y: pd.Series,
-                                     model_type: str = 'lightgbm',
-                                     **model_params) -> Dict:
+    def train_classification_model(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_type: str = 'lightgbm',
+        dates: Optional[pd.Series] = None,
+        **model_params
+    ) -> Dict:
         """
         训练分类模型
         
@@ -154,86 +679,134 @@ class EnhancedTrainerV2:
         logger.info("="*80)
         
         # 切分数据
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+        X_train, X_val, y_train, y_val = self._prepare_timeseries_split(
+            X, y, dates
         )
         
         logger.info(f"数据切分: 训练集 {len(X_train)}, 验证集 {len(X_val)}")
         logger.info(f"正样本比例: 训练集 {y_train.mean():.2%}, 验证集 {y_val.mean():.2%}")
+
+        if self.config.get('use_rolling_cv', False) and self.cv_fold_info:
+            logger.info("时间序列折统计:")
+            for fold in self.cv_fold_info:
+                logger.info(
+                    "  折%02d 训练[%s ~ %s] %4d 条(正样本 %.2f%%) | 验证[%s ~ %s] %4d 条(正样本 %.2f%%)",
+                    fold['fold_id'],
+                    fold['train_start'].strftime('%Y-%m-%d'),
+                    fold['train_end'].strftime('%Y-%m-%d'),
+                    fold['train_size'],
+                    fold['train_pos_rate'] * 100,
+                    fold['val_start'].strftime('%Y-%m-%d'),
+                    fold['val_end'].strftime('%Y-%m-%d'),
+                    fold['val_size'],
+                    fold['val_pos_rate'] * 100
+                )
         
-        # 创建预处理器
+        # 创建预处理器并仅在训练集上拟合
         preprocessor = self.create_preprocessing_pipeline()
-        
+        preprocessor.fit(X_train)
+        feature_columns = list(X_train.columns)
+        X_train_trans = preprocessor.transform(X_train)
+        X_val_trans = preprocessor.transform(X_val)
+
         # 创建模型
+        early_stopping_rounds = model_params.get('early_stopping_rounds', 50)
         if model_type == 'lightgbm':
+            import lightgbm as lgb
             from lightgbm import LGBMClassifier
             estimator = LGBMClassifier(
-                n_estimators=model_params.get('n_estimators', 100),
+                n_estimators=model_params.get('n_estimators', 800),
                 max_depth=model_params.get('max_depth', 5),
-                learning_rate=model_params.get('learning_rate', 0.1),
+                learning_rate=model_params.get('learning_rate', 0.05),
+                subsample=model_params.get('subsample', 0.8),
+                colsample_bytree=model_params.get('colsample_bytree', 0.8),
+                reg_alpha=model_params.get('reg_alpha', 0.1),
+                reg_lambda=model_params.get('reg_lambda', 1.0),
                 random_state=42,
                 verbosity=-1
             )
+            estimator.fit(
+                X_train_trans,
+                y_train,
+                eval_set=[(X_val_trans, y_val)],
+                eval_metric='auc',
+                callbacks=[
+                    lgb.early_stopping(early_stopping_rounds, verbose=False),
+                    lgb.log_evaluation(period=0)
+                ]
+            )
         elif model_type == 'xgboost':
-            from xgboost import XGBClassifier
-            estimator = XGBClassifier(
-                n_estimators=model_params.get('n_estimators', 100),
-                max_depth=model_params.get('max_depth', 5),
-                learning_rate=model_params.get('learning_rate', 0.1),
-                random_state=42,
-                verbosity=0
+            estimator = self._train_xgboost_classifier(
+                X_train_trans,
+                y_train,
+                X_val_trans,
+                y_val,
+                early_stopping_rounds,
+                model_params
             )
         elif model_type == 'logistic':
             from sklearn.linear_model import LogisticRegression
             estimator = LogisticRegression(
-                max_iter=1000,
-                random_state=42
+                max_iter=model_params.get('max_iter', 1000),
+                C=model_params.get('C', 1.0),
+                penalty=model_params.get('penalty', 'l2'),
+                random_state=42,
+                class_weight='balanced'
             )
+            estimator.fit(X_train_trans, y_train)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
-        
-        # 创建完整 pipeline
-        pipeline = Pipeline([
-            ('preprocessor', preprocessor),
-            ('classifier', estimator)
-        ])
-        
-        # 训练
-        logger.info("训练模型...")
-        pipeline.fit(X_train, y_train)
-        
+
+        model_wrapper = PreprocessedModel(
+            preprocessor=preprocessor,
+            estimator=estimator,
+            task='classification',
+            feature_columns=feature_columns
+        )
+
         # 预测（用于评估和校准）
-        y_pred_train = pipeline.predict_proba(X_train)[:, 1]
-        y_pred_val = pipeline.predict_proba(X_val)[:, 1]
+        y_pred_train = model_wrapper.predict_proba(X_train)[:, 1]
+        y_pred_val = model_wrapper.predict_proba(X_val)[:, 1]
         
         # 评估
         from sklearn.metrics import roc_auc_score, f1_score, brier_score_loss
         
+        train_auc = roc_auc_score(y_train, y_pred_train)
+        val_auc = roc_auc_score(y_val, y_pred_val)
         metrics = {
-            'train_auc': roc_auc_score(y_train, y_pred_train),
-            'val_auc': roc_auc_score(y_val, y_pred_val),
-            'train_f1': f1_score(y_train, (y_pred_train > 0.5).astype(int)),
-            'val_f1': f1_score(y_val, (y_pred_val > 0.5).astype(int)),
+            'train_auc': train_auc,
+            'val_auc': val_auc,
+            'train_f1_default': f1_score(y_train, (y_pred_train > 0.5).astype(int)),
+            'val_f1_default': f1_score(y_val, (y_pred_val > 0.5).astype(int)),
             'train_brier': brier_score_loss(y_train, y_pred_train),
             'val_brier': brier_score_loss(y_val, y_pred_val)
         }
+
+        if 'ks' in self.config.get('classification_metrics', []):
+            metrics['val_ks'] = self._compute_ks_score(y_val, y_pred_val)
+
+        if 'top_k_hit_rate' in self.config.get('classification_metrics', []):
+            top_k_hits = self._compute_top_k_hit_rates(y_val, y_pred_val, self.config.get('top_k_values', []))
+            for k, hit in top_k_hits.items():
+                metrics[f'top_{k}_hit_rate'] = hit
         
         logger.info("训练集评估:")
         logger.info(f"  AUC: {metrics['train_auc']:.4f}")
-        logger.info(f"  F1:  {metrics['train_f1']:.4f}")
+        logger.info(f"  F1(0.5): {metrics['train_f1_default']:.4f}")
         logger.info(f"  Brier: {metrics['train_brier']:.4f}")
         
         logger.info("验证集评估:")
         logger.info(f"  AUC: {metrics['val_auc']:.4f}")
-        logger.info(f"  F1:  {metrics['val_f1']:.4f}")
+        logger.info(f"  F1(0.5): {metrics['val_f1_default']:.4f}")
         logger.info(f"  Brier: {metrics['val_brier']:.4f}")
         
         # 概率校准
         calibrator = None
+        calibrated_scores = y_pred_val
         if ENABLE_CALIBRATION:
             logger.info(f"应用概率校准: {CALIBRATION_METHOD}")
             calibrator = CalibratedClassifierCV(
-                estimator=pipeline,
+                estimator=model_wrapper,
                 method=CALIBRATION_METHOD,
                 cv='prefit'
             )
@@ -241,34 +814,56 @@ class EnhancedTrainerV2:
             
             # 评估校准后的性能
             y_pred_cal = calibrator.predict_proba(X_val)[:, 1]
+            calibrated_scores = y_pred_cal
             cal_brier = brier_score_loss(y_val, y_pred_cal)
             
             logger.info(f"校准后 Brier: {cal_brier:.4f} (改善: {metrics['val_brier'] - cal_brier:.4f})")
             metrics['val_brier_calibrated'] = cal_brier
         
+        optimal_threshold, threshold_metrics = self._find_optimal_threshold(y_val, calibrated_scores)
+        metrics['optimal_threshold'] = optimal_threshold
+        metrics.update({f"optimal_{k}": v for k, v in threshold_metrics.items()})
+        metrics['val_f1_optimal'] = threshold_metrics.get('f1', np.nan)
+        metrics['val_precision_optimal'] = threshold_metrics.get('precision', np.nan)
+        metrics['val_recall_optimal'] = threshold_metrics.get('recall', np.nan)
+
+        logger.info(
+            "最佳阈值 %.3f → 验证集 Precision %.4f / Recall %.4f / F1 %.4f",
+            optimal_threshold,
+            metrics['val_precision_optimal'],
+            metrics['val_recall_optimal'],
+            metrics['val_f1_optimal']
+        )
+
+        if self.config.get('use_rolling_cv', False) and self._cv_pairs and self._cv_sorted_frames is not None:
+            self._log_fold_classification_diagnostics(model_wrapper, calibrator, optimal_threshold)
+
         # 特征选择（如果需要）
         selected_features = None
         if self.config['enable_feature_selection']:
-            logger.info("执行特征选择...")
-            from src.ml.preprocessing.feature_selection import select_features_for_task
-            
-            selected_features, _ = select_features_for_task(
-                X_train[self.numerical_features + self.categorical_features],
-                y_train,
-                task='classification',
-                min_features=self.config['min_features'],
-                max_features=self.config['max_features']
-            )
+            if self.categorical_features:
+                logger.info("存在类别特征，跳过原始空间特征选择以避免object类型问题")
+            else:
+                logger.info("执行特征选择...")
+                from src.ml.preprocessing.feature_selection import select_features_for_task
+                
+                selected_features, _ = select_features_for_task(
+                    X_train[self.numerical_features],
+                    y_train,
+                    task='classification',
+                    min_features=self.config['min_features'],
+                    max_features=self.config['max_features']
+                )
         
         # 返回结果
         result = {
             'task': 'classification',
             'model_type': model_type,
-            'pipeline': pipeline,
+            'pipeline': model_wrapper,
             'calibrator': calibrator,
             'selected_features': selected_features,
             'metrics': metrics,
-            'threshold': self.config['cls_threshold'],
+            'threshold': optimal_threshold,
             'training_date': datetime.now().strftime('%Y-%m-%d'),
             'config': self.config.copy()
         }
@@ -277,11 +872,14 @@ class EnhancedTrainerV2:
         
         return result
     
-    def train_regression_model(self,
-                                X: pd.DataFrame,
-                                y: pd.Series,
-                                model_type: str = 'lightgbm',
-                                **model_params) -> Dict:
+    def train_regression_model(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_type: str = 'lightgbm',
+        dates: Optional[pd.Series] = None,
+        **model_params
+    ) -> Dict:
         """
         训练回归模型
         
@@ -306,54 +904,86 @@ class EnhancedTrainerV2:
         logger.info("="*80)
         
         # 切分数据
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42
+        X_train, X_val, y_train, y_val = self._prepare_timeseries_split(
+            X, y, dates
         )
         
         logger.info(f"数据切分: 训练集 {len(X_train)}, 验证集 {len(X_val)}")
         logger.info(f"目标统计: 均值 {y_train.mean():.4f}, 标准差 {y_train.std():.4f}")
+
+        if self.config.get('use_rolling_cv', False) and self.cv_fold_info:
+            logger.info("时间序列折统计:")
+            for fold in self.cv_fold_info:
+                logger.info(
+                    "  折%02d 训练[%s ~ %s] %4d 条 | 验证[%s ~ %s] %4d 条",
+                    fold['fold_id'],
+                    fold['train_start'].strftime('%Y-%m-%d'),
+                    fold['train_end'].strftime('%Y-%m-%d'),
+                    fold['train_size'],
+                    fold['val_start'].strftime('%Y-%m-%d'),
+                    fold['val_end'].strftime('%Y-%m-%d'),
+                    fold['val_size']
+                )
         
-        # 创建预处理器
+        # 创建预处理器并仅在训练集上拟合
         preprocessor = self.create_preprocessing_pipeline()
-        
+        preprocessor.fit(X_train)
+        feature_columns = list(X_train.columns)
+        X_train_trans = preprocessor.transform(X_train)
+        X_val_trans = preprocessor.transform(X_val)
+
         # 创建模型
+        early_stopping_rounds = model_params.get('early_stopping_rounds', 50)
         if model_type == 'lightgbm':
+            import lightgbm as lgb
             from lightgbm import LGBMRegressor
             estimator = LGBMRegressor(
-                n_estimators=model_params.get('n_estimators', 100),
+                n_estimators=model_params.get('n_estimators', 800),
                 max_depth=model_params.get('max_depth', 5),
-                learning_rate=model_params.get('learning_rate', 0.1),
+                learning_rate=model_params.get('learning_rate', 0.05),
+                subsample=model_params.get('subsample', 0.8),
+                colsample_bytree=model_params.get('colsample_bytree', 0.8),
+                reg_alpha=model_params.get('reg_alpha', 0.1),
+                reg_lambda=model_params.get('reg_lambda', 1.0),
                 random_state=42,
                 verbosity=-1
             )
+            estimator.fit(
+                X_train_trans,
+                y_train,
+                eval_set=[(X_val_trans, y_val)],
+                eval_metric='rmse',
+                callbacks=[
+                    lgb.early_stopping(early_stopping_rounds, verbose=False),
+                    lgb.log_evaluation(period=0)
+                ]
+            )
         elif model_type == 'xgboost':
-            from xgboost import XGBRegressor
-            estimator = XGBRegressor(
-                n_estimators=model_params.get('n_estimators', 100),
-                max_depth=model_params.get('max_depth', 5),
-                learning_rate=model_params.get('learning_rate', 0.1),
-                random_state=42,
-                verbosity=0
+            estimator = self._train_xgboost_regressor(
+                X_train_trans,
+                y_train,
+                X_val_trans,
+                y_val,
+                early_stopping_rounds,
+                model_params
             )
         elif model_type == 'ridge':
             from sklearn.linear_model import Ridge
             estimator = Ridge(alpha=model_params.get('alpha', 1.0))
+            estimator.fit(X_train_trans, y_train)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
-        
-        # 创建完整 pipeline
-        pipeline = Pipeline([
-            ('preprocessor', preprocessor),
-            ('regressor', estimator)
-        ])
-        
-        # 训练
-        logger.info("训练模型...")
-        pipeline.fit(X_train, y_train)
-        
+
+        model_wrapper = PreprocessedModel(
+            preprocessor=preprocessor,
+            estimator=estimator,
+            task='regression',
+            feature_columns=feature_columns
+        )
+
         # 预测
-        y_pred_train = pipeline.predict(X_train)
-        y_pred_val = pipeline.predict(X_val)
+        y_pred_train = model_wrapper.predict(X_train)
+        y_pred_val = model_wrapper.predict(X_val)
         
         # 评估
         from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
@@ -376,26 +1006,32 @@ class EnhancedTrainerV2:
         logger.info(f"  R²:  {metrics['val_r2']:.4f}")
         logger.info(f"  MAE: {metrics['val_mae']:.4f}")
         logger.info(f"  RMSE: {metrics['val_rmse']:.4f}")
+
+        if self.config.get('use_rolling_cv', False) and self._cv_pairs and self._cv_sorted_frames is not None:
+            self._log_fold_regression_diagnostics(model_wrapper)
         
         # 特征选择（如果需要）
         selected_features = None
         if self.config['enable_feature_selection']:
-            logger.info("执行特征选择...")
-            from src.ml.preprocessing.feature_selection import select_features_for_task
-            
-            selected_features, _ = select_features_for_task(
-                X_train[self.numerical_features + self.categorical_features],
-                y_train,
-                task='regression',
-                min_features=self.config['min_features'],
-                max_features=self.config['max_features']
-            )
+            if self.categorical_features:
+                logger.info("存在类别特征，跳过原始空间特征选择以避免object类型问题")
+            else:
+                logger.info("执行特征选择...")
+                from src.ml.preprocessing.feature_selection import select_features_for_task
+                
+                selected_features, _ = select_features_for_task(
+                    X_train[self.numerical_features],
+                    y_train,
+                    task='regression',
+                    min_features=self.config['min_features'],
+                    max_features=self.config['max_features']
+                )
         
         # 返回结果
         result = {
             'task': 'regression',
             'model_type': model_type,
-            'pipeline': pipeline,
+            'pipeline': model_wrapper,
             'calibrator': None,  # 回归不需要校准
             'selected_features': selected_features,
             'metrics': metrics,

@@ -6,9 +6,11 @@
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterable
 import logging
 import re
+
+from src.data.db.symbol_standardizer import get_symbol_standardizer, standardize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,36 @@ class IndustryFeatureGenerator:
         self.min_frequency = min_frequency
         self.industry_cache = {}  # 缓存: {symbol: industry}
         self.industry_stats = {}  # 统计: {industry: count}
+        self.symbol_standardizer = get_symbol_standardizer()
+
+    def _normalize_symbol_key(self, symbol: str) -> str:
+        """生成用于匹配的统一主键"""
+        if symbol is None:
+            return ''
+        try:
+            std = standardize_symbol(symbol)
+            return std.split('.')[0]
+        except Exception:
+            digits = re.findall(r'\d{3,}', str(symbol))
+            return digits[0] if digits else str(symbol)
+
+    def _prepare_query_symbols(self, symbols: Iterable[str]) -> List[str]:
+        """准备数据库查询所需的候选symbol列表"""
+        candidates = set()
+        for symbol in symbols:
+            if not symbol:
+                continue
+            raw = str(symbol).strip()
+            candidates.add(raw)
+            try:
+                std = standardize_symbol(raw)
+                candidates.add(std)
+                candidates.add(std.split('.')[0])
+            except Exception:
+                digits = re.findall(r'\d{6}', raw)
+                if digits:
+                    candidates.add(digits[0])
+        return list(candidates)
     
     def fetch_industry_data(self, symbols: Optional[List[str]] = None) -> pd.DataFrame:
         """
@@ -108,17 +140,28 @@ class IndustryFeatureGenerator:
                        COALESCE(NULLIF(TRIM(industry), ''), 'Unknown') AS industry
                 FROM stocks
                 """
-                df = self.db.execute_query(query)
+                results = self.db.execute_query(query)
             else:
                 # 获取指定股票
-                placeholders = ','.join(['?' if self.db.db_type == 'sqlite' else '%s'] * len(symbols))
+                query_symbols = self._prepare_query_symbols(symbols)
+                if not query_symbols:
+                    logger.warning("未获取到行业数据")
+                    return pd.DataFrame(columns=['symbol', 'industry'])
+                placeholders = ','.join(['?' if self.db.db_type == 'sqlite' else '%s'] * len(query_symbols))
                 query = f"""
                 SELECT symbol, 
                        COALESCE(NULLIF(TRIM(industry), ''), 'Unknown') AS industry
                 FROM stocks
                 WHERE symbol IN ({placeholders})
                 """
-                df = self.db.execute_query(query, tuple(symbols))
+                results = self.db.execute_query(query, tuple(query_symbols))
+
+            df = pd.DataFrame(results) if results else pd.DataFrame(columns=['symbol', 'industry'])
+            if not df.empty:
+                missing_cols = {'symbol', 'industry'} - set(df.columns)
+                for col in missing_cols:
+                    df[col] = np.nan
+                df = df[['symbol', 'industry']]
             
             if df is None or len(df) == 0:
                 logger.warning("未获取到行业数据")
@@ -129,7 +172,12 @@ class IndustryFeatureGenerator:
             
             # 更新缓存
             for _, row in df.iterrows():
-                self.industry_cache[row['symbol']] = row['industry']
+                cache_symbol = row['symbol']
+                industry_value = row['industry']
+                self.industry_cache[cache_symbol] = industry_value
+                normalized_key = self._normalize_symbol_key(cache_symbol)
+                if normalized_key:
+                    self.industry_cache[normalized_key] = industry_value
             
             # 统计行业分布
             self._update_industry_stats(df)
@@ -216,11 +264,14 @@ class IndustryFeatureGenerator:
         result = {}
         
         if use_cache:
-            # 从缓存中获取
             missing_symbols = []
             for symbol in symbols:
-                if symbol in self.industry_cache:
-                    result[symbol] = self.industry_cache[symbol]
+                cache_key_primary = symbol
+                cache_key_secondary = self._normalize_symbol_key(symbol)
+                if cache_key_primary in self.industry_cache:
+                    result[symbol] = self.industry_cache[cache_key_primary]
+                elif cache_key_secondary in self.industry_cache:
+                    result[symbol] = self.industry_cache[cache_key_secondary]
                 else:
                     missing_symbols.append(symbol)
             
@@ -283,19 +334,30 @@ def add_industry_features(df: pd.DataFrame, db_manager, merge_low_freq: bool = T
         return df
     
     generator = IndustryFeatureGenerator(db_manager)
-    
-    # 获取行业数据
-    symbols = df['symbol'].unique().tolist()
-    industry_df = generator.fetch_industry_data(symbols)
-    
-    # 合并低频行业
+
+    symbols = df['symbol'].astype(str)
+    symbol_keys = symbols.apply(generator._normalize_symbol_key)
+    df_with_key = df.copy()
+    df_with_key['_symbol_key'] = symbol_keys
+
+    industry_df = generator.fetch_industry_data(symbols.unique().tolist())
+
+    if industry_df.empty:
+        df_with_key['industry'] = 'Unknown'
+        return df_with_key.drop(columns=['_symbol_key'])
+
+    industry_df['_symbol_key'] = industry_df['symbol'].apply(generator._normalize_symbol_key)
+    industry_df = industry_df.drop_duplicates('_symbol_key', keep='first')
+
     if merge_low_freq:
-        industry_df = generator.merge_low_frequency_industries(industry_df, total_count=len(symbols))
-    
-    # 合并到原 DataFrame
-    df = df.merge(industry_df, on='symbol', how='left')
-    
-    # 填充缺失值
-    df['industry'].fillna('Unknown', inplace=True)
-    
-    return df
+        total_count = len(symbol_keys.unique())
+        industry_df = generator.merge_low_frequency_industries(industry_df, total_count=total_count)
+
+    merged = df_with_key.merge(
+        industry_df[['_symbol_key', 'industry']],
+        on='_symbol_key',
+        how='left'
+    )
+
+    merged['industry'].fillna('Unknown', inplace=True)
+    return merged.drop(columns=['_symbol_key'])

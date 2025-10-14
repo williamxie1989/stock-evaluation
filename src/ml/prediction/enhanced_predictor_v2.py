@@ -33,7 +33,7 @@ class EnhancedPredictorV2:
     4. 向后兼容旧格式模型
     """
     
-    def __init__(self, models_dir: str = "models/v2"):
+    def __init__(self, models_dir: str = "models/v2", prediction_period: Optional[int] = None):
         """
         初始化预测器
         
@@ -41,8 +41,11 @@ class EnhancedPredictorV2:
         ----------
         models_dir : str
             模型文件目录
+        prediction_period : int, optional
+            预测周期（天数），如果不指定则使用配置文件中的默认值
         """
         self.models_dir = Path(models_dir)
+        self.prediction_period = prediction_period or PREDICTION_PERIOD_DAYS
         
         # 初始化数据访问层
         self.data_access = UnifiedDataAccessLayer()
@@ -63,15 +66,15 @@ class EnhancedPredictorV2:
         # 加载模型
         self._load_models()
         
-        logger.info("EnhancedPredictorV2 初始化完成")
+        logger.info(f"EnhancedPredictorV2 初始化完成 (预测周期: {self.prediction_period}天)")
     
     def _load_models(self):
         """加载模型（V2格式优先，向后兼容V1）"""
         # 尝试加载分类模型
         cls_paths = [
-            self.models_dir / f'cls_{PREDICTION_PERIOD_DAYS}d_best.pkl',
-            self.models_dir / f'cls_{PREDICTION_PERIOD_DAYS}d_lightgbm.pkl',
-            self.models_dir / f'cls_{PREDICTION_PERIOD_DAYS}d_xgboost.pkl',
+            self.models_dir / f'cls_{self.prediction_period}d_best.pkl',
+            self.models_dir / f'cls_{self.prediction_period}d_lightgbm.pkl',
+            self.models_dir / f'cls_{self.prediction_period}d_xgboost.pkl',
             self.models_dir.parent / 'good' / 'xgboost_classification.pkl'  # 旧格式fallback
         ]
         
@@ -89,9 +92,9 @@ class EnhancedPredictorV2:
         
         # 尝试加载回归模型
         reg_paths = [
-            self.models_dir / f'reg_{PREDICTION_PERIOD_DAYS}d_best.pkl',
-            self.models_dir / f'reg_{PREDICTION_PERIOD_DAYS}d_lightgbm.pkl',
-            self.models_dir / f'reg_{PREDICTION_PERIOD_DAYS}d_xgboost.pkl',
+            self.models_dir / f'reg_{self.prediction_period}d_best.pkl',
+            self.models_dir / f'reg_{self.prediction_period}d_lightgbm.pkl',
+            self.models_dir / f'reg_{self.prediction_period}d_xgboost.pkl',
             self.models_dir.parent / 'good' / 'xgboost_regression.pkl'  # 旧格式fallback
         ]
         

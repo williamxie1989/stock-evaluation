@@ -30,11 +30,11 @@ from config.prediction_config import (
 )
 
 # 导入特征生成器
-from .price_volume import PriceVolumeFeatureGenerator, build_price_volume_features
-from .market_factors import MarketFactorGenerator, build_market_factors_for_universe
-from .industry import IndustryFeatureGenerator, add_industry_features
-from .board import BoardFeatureGenerator, add_board_features
-from .feature_cache_manager import FeatureCacheManager
+from src.ml.features.price_volume import PriceVolumeFeatureGenerator
+from src.ml.features.market_factors import MarketFactorGenerator
+from src.ml.features.industry import IndustryFeatureGenerator, add_industry_features
+from src.ml.features.board import BoardFeatureGenerator, add_board_features
+from src.ml.features.feature_cache_manager import FeatureCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,8 @@ class UnifiedFeatureBuilder:
                        as_of_date: Optional[str] = None,
                        return_labels: bool = False,
                        label_period: int = 30,
-                       force_refresh: bool = False) -> pd.DataFrame:
+                       force_refresh: bool = False,
+                       universe_symbols: Optional[List[str]] = None) -> pd.DataFrame:
         """
         为股票列表构建所有特征（带缓存）
         
@@ -133,17 +134,24 @@ class UnifiedFeatureBuilder:
                 logger.info(f"✅ 缓存命中！跳过特征计算 ({len(cached_features)}行 x {len(cached_features.columns)}列)")
                 return cached_features
         
+        # 🔄 统一加载股票历史数据（避免重复 IO）
+        history_symbols = set(symbols)
+        if universe_symbols:
+            history_symbols.update(universe_symbols)
+        history_data = self._load_stock_history(sorted(history_symbols), as_of_date)
+
         # Step 1: 构建价量特征
         if self.enable_price_volume:
             logger.info("构建价量特征...")
-            df_pv = self._build_price_volume_features(symbols, as_of_date)
+            df_pv = self._build_price_volume_features(symbols, as_of_date, history_data)
         else:
             df_pv = pd.DataFrame({'symbol': symbols})
         
         # Step 2: 构建市场因子特征
         if self.enable_market:
             logger.info("构建市场因子...")
-            df_market = self._build_market_features(symbols, as_of_date)
+            market_universe = universe_symbols or symbols
+            df_market = self._build_market_features(symbols, as_of_date, history_data, market_universe)
             # 合并
             if len(df_market) > 0:
                 df_pv = df_pv.merge(df_market, on='symbol', how='left', suffixes=('', '_market'))
@@ -291,68 +299,108 @@ class UnifiedFeatureBuilder:
             traceback.print_exc()
             return pd.DataFrame()
     
-    def _build_price_volume_features(self, symbols: List[str], as_of_date: Optional[str]) -> pd.DataFrame:
-        """构建价量特征"""
-        all_features = []
-        
-        # 🔧 修复：确保end_date不为None
-        end_date = as_of_date if as_of_date else datetime.now().strftime('%Y-%m-%d')
-        
+    def _load_stock_history(self,
+                             symbols: List[str],
+                             as_of_date: Optional[str]) -> Dict[str, pd.DataFrame]:
+        """批量加载股票历史数据并标准化"""
+        if not symbols:
+            return {}
+
+        end_dt = pd.Timestamp(as_of_date) if as_of_date else pd.Timestamp.now()
+        start_dt = end_dt - timedelta(days=self.lookback_days + 60)
+
+        history: Dict[str, pd.DataFrame] = {}
+
         for symbol in symbols:
             try:
-                # 获取历史数据
-                start_date = (pd.Timestamp(end_date) - timedelta(days=self.lookback_days + 30)).strftime('%Y-%m-%d')
                 df = self.data_access.get_stock_data(
                     symbol=symbol,
-                    start_date=start_date,
-                    end_date=end_date
+                    start_date=start_dt.strftime('%Y-%m-%d'),
+                    end_date=end_dt.strftime('%Y-%m-%d')
                 )
-                
+
                 if df is None or len(df) < MIN_HISTORY_DAYS:
-                    logger.warning(f"{symbol}: 数据不足 (< {MIN_HISTORY_DAYS} 天)")
+                    logger.debug(f"{symbol}: 历史数据不足，len={len(df) if df is not None else 0}")
                     continue
-                
-                # 标准化列名
+
+                df = df.copy()
                 df.columns = df.columns.str.lower()
-                
-                # 🔧 修复：确保数值列为正确类型
+
+                # 设置日期索引
+                if 'date' in df.columns and df.index.name != 'date':
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                elif not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index, errors='coerce')
+
+                df.sort_index(inplace=True)
+
+                # 仅保留 lookback_days + 缓冲
+                df = df[df.index >= start_dt]
+
+                # 数值列转型
                 numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount']
                 for col in numeric_cols:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                # 设置日期索引
-                if 'date' in df.columns and df.index.name != 'date':
-                    df.set_index('date', inplace=True)
-                elif df.index.name != 'date' and not isinstance(df.index, pd.DatetimeIndex):
-                    # 如果索引不是日期类型，尝试转换
-                    df.index = pd.to_datetime(df.index, errors='coerce')
-                
-                # 生成价量特征
-                df_features = self.pv_generator.generate_features(df)
-                
-                # 只保留最后一行
+
+                if 'close' in df.columns:
+                    df['ret'] = df['close'].pct_change(fill_method=None)
+
+                history[symbol] = df
+
+            except Exception as exc:
+                logger.warning(f"{symbol}: 加载历史数据失败 - {exc}")
+                continue
+
+        return history
+
+    def _build_price_volume_features(self,
+                                      symbols: List[str],
+                                      as_of_date: Optional[str],
+                                      history_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """构建价量特征"""
+        all_features = []
+
+        for symbol in symbols:
+            df = history_data.get(symbol)
+            if df is None or len(df) < MIN_HISTORY_DAYS:
+                logger.warning(f"{symbol}: 缺失价量特征所需历史数据，跳过")
+                continue
+
+            try:
+                df_local = df.copy()
+
+                if as_of_date:
+                    df_local = df_local[df_local.index <= pd.Timestamp(as_of_date)]
+
+                df_local = df_local.tail(self.lookback_days + 5)
+
+                df_features = self.pv_generator.generate_features(df_local)
+
                 df_last = df_features.tail(1).copy()
                 df_last['symbol'] = symbol
-                
+
                 all_features.append(df_last)
-                
-            except Exception as e:
-                logger.error(f"{symbol}: 价量特征构建失败 - {e}")
+            except Exception as exc:
+                logger.error(f"{symbol}: 价量特征构建失败 - {exc}")
                 continue
-        
+
         if not all_features:
             return pd.DataFrame()
-        
+
         result = pd.concat(all_features, ignore_index=True)
-        
-        # 重置索引，移除date列（保留为普通列）
+
         if 'date' in result.index.names:
             result.reset_index(inplace=True)
-        
+
         return result
-    
-    def _build_market_features(self, symbols: List[str], as_of_date: Optional[str]) -> pd.DataFrame:
+
+    def _build_market_features(self,
+                               symbols: List[str],
+                               as_of_date: Optional[str],
+                               history_data: Dict[str, pd.DataFrame],
+                               universe_symbols: List[str]) -> pd.DataFrame:
         """构建市场因子特征"""
         try:
             # 🔧 修复：确保end_date不为None
@@ -360,38 +408,20 @@ class UnifiedFeatureBuilder:
             
             # 获取所有股票数据用于构建市场收益
             logger.info("获取股票池数据用于构建市场因子...")
-            all_stocks_data = {}
-            
-            start_date = (pd.Timestamp(end_date) - timedelta(days=self.lookback_days + 30)).strftime('%Y-%m-%d')
-            
-            for symbol in symbols:
-                try:
-                    df = self.data_access.get_stock_data(
-                        symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-                    
-                    if df is not None and len(df) >= MIN_HISTORY_DAYS:
-                        df.columns = df.columns.str.lower()
-                        
-                        # 🔧 修复：确保数值列为正确类型
-                        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount']
-                        for col in numeric_cols:
-                            if col in df.columns:
-                                df[col] = pd.to_numeric(df[col], errors='coerce')
-                        
-                        if 'date' in df.columns:
-                            df.set_index('date', inplace=True)
-                        elif not isinstance(df.index, pd.DatetimeIndex):
-                            df.index = pd.to_datetime(df.index, errors='coerce')
-                            
-                        if 'ret' not in df.columns and 'close' in df.columns:
-                            df['ret'] = df['close'].pct_change()
-                        
-                        all_stocks_data[symbol] = df
-                except:
+            all_stocks_data: Dict[str, pd.DataFrame] = {}
+
+            for symbol in universe_symbols:
+                df = history_data.get(symbol)
+                if df is None or len(df) < MIN_HISTORY_DAYS:
                     continue
+
+                df_local = df.copy()
+                df_local = df_local[df_local.index <= pd.Timestamp(end_date)]
+
+                if 'ret' not in df_local.columns and 'close' in df_local.columns:
+                    df_local['ret'] = df_local['close'].pct_change(fill_method=None)
+
+                all_stocks_data[symbol] = df_local
             
             if len(all_stocks_data) < MIN_STOCKS_FOR_MARKET:
                 logger.warning(f"股票数量不足以构建市场因子 ({len(all_stocks_data)} < {MIN_STOCKS_FOR_MARKET})")
