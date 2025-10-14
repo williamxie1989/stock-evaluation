@@ -35,6 +35,7 @@ from src.ml.features.market_factors import MarketFactorGenerator
 from src.ml.features.industry import IndustryFeatureGenerator, add_industry_features
 from src.ml.features.board import BoardFeatureGenerator, add_board_features
 from src.ml.features.feature_cache_manager import FeatureCacheManager
+from src.ml.features.fundamental_features import FundamentalFeatureGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class UnifiedFeatureBuilder:
                  enable_market: bool = ENABLE_MARKET_FACTOR,
                  enable_industry: bool = ENABLE_INDUSTRY_FEATURES,
                  enable_board: bool = ENABLE_BOARD_ONEHOT,
+                 enable_fundamental: bool = False,
                  enable_cache: bool = True):
         """
         初始化统一特征构建器
@@ -69,6 +71,7 @@ class UnifiedFeatureBuilder:
             enable_market: 启用市场因子
             enable_industry: 启用行业特征
             enable_board: 启用板块特征
+            enable_fundamental: 启用基本面特征（财务数据）
             enable_cache: 启用特征缓存（默认True）
         """
         self.data_access = data_access
@@ -80,12 +83,23 @@ class UnifiedFeatureBuilder:
         self.enable_market = enable_market
         self.enable_industry = enable_industry
         self.enable_board = enable_board
+        self.enable_fundamental = enable_fundamental
         
         # 初始化各特征生成器
         self.pv_generator = PriceVolumeFeatureGenerator(lookback_days) if enable_price_volume else None
         self.market_generator = MarketFactorGenerator(lookback_days) if enable_market else None
         self.industry_generator = IndustryFeatureGenerator(db_manager, min_frequency=INDUSTRY_MIN_FREQUENCY) if enable_industry else None
         self.board_generator = BoardFeatureGenerator() if enable_board else None
+        
+        # 🚀 初始化基本面特征生成器（支持数据库缓存）
+        if enable_fundamental:
+            self.fundamental_generator = FundamentalFeatureGenerator(
+                cache_enabled=enable_cache,
+                db_manager=db_manager,  # 传递db_manager以启用数据库缓存
+                use_db_cache=True  # 优先从数据库读取
+            )
+        else:
+            self.fundamental_generator = None
         
         # 🚀 初始化特征缓存管理器（整合L0-L2三层缓存）
         self.cache_manager = FeatureCacheManager(enable_cache=enable_cache)
@@ -95,6 +109,7 @@ class UnifiedFeatureBuilder:
         logger.info(f"  - 市场因子: {enable_market}")
         logger.info(f"  - 行业特征: {enable_industry}")
         logger.info(f"  - 板块特征: {enable_board}")
+        logger.info(f"  - 基本面特征: {enable_fundamental}")
         logger.info(f"  - 特征缓存: {enable_cache}")
     
     def build_features(self, 
@@ -126,6 +141,7 @@ class UnifiedFeatureBuilder:
                 'enable_market': self.enable_market,
                 'enable_industry': self.enable_industry,
                 'enable_board': self.enable_board,
+                'enable_fundamental': self.enable_fundamental,
                 'lookback_days': self.lookback_days
             }
             
@@ -166,7 +182,12 @@ class UnifiedFeatureBuilder:
             logger.info("添加板块特征...")
             df_pv = add_board_features(df_pv, symbol_col='symbol')
         
-        # Step 5: 构建标签（如果需要）
+        # Step 5: 添加基本面特征（财务数据）
+        if self.enable_fundamental:
+            logger.info("添加基本面特征...")
+            df_pv = self._add_fundamental_features(df_pv, as_of_date)
+        
+        # Step 6: 构建标签（如果需要）
         if return_labels:
             logger.info(f"构建 {label_period} 天预测标签...")
             df_pv = self._add_labels(df_pv, label_period, as_of_date)
@@ -183,6 +204,7 @@ class UnifiedFeatureBuilder:
                 'enable_market': self.enable_market,
                 'enable_industry': self.enable_industry,
                 'enable_board': self.enable_board,
+                'enable_fundamental': self.enable_fundamental,
                 'lookback_days': self.lookback_days
             }
             self.cache_manager.set(symbols, as_of_date, feature_config, df_pv)
@@ -290,6 +312,13 @@ class UnifiedFeatureBuilder:
                         df_features.insert(0, 'date', original_dates[:len(df_features)])
             else:
                 logger.debug(f"{symbol}: ✅ date列验证通过")
+            
+            # 添加基本面特征（如果启用）
+            if self.enable_fundamental and self.fundamental_generator is not None:
+                # 添加symbol列（基本面特征生成需要）
+                df_features['symbol'] = symbol
+                df_features = self._add_fundamental_features(df_features, as_of_date=None)
+                # _add_fundamental_features会保留symbol列，这里不需要删除
             
             return df_features
             
@@ -472,6 +501,68 @@ class UnifiedFeatureBuilder:
             logger.error(f"市场因子构建失败: {e}")
             return pd.DataFrame()
     
+    def _add_fundamental_features(self, df: pd.DataFrame, as_of_date: Optional[str]) -> pd.DataFrame:
+        """
+        添加基本面特征（财务数据）
+        
+        为每只股票的每个日期添加估值、盈利、成长、财务质量4大类特征
+        
+        Args:
+            df: 包含symbol和date列的DataFrame
+            as_of_date: 截止日期（已废弃，使用DataFrame中的date列）
+        
+        Returns:
+            添加了基本面特征的DataFrame
+        """
+        if 'symbol' not in df.columns:
+            logger.warning("DataFrame缺少symbol列，无法添加基本面特征")
+            return df
+        
+        if 'date' not in df.columns:
+            logger.warning("DataFrame缺少date列，无法添加基本面特征")
+            return df
+        
+        # 为每个(symbol, date)对生成基本面特征
+        fundamental_features_list = []
+        
+        # 按行遍历，为每个symbol-date组合生成特征
+        for idx, row in df.iterrows():
+            symbol = row['symbol']
+            date = pd.to_datetime(row['date'])
+            
+            try:
+                # 移除后缀（如果有）
+                symbol_clean = symbol.split('.')[0] if '.' in symbol else symbol
+                
+                # 生成特征
+                features = self.fundamental_generator.generate_features(
+                    symbol=symbol_clean,
+                    date=date,
+                    lookback_quarters=4
+                )
+                
+                # 添加symbol和date标识
+                features['symbol'] = symbol
+                features['date'] = row['date']  # 保持原始格式
+                fundamental_features_list.append(features)
+                
+            except Exception as e:
+                logger.debug(f"{symbol}@{date.date()}: 基本面特征生成失败 - {e}")
+                # 失败时添加空特征
+                fundamental_features_list.append({'symbol': symbol, 'date': row['date']})
+        
+        # 转换为DataFrame
+        df_fundamental = pd.DataFrame(fundamental_features_list)
+        
+        # 按symbol和date合并到原始DataFrame
+        df_merged = df.merge(df_fundamental, on=['symbol', 'date'], how='left', suffixes=('', '_fundamental'))
+        
+        # 统计添加的特征数
+        new_features = [col for col in df_fundamental.columns if col != 'symbol']
+        logger.info(f"添加了 {len(new_features)} 个基本面特征")
+        
+        return df_merged
+    
     def _add_labels(self, df: pd.DataFrame, period: int, as_of_date: Optional[str]) -> pd.DataFrame:
         """添加预测标签"""
         # 计算未来收益
@@ -547,6 +638,32 @@ class UnifiedFeatureBuilder:
         
         if self.enable_market and self.market_generator:
             features.extend(self.market_generator.get_feature_names())
+        
+        # 基本面特征（全部为数值特征）
+        if self.enable_fundamental:
+            # 基本面特征列表（根据fundamental_features.py实现）
+            fundamental_features = [
+                # 估值特征
+                'market_cap', 'log_market_cap', 'circ_market_cap', 
+                'pe_ttm', 'pe_ttm_valid', 'pb', 'pb_valid',
+                'roe', 'net_profit_margin',
+                
+                # 盈利特征
+                'roe_latest', 'roa', 'gross_profit_margin',
+                'net_profit', 'total_revenue', 'roe_yoy_growth',
+                'net_profit_yoy_growth',
+                
+                # 成长特征
+                'revenue_yoy_growth', 'profit_yoy_growth',
+                'deducted_profit_yoy_growth', 'revenue_cagr_3y',
+                'profit_cagr_3y',
+                
+                # 财务质量特征
+                'debt_to_asset_ratio', 'current_ratio', 'quick_ratio',
+                'receivable_turnover_days', 'operating_cashflow_per_share',
+                'book_value_per_share'
+            ]
+            features.extend(fundamental_features)
         
         return features
     

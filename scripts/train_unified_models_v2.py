@@ -52,7 +52,8 @@ def prepare_training_data(
     prediction_period: int = PREDICTION_PERIOD_DAYS,
     classification_strategy: str = LABEL_STRATEGY,
     label_quantile: float = LABEL_POSITIVE_QUANTILE,
-    label_min_samples: int = LABEL_MIN_SAMPLES_PER_DATE
+    label_min_samples: int = LABEL_MIN_SAMPLES_PER_DATE,
+    enable_fundamental: bool = False
 ) -> pd.DataFrame:
     """
     准备训练数据
@@ -85,6 +86,7 @@ def prepare_training_data(
     logger.info(f"预测周期: {prediction_period}天")
     logger.info(f"价格策略: 特征用不复权 + 标签用前复权")
     logger.info(f"标签策略: {classification_strategy} (quantile={label_quantile:.2f})")
+    logger.info(f"基本面特征: {'启用' if enable_fundamental else '禁用'}")
 
     from src.data.unified_data_access import UnifiedDataAccessLayer, DataAccessConfig
     config = DataAccessConfig()
@@ -98,7 +100,8 @@ def prepare_training_data(
 
     builder = UnifiedFeatureBuilder(
         data_access=data_access,
-        db_manager=db_manager
+        db_manager=db_manager,
+        enable_fundamental=enable_fundamental
     )
 
     market_generator = builder.market_generator
@@ -914,6 +917,8 @@ def main():
                         help='quantile 策略使用的上分位数（例如 0.7 表示前30% 为正类）')
     parser.add_argument('--label-min-samples', type=int, default=LABEL_MIN_SAMPLES_PER_DATE,
                         help='quantile 策略下每个交易日的最小样本数，低于该值回退 absolute')
+    parser.add_argument('--enable-fundamental', action='store_true',
+                        help='启用基本面特征（财务数据）')
     
     args = parser.parse_args()
     
@@ -954,7 +959,8 @@ def main():
         prediction_period=args.prediction_period,
         classification_strategy=args.label_strategy,
         label_quantile=args.label_quantile,
-        label_min_samples=args.label_min_samples
+        label_min_samples=args.label_min_samples,
+        enable_fundamental=args.enable_fundamental
     )
     
     # 训练模型
