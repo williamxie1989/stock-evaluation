@@ -75,6 +75,18 @@ class PriceVolumeFeatureGenerator:
         # 8. 资金流特征
         df = self._add_money_flow_features(df)
         
+        # 9. VWAP特征 (成交量加权平均价格)
+        df = self._add_vwap_features(df)
+        
+        # 10. 高级波动率特征
+        df = self._add_advanced_volatility(df)
+        
+        # 11. 高级动量特征
+        df = self._add_advanced_momentum(df)
+        
+        # 12. 高级流动性特征
+        df = self._add_advanced_liquidity(df)
+        
         return df
     
     def _add_turnover_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -216,6 +228,116 @@ class PriceVolumeFeatureGenerator:
         df.drop(temp_cols, axis=1, inplace=True, errors='ignore')
         
         return df
+
+
+    def _add_vwap_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """VWAP (成交量加权平均价格) 特征"""
+        # VWAP = sum(price * volume) / sum(volume)
+        df['vwap'] = (df['close'] * df['volume']).rolling(20).sum() / (df['volume'].rolling(20).sum() + 1e-9)
+        
+        # 价格偏离VWAP (溢价/折价)
+        df['price_to_vwap'] = df['close'] / (df['vwap'] + 1e-9) - 1.0
+        
+        # VWAP动量
+        df['vwap_mom_5'] = df['vwap'].pct_change(5, fill_method=None)
+        df['vwap_mom_20'] = df['vwap'].pct_change(20, fill_method=None)
+        
+        # VWAP趋势强度
+        df['vwap_trend'] = (df['vwap'] - df['vwap'].shift(20)) / (df['vwap'].shift(20) + 1e-9)
+        
+        return df
+
+
+    def _add_advanced_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
+        """高级波动率特征 (更精确的波动率估计)"""
+        # Parkinson波动率 (基于高低价，比收盘价波动率更有效)
+        # 理论上比简单波动率效率提升5倍
+        df['parkinson_vol_20'] = np.sqrt(
+            ((np.log(df['high'] / (df['low'] + 1e-9)) ** 2) / (4 * np.log(2))).rolling(20, min_periods=10).mean()
+        )
+        
+        # Garman-Klass波动率 (结合OHLC，效率最高)
+        df['gk_vol_20'] = np.sqrt(
+            (0.5 * (np.log(df['high'] / (df['low'] + 1e-9)) ** 2) - 
+             (2 * np.log(2) - 1) * (np.log(df['close'] / (df['open'] + 1e-9)) ** 2)).rolling(20, min_periods=10).mean()
+        )
+        
+        # 波动率的波动率 (vol of vol, 识别波动率regime变化)
+        df['vol_of_vol_60'] = df['vol_20'].rolling(60, min_periods=30).std()
+        
+        # 波动率偏度 (skewness, 识别尾部风险)
+        df['vol_skew_60'] = df['ret'].rolling(60, min_periods=30).skew()
+        
+        # 波动率峰度 (kurtosis, 识别黑天鹅风险)
+        df['vol_kurt_60'] = df['ret'].rolling(60, min_periods=30).kurt()
+        
+        # 波动率比率 (短期/长期)
+        df['vol_ratio'] = df['vol_20'] / (df['vol_60'] + 1e-9)
+        
+        return df
+
+
+    def _add_advanced_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
+        """高级动量特征 (经典技术指标)"""
+        # 动量加速度 (momentum of momentum)
+        df['mom_accel_20'] = df['ret_20'] - df['ret_20'].shift(20)
+        
+        # RSI (相对强弱指标, 14日标准)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14, min_periods=7).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=7).mean()
+        df['RSI'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
+        
+        # RSI超买超卖信号
+        df['RSI_oversold'] = (df['RSI'] < 30).astype(float)  # RSI<30为超卖
+        df['RSI_overbought'] = (df['RSI'] > 70).astype(float)  # RSI>70为超买
+        
+        # 价格新高/新低 (突破信号)
+        df['new_high_20'] = (df['close'] == df['close'].rolling(20, min_periods=10).max()).astype(float)
+        df['new_low_20'] = (df['close'] == df['close'].rolling(20, min_periods=10).min()).astype(float)
+        df['new_high_60'] = (df['close'] == df['close'].rolling(60, min_periods=30).max()).astype(float)
+        
+        # 动量持续性 (连续上涨/下跌天数)
+        df['up_days'] = (df['ret'] > 0).astype(int).rolling(20, min_periods=10).sum()
+        df['down_days'] = (df['ret'] < 0).astype(int).rolling(20, min_periods=10).sum()
+        
+        return df
+
+
+    def _add_advanced_liquidity(self, df: pd.DataFrame) -> pd.DataFrame:
+        """高级流动性特征"""
+        # Roll隐含价差 (基于序列相关性估计买卖价差)
+        def roll_spread(returns):
+            if len(returns) < 2:
+                return 0
+            cov = np.cov(returns[:-1], returns[1:])[0, 1]
+            return 2 * np.sqrt(max(-cov, 0))
+        
+        df['roll_spread'] = df['ret'].rolling(20, min_periods=10).apply(roll_spread, raw=True)
+        
+        # 成交量持续性 (autocorrelation)
+        def autocorr(x):
+            if len(x) < 2:
+                return 0
+            return np.corrcoef(x[:-1], x[1:])[0, 1] if len(set(x)) > 1 else 0
+        
+        df['volume_persistence'] = df['volume'].rolling(20, min_periods=10).apply(autocorr, raw=True)
+        
+        # 价格冲击 (price impact, 单位成交量引起的价格变化)
+        df['price_impact'] = df['ret'].abs() / (df['vol_norm_20'] + 1e-9)
+        
+        # Amihud非流动性指标 (已有illiq_20, 这里添加60日版本)
+        df['illiq_60'] = (
+            df['ret'].abs() / (df['turnover'] + 1e-9)
+        ).rolling(window=60, min_periods=30).mean()
+        
+        # 买卖压力 (基于成交量方向性)
+        # 上涨日成交量 / 总成交量
+        up_volume = (df['ret'] > 0).astype(float) * df['volume']
+        df['buy_pressure'] = up_volume.rolling(20, min_periods=10).sum() / (df['volume'].rolling(20, min_periods=10).sum() + 1e-9)
+        
+        return df
+
     
     def _add_mfi(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
         """计算资金流量指标 (Money Flow Index)"""

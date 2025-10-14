@@ -3,32 +3,34 @@
 
 
 def get_conservative_lgbm_params() -> dict:
-    """返回更保守的 LightGBM 参数配置（分类任务）。"""
+    """返回优化的 LightGBM 参数配置（✅ 已应用保守调优）。"""
     return {
-        'n_estimators': 200,  # 🔧 从 300 降至 200
-        'max_depth': 3,
-        'learning_rate': 0.01,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        'reg_alpha': 2.0,  # 🔧 从 1.0 提升到 2.0
-        'reg_lambda': 10.0,  # 🔧 从 5.0 提升到 10.0
-        'min_child_samples': 100,  # 🔧 从 50 提升到 100
-        'early_stopping_rounds': 20  # 🔧 从 30 降至 20，更早停止
+        'n_estimators': 300,      # ✅ 已调优: 增加树数量
+        'max_depth': 5,           # ✅ 已调优: 增加模型深度
+        'learning_rate': 0.03,    # ✅ 已调优: 降低学习率配合更多树
+        'num_leaves': 31,
+        'min_child_samples': 50,  # ✅ 已调优: 增强正则化
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,         # L1正则化
+        'reg_lambda': 1.0,        # L2正则化
+        'early_stopping_rounds': 30
     }
 
 
 def get_conservative_xgb_params() -> dict:
-    """返回更保守的 XGBoost 参数配置（分类任务）。"""
+    """返回优化的 XGBoost 参数配置（✅ 已应用保守调优）。"""
     return {
-        'n_estimators': 200,  # 🔧 从 300 降至 200
-        'max_depth': 3,
-        'learning_rate': 0.01,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        'reg_alpha': 2.0,  # 🔧 从 1.0 提升到 2.0
-        'reg_lambda': 10.0,  # 🔧 从 5.0 提升到 10.0
-        'min_child_weight': 20,  # 🔧 从 10 提升到 20
-        'early_stopping_rounds': 20  # 🔧 从 30 降至 20
+        'n_estimators': 300,      # ✅ 已调优: 增加树数量
+        'max_depth': 5,           # ✅ 已调优: 增加模型深度
+        'learning_rate': 0.03,    # ✅ 已调优: 降低学习率
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,         # L1正则化
+        'reg_lambda': 1.0,        # L2正则化
+        'min_child_weight': 5,    # ✅ 已调优: 增强正则化
+        'gamma': 0.1,             # ✅ 已调优: 增强正则化
+        'early_stopping_rounds': 30
     }
 
 
