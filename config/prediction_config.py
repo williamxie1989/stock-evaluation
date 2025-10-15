@@ -12,11 +12,22 @@ CLS_THRESHOLD = 0.05  # 分类阈值：涨幅超过5%判为正样本 (absolute �
 LABEL_STRATEGY = 'quantile'  # 'absolute' 或 'quantile'
 LABEL_POSITIVE_QUANTILE = 0.75  # 🔧 提高到 0.75，选择更极端的正样本（前25%）
 LABEL_NEGATIVE_QUANTILE = 0.3  # quantile策略的下分位数，用于构建负类或中性区
-LABEL_MIN_SAMPLES_PER_DATE = 50  # 🔧 提高到 50，确保每日有足够样本做分位数
+LABEL_MIN_SAMPLES_PER_DATE = 30  # 🔧 quantile策略要求每日最少样本数（批量训练时使用）
 ENABLE_LABEL_NEUTRAL_BAND = False  # 预留配置：是否引入中性区间
 LABEL_NEUTRAL_QUANTILE = 0.5  # 中性区间上界（仅当启用neutral band时有效）
 LABEL_USE_MARKET_BASELINE = True  # 是否使用市场基准构建超额收益标签
 LABEL_USE_INDUSTRY_NEUTRAL = True  # 是否对行业截面做去均值
+
+# 批量训练配置
+ENABLE_BATCH_TRAINING = True  # 🆕 是否启用批量训练模式（一次性训练多只股票）
+BATCH_TRAINING_SIZE = 50  # 🆕 每批训练的股票数量（可根据内存调整：10-300）
+# 批量训练优势：
+#   - 使用真正的横截面quantile策略（每天多只股票排序）
+#   - 正样本率稳定在设定分位数（如25%）
+#   - 避免时间序列quantile的市场周期偏差
+# 批量训练成本：
+#   - 内存占用: BATCH_SIZE * 数据量 (建议50只股票约需2-4GB)
+#   - 训练时间: 比单股票模式慢，但可通过减少BATCH_SIZE平衡
 
 # ============ 数据配置 ============
 LOOKBACK_DAYS = 720  # 特征计算回溯天数（用于默认start_date计算）

@@ -127,7 +127,7 @@ def add_labels_corrected(
     if neutral_quantile is not None and not 0 < neutral_quantile < 1:
         logger.warning("neutral_quantile 应位于 (0, 1)，当前值无效，将忽略中性区间")
         neutral_quantile = None
-
+ 
     def _prepare_market_baseline(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         """标准化市场收益数据并计算未来预测期收益"""
         if df is None or len(df) == 0:
@@ -394,8 +394,20 @@ def add_labels_corrected(
 
     result = result.loc[valid_mask].copy()
 
-    # 🔒 移除可能导致泄露的未来收益对照列
-    result.drop(columns=['future_return_raw'], inplace=True, errors='ignore')
-    result.drop(columns=['market_future_return', '__industry__'], inplace=True, errors='ignore')
+    # 🔒 移除所有可能导致数据泄漏的未来收益列
+    # 这些列仅用于标签计算，不应作为特征使用
+    leakage_cols = [
+        'future_return',           # 未来绝对收益 - 直接泄漏！
+        'future_excess_return',    # 未来超额收益 - 直接泄漏！
+        'future_residual_return',  # 未来残差收益 - 直接泄漏！
+        'future_return_raw',       # 原始价格未来收益
+        'market_future_return',    # 市场未来收益
+        '__industry__'             # 临时行业列
+    ]
+    
+    cols_to_drop = [col for col in leakage_cols if col in result.columns]
+    if cols_to_drop:
+        logger.info(f"🔒 移除泄漏特征列: {cols_to_drop}")
+        result.drop(columns=cols_to_drop, inplace=True)
 
     return result

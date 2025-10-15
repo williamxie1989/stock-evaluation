@@ -19,6 +19,11 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
+# 🔧 添加scripts目录到sys.path，用于导入batch_training_module
+scripts_dir = os.path.join(project_root, 'scripts')
+if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+
 from config.prediction_config import *
 from src.ml.features.unified_feature_builder import UnifiedFeatureBuilder
 from src.ml.training.enhanced_trainer_v2 import EnhancedTrainerV2
@@ -32,6 +37,9 @@ from src.ml.training.toolkit import (
     get_conservative_xgb_params,
     improved_time_series_split
 )
+
+# 🆕 导入批量训练模块
+from batch_training_module import prepare_batch_training_data
 
 # 配置日志
 logging.basicConfig(
@@ -274,135 +282,177 @@ def prepare_training_data(
             logger.error(f"市场因子构建异常: {exc}", exc_info=True)
             market_returns = None
 
-    for j, symbol in enumerate(active_symbols, 1):
-        try:
-            logger.info(f"[{j}/{len(active_symbols)}] 生成特征 {symbol}")
-
-            features_df = builder.build_features_from_dataframe(price_frames[symbol], symbol)
-            if features_df is None or len(features_df) == 0:
-                logger.warning("  跳过: 特征构建失败")
-                failed_symbols.append((symbol, 'feature_build_failed'))
-                quality_stats['feature_build_failed'] += 1
-                continue
-
-            if market_generator is not None and market_returns is not None:
-                try:
-                    market_enriched = market_generator.add_market_features(
-                        price_frames[symbol].copy(),
-                        symbol,
-                        market_returns
-                    )
-                    candidate_cols = ['MKT'] + market_generator.get_feature_names()
-                    available_cols: List[str] = []
-                    for col in candidate_cols:
-                        if col in market_enriched.columns and col not in available_cols:
-                            available_cols.append(col)
-                    if available_cols:
-                        market_slice = market_enriched.reset_index()[['date'] + available_cols]
-                        features_df = features_df.merge(market_slice, on='date', how='left')
-                except Exception as market_exc:
-                    logger.warning(f"  市场特征添加失败: {market_exc}")
-
-            features_df['symbol'] = symbol
-            if board_generator is not None:
-                try:
-                    features_df = board_generator.add_board_feature(features_df, symbol_col='symbol')
-                except Exception as board_exc:
-                    logger.warning(f"  板块特征添加失败: {board_exc}")
-
-            # 🔧 关键修复：确保features_df中有date列
-            if 'date' not in features_df.columns:
-                # 如果date在索引中，转为列
-                if features_df.index.name == 'date' or isinstance(features_df.index, pd.DatetimeIndex):
-                    features_df = features_df.reset_index()
-                    if 'index' in features_df.columns and 'date' not in features_df.columns:
-                        features_df.rename(columns={'index': 'date'}, inplace=True)
-                    logger.info(f"  ℹ️ date从索引转为列")
-                else:
-                    logger.error(f"  ❌ 无法找到date列，跳过此股票")
-                    logger.error(f"     索引名: {features_df.index.name}, 列: {list(features_df.columns[:10])}")
-                    failed_symbols.append((symbol, 'no_date_column'))
-                    continue
-
-            # 🔧 使用修正的标签构建函数
-            # 注意: 标签采用前复权价格，原始价格用于对照
+    # 🆕 批量训练模式分支
+    if ENABLE_BATCH_TRAINING:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("使用批量训练模式（横截面quantile策略）")
+        logger.info("=" * 80)
+        logger.info(f"批次大小: {BATCH_TRAINING_SIZE}")
+        
+        batch_results, batch_failed = prepare_batch_training_data(
+            symbols=active_symbols,
+            price_frames=price_frames,
+            qfq_frames=qfq_frames,
+            builder=builder,
+            market_generator=market_generator,
+            board_generator=board_generator,
+            market_returns=market_returns,
+            batch_size=BATCH_TRAINING_SIZE,
+            prediction_period=prediction_period,
+            classification_strategy=classification_strategy,
+            label_quantile=label_quantile,
+            label_min_samples=label_min_samples
+        )
+        
+        # 合并所有批次结果
+        if len(batch_results) == 0:
+            raise ValueError("批量训练模式: 所有批次都失败")
+        
+        all_data = batch_results
+        failed_symbols.extend(batch_failed)
+        
+        logger.info("")
+        logger.info(f"批量训练数据准备完成:")
+        logger.info(f"  总批次数: {len(all_data)}")
+        logger.info(f"  总记录数: {sum(len(df) for df in all_data):,}")
+        logger.info(f"  失败股票: {len(failed_symbols)}")
+        
+    else:
+        # 原有的单股票训练模式
+        logger.info("")
+        logger.info("使用单股票训练模式（时间序列quantile或absolute策略）")
+        logger.info("")
+        
+        for j, symbol in enumerate(active_symbols, 1):
             try:
-                # 准备原始价格数据（不复权）
-                price_raw = price_frames[symbol].copy()
-                if price_raw.index.name == 'date' or isinstance(price_raw.index, pd.DatetimeIndex):
-                    price_raw = price_raw.reset_index()
-                    if 'index' in price_raw.columns and 'date' not in price_raw.columns:
-                        price_raw.rename(columns={'index': 'date'}, inplace=True)
+                logger.info(f"[{j}/{len(active_symbols)}] 生成特征 {symbol}")
 
-                if 'close' not in price_raw.columns:
-                    logger.error(f"  ❌ price_raw中没有close列: {list(price_raw.columns)}")
-                    failed_symbols.append((symbol, 'no_close_column'))
+                features_df = builder.build_features_from_dataframe(price_frames[symbol], symbol)
+                if features_df is None or len(features_df) == 0:
+                    logger.warning("  跳过: 特征构建失败")
+                    failed_symbols.append((symbol, 'feature_build_failed'))
+                    quality_stats['feature_build_failed'] += 1
                     continue
 
-                price_raw = price_raw[['date', 'close']].copy()
-                price_raw['symbol'] = symbol
+                if market_generator is not None and market_returns is not None:
+                    try:
+                        market_enriched = market_generator.add_market_features(
+                            price_frames[symbol].copy(),
+                            symbol,
+                            market_returns
+                        )
+                        candidate_cols = ['MKT'] + market_generator.get_feature_names()
+                        available_cols: List[str] = []
+                        for col in candidate_cols:
+                            if col in market_enriched.columns and col not in available_cols:
+                                available_cols.append(col)
+                        if available_cols:
+                            market_slice = market_enriched.reset_index()[['date'] + available_cols]
+                            features_df = features_df.merge(market_slice, on='date', how='left')
+                    except Exception as market_exc:
+                        logger.warning(f"  市场特征添加失败: {market_exc}")
 
-                # 准备前复权价格数据
-                price_adj = qfq_frames[symbol].copy()
-                if 'date' not in price_adj.columns:
-                    price_adj = price_adj.reset_index()
+                features_df['symbol'] = symbol
+                if board_generator is not None:
+                    try:
+                        features_df = board_generator.add_board_feature(features_df, symbol_col='symbol')
+                    except Exception as board_exc:
+                        logger.warning(f"  板块特征添加失败: {board_exc}")
 
-                if 'close' not in price_adj.columns:
-                    logger.error(f"  ❌ 前复权数据缺少close列: {list(price_adj.columns)}")
-                    failed_symbols.append((symbol, 'no_close_column_qfq'))
+                # 🔧 关键修复：确保features_df中有date列
+                if 'date' not in features_df.columns:
+                    # 如果date在索引中，转为列
+                    if features_df.index.name == 'date' or isinstance(features_df.index, pd.DatetimeIndex):
+                        features_df = features_df.reset_index()
+                        if 'index' in features_df.columns and 'date' not in features_df.columns:
+                            features_df.rename(columns={'index': 'date'}, inplace=True)
+                        logger.info(f"  ℹ️ date从索引转为列")
+                    else:
+                        logger.error(f"  ❌ 无法找到date列，跳过此股票")
+                        logger.error(f"     索引名: {features_df.index.name}, 列: {list(features_df.columns[:10])}")
+                        failed_symbols.append((symbol, 'no_date_column'))
+                        continue
+
+                # 🔧 使用修正的标签构建函数
+                # 注意: 标签采用前复权价格，原始价格用于对照
+                try:
+                    # 准备原始价格数据（不复权）
+                    price_raw = price_frames[symbol].copy()
+                    if price_raw.index.name == 'date' or isinstance(price_raw.index, pd.DatetimeIndex):
+                        price_raw = price_raw.reset_index()
+                        if 'index' in price_raw.columns and 'date' not in price_raw.columns:
+                            price_raw.rename(columns={'index': 'date'}, inplace=True)
+
+                    if 'close' not in price_raw.columns:
+                        logger.error(f"  ❌ price_raw中没有close列: {list(price_raw.columns)}")
+                        failed_symbols.append((symbol, 'no_close_column'))
+                        continue
+
+                    price_raw = price_raw[['date', 'close']].copy()
+                    price_raw['symbol'] = symbol
+
+                    # 准备前复权价格数据
+                    price_adj = qfq_frames[symbol].copy()
+                    if 'date' not in price_adj.columns:
+                        price_adj = price_adj.reset_index()
+
+                    if 'close' not in price_adj.columns:
+                        logger.error(f"  ❌ 前复权数据缺少close列: {list(price_adj.columns)}")
+                        failed_symbols.append((symbol, 'no_close_column_qfq'))
+                        continue
+
+                    price_adj['date'] = pd.to_datetime(price_adj['date'])
+                    price_adj = price_adj[['date', 'close']].copy()
+                    price_adj['symbol'] = symbol
+
+                    # 使用修正的标签构建函数
+                    features_with_labels = add_labels_corrected(
+                        features_df=features_df,
+                        price_data=price_adj,
+                        prediction_period=prediction_period,
+                        threshold=CLS_THRESHOLD,  # absolute 策略兜底
+                        price_data_raw=price_raw,
+                        classification_strategy=classification_strategy,
+                        quantile=label_quantile,
+                        min_samples_per_date=label_min_samples,
+                        negative_quantile=LABEL_NEGATIVE_QUANTILE,
+                        enable_neutral_band=ENABLE_LABEL_NEUTRAL_BAND,
+                        neutral_quantile=LABEL_NEUTRAL_QUANTILE,
+                        market_returns=market_returns,
+                        use_market_baseline=LABEL_USE_MARKET_BASELINE,
+                        use_industry_neutral=LABEL_USE_INDUSTRY_NEUTRAL
+                    )
+                    features_df = features_with_labels
+                except Exception as label_exc:
+                    logger.warning(f"  标签构建失败: {label_exc}")
+                    failed_symbols.append((symbol, 'label_build_failed'))
                     continue
 
-                price_adj['date'] = pd.to_datetime(price_adj['date'])
-                price_adj = price_adj[['date', 'close']].copy()
-                price_adj['symbol'] = symbol
+                if len(features_df) == 0:
+                    logger.warning("  跳过: 无有效标签")
+                    failed_symbols.append((symbol, 'no_valid_labels'))
+                    quality_stats['no_valid_labels'] += 1
+                    continue
 
-                # 使用修正的标签构建函数
-                features_with_labels = add_labels_corrected(
-                    features_df=features_df,
-                    price_data=price_adj,
-                    prediction_period=prediction_period,
-                    threshold=CLS_THRESHOLD,  # absolute 策略兜底
-                    price_data_raw=price_raw,
-                    classification_strategy=classification_strategy,
-                    quantile=label_quantile,
-                    min_samples_per_date=label_min_samples,
-                    negative_quantile=LABEL_NEGATIVE_QUANTILE,
-                    enable_neutral_band=ENABLE_LABEL_NEUTRAL_BAND,
-                    neutral_quantile=LABEL_NEUTRAL_QUANTILE,
-                    market_returns=market_returns,
-                    use_market_baseline=LABEL_USE_MARKET_BASELINE,
-                    use_industry_neutral=LABEL_USE_INDUSTRY_NEUTRAL
-                )
-                features_df = features_with_labels
-            except Exception as label_exc:
-                logger.warning(f"  标签构建失败: {label_exc}")
-                failed_symbols.append((symbol, 'label_build_failed'))
-                continue
+                # 已在add_labels_corrected中处理,这里可选择性二次过滤
+                extreme_return_mask = features_df['label_reg'].abs() > 1.0
+                if extreme_return_mask.sum() > 0:
+                    logger.warning(f"  过滤 {extreme_return_mask.sum()} 条极端收益率记录(>100%)")
+                    features_df = features_df[~extreme_return_mask]
 
-            if len(features_df) == 0:
-                logger.warning("  跳过: 无有效标签")
-                failed_symbols.append((symbol, 'no_valid_labels'))
-                quality_stats['no_valid_labels'] += 1
-                continue
+                if len(features_df) == 0:
+                    logger.warning("  跳过: 过滤后无数据")
+                    failed_symbols.append((symbol, 'all_filtered'))
+                    continue
 
-            # 已在add_labels_corrected中处理,这里可选择性二次过滤
-            extreme_return_mask = features_df['label_reg'].abs() > 1.0
-            if extreme_return_mask.sum() > 0:
-                logger.warning(f"  过滤 {extreme_return_mask.sum()} 条极端收益率记录(>100%)")
-                features_df = features_df[~extreme_return_mask]
+                all_data.append(features_df)
+                quality_stats['success'] += 1
+                logger.info(f"  ✓ 成功: {len(features_df)} 条记录 (正样本率: {features_df['label_cls'].mean():.1%})")
 
-            if len(features_df) == 0:
-                logger.warning("  跳过: 过滤后无数据")
-                failed_symbols.append((symbol, 'all_filtered'))
-                continue
-
-            all_data.append(features_df)
-            quality_stats['success'] += 1
-            logger.info(f"  ✓ 成功: {len(features_df)} 条记录 (正样本率: {features_df['label_cls'].mean():.1%})")
-
-        except Exception as exc:
-            logger.error(f"  特征生成失败: {exc}", exc_info=True)
-            failed_symbols.append((symbol, 'exception'))
+            except Exception as exc:
+                logger.error(f"  特征生成失败: {exc}", exc_info=True)
+                failed_symbols.append((symbol, 'exception'))
     
     # 合并数据
     if len(all_data) == 0:

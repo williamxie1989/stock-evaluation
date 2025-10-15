@@ -15,6 +15,7 @@
 
 import re
 import time
+from functools import reduce
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
@@ -467,8 +468,8 @@ class FundamentalDataManager:
     def bulk_update_from_akshare(
         self, 
         symbols: List[str], 
-        start_date: str = None,
-        end_date: str = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
         update_quarterly: bool = True,
         update_daily: bool = True,
         max_retries: int = 3,
@@ -532,6 +533,8 @@ class FundamentalDataManager:
                     try:
                         df_daily = self._fetch_daily_valuation_data(
                             symbol=symbol,
+                            start_date=start_date,
+                            end_date=end_date,
                             max_retries=max_retries,
                             retry_delay=retry_delay
                         )
@@ -612,27 +615,6 @@ class FundamentalDataManager:
         
         return df_clean
     
-    def _clean_daily_valuation_data(
-        self, 
-        df: pd.DataFrame, 
-        symbol: str, 
-        trade_date: datetime
-    ) -> pd.DataFrame:
-        """清洗日度估值数据"""
-        # 从实时数据中提取估值指标
-        valuation_data = {
-            'trade_date': trade_date.date(),
-            'symbol': symbol,
-            'pe_ttm': df.get('市盈率-动态', None),
-            'pb': df.get('市净率', None),
-            'market_cap': df.get('总市值', None),
-            'circulating_market_cap': df.get('流通市值', None)
-        }
-        
-        df_clean = pd.DataFrame([valuation_data])
-        df_clean = self._clean_financial_dataframe(df_clean, mode='daily')
-        return df_clean
-
     def _fetch_quarterly_financials(
         self,
         symbol: str,
@@ -669,37 +651,112 @@ class FundamentalDataManager:
     def _fetch_daily_valuation_data(
         self,
         symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
         max_retries: int = 2,
         retry_delay: float = 3.0
     ) -> pd.DataFrame:
         """
-        从 AKShare 获取最新日度估值数据
-        当前实现依赖东方财富接口，若失败则返回空表
+        通过百度股市通接口获取日度估值数据
+
+        指标覆盖：总市值、市盈率(TTM)、市盈率(静)、市净率、市现率
+        返回值包含 trade_date、symbol、market_cap、pe_ttm、pb 等字段
         """
-        numeric_code = symbol.split('.')[0]
-        last_error: Optional[Exception] = None
+        code = symbol.split('.')[0]
+        indicator_map = {
+            'market_cap': ('总市值', lambda v: v * 1e8 if v is not None else None),
+            'pe_ttm': ('市盈率(TTM)', None),
+            'pe_static': ('市盈率(静)', None),
+            'pb': ('市净率', None),
+            'pcf': ('市现率', None),
+        }
         
-        for attempt in range(1, max_retries + 1):
-            try:
-                df_raw = ak.stock_individual_info_em(symbol=numeric_code)
-                if df_raw is None or df_raw.empty:
-                    logger.debug(f"{symbol}: 日度估值接口返回空数据")
-                    return pd.DataFrame()
-                
-                df_clean = self._clean_daily_valuation_data(
-                    df_raw,
-                    symbol,
-                    datetime.now()
-                )
-                return df_clean
-            except Exception as e:
-                last_error = e
-                logger.debug(f"{symbol}: 第{attempt}次获取日度估值失败 - {e}")
-                time.sleep(max(retry_delay * attempt, 0.0))
+        period = self._infer_baidu_period(start_date, end_date)
+        frames: List[pd.DataFrame] = []
         
-        if last_error:
-            logger.warning(f"{symbol}: 日度估值数据获取失败，已跳过 - {last_error}")
-        return pd.DataFrame()
+        for column, (indicator, transform) in indicator_map.items():
+            data = None
+            last_error: Optional[Exception] = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    df_raw = ak.stock_zh_valuation_baidu(
+                        symbol=code,
+                        indicator=indicator,
+                        period=period
+                    )
+                    if df_raw is not None and not df_raw.empty:
+                        df_raw = df_raw.rename(columns={'date': 'trade_date', 'value': column})
+                        if transform:
+                            df_raw[column] = df_raw[column].apply(transform)
+                        frames.append(df_raw)
+                    else:
+                        logger.debug(f"{symbol}: 指标 {indicator} 未返回数据")
+                    data = df_raw
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.debug(f"{symbol}: 指标 {indicator} 获取失败 (尝试 {attempt}/{max_retries}) - {e}")
+                    time.sleep(max(retry_delay * attempt, 0.0))
+            if data is None and last_error:
+                logger.info(f"{symbol}: 无法获取指标 {indicator}, 错误: {last_error}")
+        
+        if not frames:
+            return pd.DataFrame()
+        
+        df_merged = reduce(
+            lambda left, right: pd.merge(left, right, on='trade_date', how='outer'),
+            frames
+        )
+        
+        df_merged['trade_date'] = pd.to_datetime(df_merged['trade_date'], errors='coerce').dt.date
+        df_merged = df_merged.dropna(subset=['trade_date'])
+        df_merged = df_merged.sort_values('trade_date').drop_duplicates(subset=['trade_date'], keep='last')
+        
+        if start_date:
+            df_merged = df_merged[df_merged['trade_date'] >= pd.to_datetime(start_date).date()]
+        if end_date:
+            df_merged = df_merged[df_merged['trade_date'] <= pd.to_datetime(end_date).date()]
+        
+        df_merged['symbol'] = symbol
+        
+        # 补齐数据库所需字段
+        expected_columns = [
+            'trade_date', 'symbol', 'pe_ttm', 'pb', 'ps_ttm', 'market_cap',
+            'circulating_market_cap', 'dividend_yield', 'pe_percentile', 'pb_percentile'
+        ]
+        for col in expected_columns:
+            if col not in df_merged.columns:
+                df_merged[col] = None
+        
+        # 将市现率映射到辅助列，暂不入库
+        if 'pcf' in df_merged.columns:
+            df_merged['pcf'] = df_merged['pcf']
+        
+        return df_merged[expected_columns + [col for col in df_merged.columns if col not in expected_columns]]
+
+    @staticmethod
+    def _infer_baidu_period(start_date: Optional[str], end_date: Optional[str]) -> str:
+        """
+        根据时间范围推断百度接口需要的 period 参数
+        """
+        if not start_date or not end_date:
+            return '近五年'
+        
+        try:
+            start = pd.to_datetime(start_date)
+            end = pd.to_datetime(end_date)
+            delta_years = (end - start).days / 365.25
+            if delta_years <= 1:
+                return '近一年'
+            if delta_years <= 3:
+                return '近三年'
+            if delta_years <= 5:
+                return '近五年'
+            if delta_years <= 10:
+                return '近十年'
+            return '全部'
+        except Exception:
+            return '近五年'
 
     # ----------------------------------------------------------------------------------
     # 数据清洗工具
