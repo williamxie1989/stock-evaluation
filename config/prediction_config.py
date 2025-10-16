@@ -56,8 +56,8 @@ CROSS_SECTIONAL_FEATURES = [
     'ret', 'ret_5', 'ret_20', 'ret_60', 'risk_adj_mom_60',
     'short_rev', 'vol_20', 'vol_60', 'downside_vol_20',
     'turnover', 'ADV_20', 'log_ADV_20', 'illiq_20',
-    'beta_60', 'beta_120', 'alpha_60', 'alpha_120',
-    'idio_vol_60', 'idio_vol_120', 'market_R2_60', 'market_R2_120',
+    'beta_60', 'alpha_60',
+    'idio_vol_60', 'market_R2_60',
     'rel_strength_20', 'rel_strength_60', 'CMF', 'MFI'
 ]
 
@@ -68,8 +68,8 @@ HANDLE_UNKNOWN_CATEGORY = 'ignore'  # OneHotEncoder处理未知类别的方式
 # ============ 训练配置 ============
 # 交叉验证
 CV_N_SPLITS = 5  # 交叉验证折数
-CV_EMBARGO = 60  # 禁用期（避免信息泄漏）
-CV_ALLOW_FUTURE = True  # 是否允许使用未来数据
+CV_EMBARGO = 60  # 禁用期（避免信息泄漏）- 已足够长，无需修改
+CV_ALLOW_FUTURE = False  # ✅ Stage5修复: 时间序列场景禁止使用未来数据
 ENABLE_TIME_SERIES_SPLIT = True  # 是否启用时间序列切分
 # 当启用时间序列切分时，使用最后一折作为验证集
 
@@ -77,16 +77,14 @@ ENABLE_TIME_SERIES_SPLIT = True  # 是否启用时间序列切分
 USE_ROLLING_WINDOW = True  # 是否使用滚动窗口切分（而非全部历史）
 ROLLING_TRAIN_YEARS = 3.0  # 训练窗口年数（使用最近3年数据）
 ROLLING_VAL_YEARS = 1.0  # 验证窗口年数（最近1年）
-ROLLING_EMBARGO_DAYS = 5  # 滚动窗口的禁用期
+ROLLING_EMBARGO_DAYS = 40  # 🔧 Stage5修复: 从5天改为40天 (预测期30天+10天缓冲)
 
-# 🔧 新增：滚动窗口配置
-USE_ROLLING_WINDOW = True  # 是否使用滚动窗口（仅保留最近N年训练数据）
-TRAIN_WINDOW_YEARS = 3.0  # 训练窗口长度（年），建议 2.0-4.0
+# 样本加权配置
 ENABLE_SAMPLE_WEIGHTING = False  # 是否对样本加时间衰减权重（近期权重更高）
 SAMPLE_WEIGHT_HALFLIFE_YEARS = 1.0  # 权重半衰期（年）
 
 # 特征选择
-ENABLE_FEATURE_SELECTION = True # 临时禁用，类别特征OneHotconfig码后再选择
+ENABLE_FEATURE_SELECTION = True  # ✅ 已启用，OneHot后特征选择正常工作
 FEATURE_SELECTION_METHOD = 'model_based'  # 'model_based' or 'shap'
 MIN_FEATURE_IMPORTANCE = 0.001  # 最小特征重要性阈值
 
@@ -112,35 +110,35 @@ REGRESSION_MODELS = [
 
 # Optuna超参数优化
 ENABLE_OPTUNA = True
-OPTUNA_N_TRIALS = 50  # 优化试验次数
+OPTUNA_N_TRIALS = 30  # ✅ Stage5修复: 与训练脚本一致 (--optuna-trials 30)
 OPTUNA_TIMEOUT = 3600  # 优化超时时间(秒)
 OPTUNA_PATIENCE = 10  # PatientPruner容忍度
 
 # ============ 模型超参数配置 ============
-# LightGBM 超参数 (✅ 已应用保守调优)
+# LightGBM 超参数 (✅ Stage5修复: 与Optuna约束一致)
 LIGHTGBM_PARAMS = {
     'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 5,           # ✅ 已调优: 增加模型深度
+    'max_depth': 4,           # ✅ Stage5修复: 从5改为4，与Optuna一致
     'learning_rate': 0.03,    # ✅ 已调优: 降低学习率配合更多树
-    'num_leaves': 31,
-    'min_child_samples': 50,  # ✅ 已调优: 增强正则化
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'reg_alpha': 0.1,         # L1正则化
-    'reg_lambda': 1.0,        # L2正则化
+    'num_leaves': 15,         # ✅ Stage5修复: 2^4-1=15，匹配max_depth=4
+    'min_child_samples': 50,  # ✅ 已调优: 增强正则化（Optuna范围20-100）
+    'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
+    'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
+    'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
+    'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
 }
 
-# XGBoost 超参数 (✅ 已应用保守调优)
+# XGBoost 超参数 (✅ Stage5修复: 与Optuna约束一致)
 XGBOOST_PARAMS = {
     'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 5,           # ✅ 已调优: 增加模型深度
+    'max_depth': 4,           # ✅ Stage5修复: 从5改为4，与Optuna一致
     'learning_rate': 0.03,    # ✅ 已调优: 降低学习率
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'reg_alpha': 0.1,
-    'reg_lambda': 1.0,
-    'min_child_weight': 5,    # ✅ 已调优: 增强正则化
-    'gamma': 0.1,             # ✅ 已调优: 增强正则化
+    'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
+    'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
+    'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
+    'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
+    'min_child_weight': 10,   # ✅ Stage5修复: 从5改为10（Optuna范围5-15）
+    'gamma': 2.0,             # ✅ Stage5修复: 从0.1改为2.0（Optuna范围1-5）
 }
 
 # Logistic Regression 超参数 (✅ 已应用保守调优)
@@ -188,7 +186,7 @@ REGRESSION_METRICS = [
 ]
 
 # 通过门槛
-MIN_CLASSIFICATION_AUC = 0.48  # 🔧 进一步降低: 允许小样本训练继续（验证基本面特征价值）
+MIN_CLASSIFICATION_AUC = 0.52  # ✅ Stage5修复: 至少略好于随机（从0.48提升）
 MIN_REGRESSION_R2 = -0.10  # 🔧 允许负R²: 小样本回归可能过拟合，但仍可分析特征重要性
 MIN_TOP_K_IMPROVEMENT = 3.0  # Top-K命中率最小提升(百分点)
 
