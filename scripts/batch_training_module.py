@@ -7,8 +7,7 @@
 import logging
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple
-from pathlib import Path
+from typing import List, Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +25,13 @@ def prepare_batch_training_data(
     classification_strategy: str,
     label_quantile: float,
     label_min_samples: int,
+    label_negative_quantile: Optional[float],
+    label_threshold: float,
+    enable_neutral_band: bool,
+    label_neutral_quantile: Optional[float],
+    use_market_baseline: bool,
+    use_industry_neutral: bool,
+    market_column: str = 'MKT',
     **kwargs
 ) -> Tuple[List[pd.DataFrame], List[Tuple[str, str]]]:
     """
@@ -54,9 +60,23 @@ def prepare_batch_training_data(
     classification_strategy : str
         分类策略
     label_quantile : float
-        分位数
+        上分位数
     label_min_samples : int
         最小样本数
+    label_negative_quantile : float or None
+        下分位数（明确负类或中性区）
+    label_threshold : float
+        样本不足时回退的绝对收益阈值
+    enable_neutral_band : bool
+        是否启用中性区
+    label_neutral_quantile : float or None
+        中性区上界
+    use_market_baseline : bool
+        是否减去市场基准构建超额收益
+    use_industry_neutral : bool
+        是否做行业中性
+    market_column : str
+        市场基准列名，默认 MKT
     
     Returns
     -------
@@ -66,11 +86,6 @@ def prepare_batch_training_data(
         失败的股票及原因
     """
     from src.ml.training.toolkit import add_labels_corrected
-    from config.prediction_config import (
-        CLS_THRESHOLD, LABEL_NEGATIVE_QUANTILE,
-        ENABLE_LABEL_NEUTRAL_BAND, LABEL_NEUTRAL_QUANTILE,
-        LABEL_USE_MARKET_BASELINE, LABEL_USE_INDUSTRY_NEUTRAL
-    )
     
     batch_results = []
     failed_symbols = []
@@ -85,7 +100,15 @@ def prepare_batch_training_data(
     logger.info(f"批次大小: {batch_size}")
     logger.info(f"批次数量: {num_batches}")
     logger.info(f"标签策略: {classification_strategy} (横截面quantile)")
-    logger.info(f"每日最小样本: {label_min_samples}")
+    logger.info(f"  上分位数: {label_quantile:.2f}")
+    if label_negative_quantile is not None:
+        logger.info(f"  下分位数: {label_negative_quantile:.2f}")
+    logger.info(f"  每日最小样本: {label_min_samples}")
+    logger.info(f"  回退阈值: {label_threshold:.3f}")
+    logger.info(f"  市场基准: {'启用' if use_market_baseline else '关闭'}")
+    logger.info(f"  行业中性: {'启用' if use_industry_neutral else '关闭'}")
+    if enable_neutral_band:
+        logger.info(f"  中性区启用, 上界: {label_neutral_quantile}")
     
     for batch_idx in range(num_batches):
         start_idx = batch_idx * batch_size
@@ -226,17 +249,18 @@ def prepare_batch_training_data(
                 features_df=combined_features,
                 price_data=combined_qfq,
                 prediction_period=prediction_period,
-                threshold=CLS_THRESHOLD,
+                threshold=label_threshold,
                 price_data_raw=combined_raw,
                 classification_strategy=classification_strategy,
                 quantile=label_quantile,
                 min_samples_per_date=label_min_samples,
-                negative_quantile=LABEL_NEGATIVE_QUANTILE,
-                enable_neutral_band=ENABLE_LABEL_NEUTRAL_BAND,
-                neutral_quantile=LABEL_NEUTRAL_QUANTILE,
+                negative_quantile=label_negative_quantile,
+                enable_neutral_band=enable_neutral_band,
+                neutral_quantile=label_neutral_quantile,
                 market_returns=market_returns,
-                use_market_baseline=LABEL_USE_MARKET_BASELINE,
-                use_industry_neutral=LABEL_USE_INDUSTRY_NEUTRAL
+                use_market_baseline=use_market_baseline,
+                market_column=market_column,
+                use_industry_neutral=use_industry_neutral
             )
             
             if len(features_with_labels) == 0:

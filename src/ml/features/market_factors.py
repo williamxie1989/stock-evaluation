@@ -165,7 +165,7 @@ class MarketFactorGenerator:
         df['MKT'].fillna(0, inplace=True)
         
         # 计算 Beta 和特质波动率 (多窗口滚动回归)
-        df = self._add_beta_features(df, windows=[60, 120])
+        df = self._add_beta_features(df, windows=[60])
 
         # 规模与流动性代理指标
         df = self._add_size_liquidity_features(df)
@@ -334,12 +334,12 @@ class MarketFactorGenerator:
         """
         return [
             'MKT',                    # 市场收益
-            'beta_60', 'beta_120',    # 不同窗口Beta
-            'alpha_60', 'alpha_120',  # 不同窗口Alpha
-            'idio_vol_60', 'idio_vol_120',  # 特质波动率
-            'market_R2_60', 'market_R2_120',  # 市场解释力度
-            'down_beta_60', 'down_beta_120',  # 下行Beta
-            'up_beta_60', 'up_beta_120',      # 上行Beta
+            'beta_60',                # 不同窗口Beta
+            'alpha_60',               # 不同窗口Alpha
+            'idio_vol_60',            # 特质波动率
+            'market_R2_60',           # 市场解释力度
+            'down_beta_60',           # 下行Beta
+            'up_beta_60',             # 上行Beta
             'turnover_ema_20', 'log_turnover_20',
             'turnover_vol_20', 'turnover_z_20', 'turnover_autocorr_5',
             'ret_skew_60', 'ret_kurt_60',

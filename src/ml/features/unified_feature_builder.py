@@ -522,87 +522,83 @@ class UnifiedFeatureBuilder:
             logger.warning("DataFrame缺少date列，无法添加基本面特征")
             return df
         
-        # 为每个(symbol, date)对生成基本面特征
-        fundamental_features_list = []
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
         
-        # 按行遍历，为每个symbol-date组合生成特征
-        for idx, row in df.iterrows():
-            symbol = row['symbol']
-            date = pd.to_datetime(row['date'])
-            
+        fundamentals_frames: List[pd.DataFrame] = []
+        for symbol, group in df.groupby('symbol'):
             try:
-                # 移除后缀（如果有）
-                symbol_clean = symbol.split('.')[0] if '.' in symbol else symbol
-                
-                # 生成特征
-                features = self.fundamental_generator.generate_features(
-                    symbol=symbol_clean,
-                    date=date,
-                    lookback_quarters=4
-                )
-                
-                # 添加symbol和date标识
-                features['symbol'] = symbol
-                features['date'] = row['date']  # 保持原始格式
-                fundamental_features_list.append(features)
-                
-            except Exception as e:
-                logger.debug(f"{symbol}@{date.date()}: 基本面特征生成失败 - {e}")
-                # 失败时添加空特征
-                fundamental_features_list.append({'symbol': symbol, 'date': row['date']})
-        
-        # 转换为DataFrame
-        df_fundamental = pd.DataFrame(fundamental_features_list)
-        
-        # 按symbol和date合并到原始DataFrame
-        df_merged = df.merge(df_fundamental, on=['symbol', 'date'], how='left', suffixes=('', '_fundamental'))
-        
-        # 统计添加的特征数
-        new_features = [col for col in df_fundamental.columns if col != 'symbol']
-        logger.info(f"添加了 {len(new_features)} 个基本面特征")
-        
-        return df_merged
-    
-    def _add_labels(self, df: pd.DataFrame, period: int, as_of_date: Optional[str]) -> pd.DataFrame:
-        """添加预测标签"""
-        # 计算未来收益
-        future_returns = []
-        
-        for _, row in df.iterrows():
-            symbol = row['symbol']
-            
-            try:
-                # 获取未来数据
-                start_date = as_of_date or datetime.now().strftime('%Y-%m-%d')
-                end_date = (pd.Timestamp(start_date) + timedelta(days=period + 10)).strftime('%Y-%m-%d')
-                
-                df_future = self.data_access.get_stock_data(
+                daily_features = self.fundamental_generator.build_daily_dataframe(
                     symbol=symbol,
-                    start_date=start_date,
-                    end_date=end_date
+                    dates=group['date']
                 )
-                
-                if df_future is None or len(df_future) < period // 2:
-                    future_returns.append(np.nan)
+                if daily_features is None or daily_features.empty:
+                    logger.debug(f"{symbol}: 无可用基本面特征，保持空值")
                     continue
+                daily_features['date'] = pd.to_datetime(daily_features['date'])
+                fundamentals_frames.append(daily_features)
+            except Exception as exc:
+                logger.debug(f"{symbol}: 构建基本面日频数据失败 - {exc}")
+                continue
+        
+        if not fundamentals_frames:
+            logger.warning("批量基本面特征为空，跳过合并")
+            return df
+        
+        df_fundamental = pd.concat(fundamentals_frames, ignore_index=True)
+        df_fundamental = df_fundamental.loc[:, ~df_fundamental.columns.duplicated()]
+        
+        merged = df.merge(
+            df_fundamental,
+            on=['symbol', 'date'],
+            how='left'
+        )
+        
+        new_cols = [col for col in df_fundamental.columns if col not in {'symbol', 'date'}]
+        logger.info(f"批量添加基本面特征列: {len(new_cols)} 个")
+        
+        return merged
+    
+    # def _add_labels(self, df: pd.DataFrame, period: int, as_of_date: Optional[str]) -> pd.DataFrame:
+    #     """添加预测标签"""
+    #     # 计算未来收益
+    #     future_returns = []
+        
+    #     for _, row in df.iterrows():
+    #         symbol = row['symbol']
+            
+    #         try:
+    #             # 获取未来数据
+    #             start_date = as_of_date or datetime.now().strftime('%Y-%m-%d')
+    #             end_date = (pd.Timestamp(start_date) + timedelta(days=period + 10)).strftime('%Y-%m-%d')
                 
-                # 确保列名
-                df_future.columns = df_future.columns.str.lower()
+    #             df_future = self.data_access.get_stock_data(
+    #                 symbol=symbol,
+    #                 start_date=start_date,
+    #                 end_date=end_date
+    #             )
                 
-                # 计算收益率
-                if len(df_future) >= 2:
-                    ret = (df_future['close'].iloc[-1] - df_future['close'].iloc[0]) / df_future['close'].iloc[0]
-                    future_returns.append(ret)
-                else:
-                    future_returns.append(np.nan)
+    #             if df_future is None or len(df_future) < period // 2:
+    #                 future_returns.append(np.nan)
+    #                 continue
+                
+    #             # 确保列名
+    #             df_future.columns = df_future.columns.str.lower()
+                
+    #             # 计算收益率
+    #             if len(df_future) >= 2:
+    #                 ret = (df_future['close'].iloc[-1] - df_future['close'].iloc[0]) / df_future['close'].iloc[0]
+    #                 future_returns.append(ret)
+    #             else:
+    #                 future_returns.append(np.nan)
                     
-            except Exception as e:
-                logger.debug(f"{symbol}: 获取未来数据失败 - {e}")
-                future_returns.append(np.nan)
+    #         except Exception as e:
+    #             logger.debug(f"{symbol}: 获取未来数据失败 - {e}")
+    #             future_returns.append(np.nan)
         
-        df[f'ret_{period}d'] = future_returns
+    #     df[f'ret_{period}d'] = future_returns
         
-        return df
+    #     return df
     
     def _clean_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """清理特征"""

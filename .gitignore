@@ -127,6 +127,8 @@ import_*.py
 comprehensive_*.py
 detailed_*.py
 stock_data.db
+verify_*.py
+diagnose_*.py
 
 # 开发记录文件
 FEATURE_*.md
@@ -138,4 +140,9 @@ PREDICTION_*.md
 R2_*.md
 *_SUMMARY.md
 *_REPORT.md
+BATCH_*.md
+FUNDAMENTAL_*.md
 
+
+# 批处理
+*.sh

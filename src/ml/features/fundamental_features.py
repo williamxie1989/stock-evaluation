@@ -20,6 +20,11 @@ import logging
 import akshare as ak
 from functools import lru_cache
 
+try:
+    from src.data.db.symbol_standardizer import get_symbol_standardizer
+except Exception:  # pragma: no cover
+    get_symbol_standardizer = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +84,14 @@ class FundamentalFeatureGenerator:
         else:
             self.data_manager = None
             logger.info("基本面特征生成器初始化完成（无数据库缓存）")
+        
+        if get_symbol_standardizer:
+            try:
+                self.symbol_standardizer = get_symbol_standardizer()
+            except Exception:
+                self.symbol_standardizer = None
+        else:
+            self.symbol_standardizer = None
     
     def generate_features(
         self, 
@@ -137,6 +150,92 @@ class FundamentalFeatureGenerator:
             logger.warning(f"生成 {symbol} 基本面特征失败: {e}")
         
         return features
+    
+    def _standardize_symbol(self, symbol: str) -> str:
+        if self.symbol_standardizer is not None:
+            try:
+                return self.symbol_standardizer.standardize_symbol(symbol)
+            except Exception:
+                return symbol
+        return symbol
+    
+    def _sanitize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        numeric_cols = [col for col in df.columns if col not in {'symbol'}]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return df
+    
+    def build_daily_dataframe(self, symbol: str, dates: pd.Series) -> pd.DataFrame:
+        """
+        将季度/日度基本面数据映射到交易日日频
+        """
+        if self.data_manager is None:
+            return pd.DataFrame(columns=['symbol', 'date'])
+        if dates is None or len(dates) == 0:
+            return pd.DataFrame(columns=['symbol', 'date'])
+        
+        date_index = pd.DatetimeIndex(pd.to_datetime(dates)).dropna().sort_values().unique()
+        if len(date_index) == 0:
+            return pd.DataFrame(columns=['symbol', 'date'])
+        
+        start_buffer = (date_index.min() - pd.Timedelta(days=200)).to_pydatetime()
+        end_date = date_index.max().to_pydatetime()
+        std_symbol = self._standardize_symbol(symbol)
+        std_symbol_with_suffix = std_symbol
+        if '.' not in std_symbol_with_suffix:
+            if std_symbol.startswith('6'):
+                std_symbol_with_suffix = f"{std_symbol}.SH"
+            else:
+                std_symbol_with_suffix = f"{std_symbol}.SZ"
+        
+        quarterly_df = self.data_manager.get_quarterly_history(std_symbol_with_suffix, start_buffer, end_date)
+        daily_valuation_df = self.data_manager.get_daily_valuation_history(std_symbol_with_suffix, start_buffer, end_date)
+        if daily_valuation_df.empty and std_symbol_with_suffix != std_symbol:
+            daily_valuation_df = self.data_manager.get_daily_valuation_history(std_symbol, start_buffer, end_date)
+        
+        feature_df = pd.DataFrame(index=date_index)
+        
+        if not daily_valuation_df.empty:
+            daily_valuation_df['trade_date'] = pd.to_datetime(daily_valuation_df['trade_date'])
+            daily_valuation_df.sort_values('trade_date', inplace=True)
+            daily_valuation_df.set_index('trade_date', inplace=True)
+            daily_valuation_df = daily_valuation_df.reindex(date_index, method='ffill')
+            daily_valuation_df = daily_valuation_df.apply(pd.to_numeric, errors='coerce')
+            
+            feature_df['pe_ttm'] = daily_valuation_df.get('pe_ttm')
+            feature_df['pe_ttm_valid'] = ((feature_df['pe_ttm'] > 0) & (feature_df['pe_ttm'] < 200)).astype(float)
+            feature_df['pb'] = daily_valuation_df.get('pb')
+            feature_df['pb_valid'] = ((feature_df['pb'] > 0) & (feature_df['pb'] < 20)).astype(float)
+        
+        if not quarterly_df.empty:
+            quarterly_df['report_date'] = pd.to_datetime(quarterly_df['report_date'])
+            quarterly_df['publish_date'] = pd.to_datetime(quarterly_df['publish_date'])
+            quarterly_df['effective_date'] = quarterly_df['publish_date'].fillna(quarterly_df['report_date'])
+            quarterly_df.sort_values('effective_date', inplace=True)
+            quarterly_df.set_index('effective_date', inplace=True)
+            quarterly_df = quarterly_df.reindex(date_index, method='ffill')
+            quarterly_df = quarterly_df.bfill()
+            quarterly_df = quarterly_df.apply(pd.to_numeric, errors='coerce')
+            
+            feature_df['revenue'] = quarterly_df.get('revenue')
+            feature_df['net_profit'] = quarterly_df.get('net_profit')
+            feature_df['net_profit_margin'] = quarterly_df.get('net_profit_margin')
+            feature_df['roe'] = quarterly_df.get('roe')
+            feature_df['eps'] = quarterly_df.get('eps')
+            feature_df['revenue_yoy'] = quarterly_df.get('revenue_yoy')
+            feature_df['net_profit_yoy'] = quarterly_df.get('net_profit_yoy')
+            feature_df['debt_to_asset'] = quarterly_df.get('debt_to_asset')
+            feature_df['current_ratio'] = quarterly_df.get('current_ratio')
+            feature_df['quick_ratio'] = quarterly_df.get('quick_ratio')
+        
+        feature_df = self._sanitize_dataframe(feature_df)
+        empty_cols = [col for col in feature_df.columns if feature_df[col].isna().all()]
+        if empty_cols:
+            feature_df.drop(columns=empty_cols, inplace=True)
+        feature_df['symbol'] = symbol
+        feature_df = feature_df.reset_index().rename(columns={'index': 'date'})
+        return feature_df
     
     def _validate_features(self, features: Dict[str, float]) -> Dict[str, float]:
         """验证并清理特征值，移除无效值"""

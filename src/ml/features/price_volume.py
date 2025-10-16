@@ -206,11 +206,12 @@ class PriceVolumeFeatureGenerator:
     
     def _add_money_flow_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """资金流特征 (只依赖价量数据)"""
-        # OBV (On-Balance Volume)
+        # OBV 修改: 使用rolling代替cumsum避免数据泄漏
         df['price_change'] = df['close'].diff()
         df['obv_delta'] = df['volume'].where(df['price_change'] > 0, 
                                               -df['volume'].where(df['price_change'] < 0, 0))
-        df['OBV'] = df['obv_delta'].cumsum()
+        # 使用20日滚动窗口的OBV变化率代替全局累积
+        df['OBV'] = df['obv_delta'].rolling(window=20, min_periods=10).sum()
         
         # CMF (Chaikin Money Flow) - 20日
         df['mf_multiplier'] = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'] + 1e-9)

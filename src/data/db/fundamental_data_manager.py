@@ -117,6 +117,35 @@ class FundamentalDataManager:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='日度估值数据表'
                 """)
                 
+                # 3. 季度数据日频化结果表
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS fundamental_data_daily_expanded (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        symbol VARCHAR(20) NOT NULL COMMENT '股票代码（带后缀）',
+                        trade_date DATE NOT NULL COMMENT '交易日期',
+                        
+                        revenue DECIMAL(20, 2) COMMENT '营业收入（元）',
+                        net_profit DECIMAL(20, 2) COMMENT '净利润（元）',
+                        net_profit_margin DECIMAL(10, 4) COMMENT '净利率',
+                        roe DECIMAL(10, 4) COMMENT 'ROE',
+                        eps DECIMAL(10, 4) COMMENT '每股收益',
+                        revenue_yoy DECIMAL(10, 4) COMMENT '营收同比增长率',
+                        net_profit_yoy DECIMAL(10, 4) COMMENT '净利润同比增长率',
+                        debt_to_asset DECIMAL(10, 4) COMMENT '资产负债率',
+                        current_ratio DECIMAL(10, 4) COMMENT '流动比率',
+                        quick_ratio DECIMAL(10, 4) COMMENT '速动比率',
+                        pe_ttm DECIMAL(10, 4) COMMENT '市盈率(TTM)',
+                        pb DECIMAL(10, 4) COMMENT '市净率',
+                        
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        
+                        UNIQUE KEY uk_symbol_date_expanded (symbol, trade_date),
+                        INDEX idx_symbol_expanded (symbol),
+                        INDEX idx_date_expanded (trade_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='季度财务数据日频化表'
+                """)
+                
                 cursor.close()
                 logger.info("✅ 基本面数据表已就绪")
                 
@@ -403,6 +432,168 @@ class FundamentalDataManager:
         except Exception as e:
             logger.debug(f"{symbol}@{trade_date.date()}: 读取估值数据失败 - {e}")
             return None
+    
+    def get_quarterly_history(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> pd.DataFrame:
+        """
+        获取指定区间的全部季度财务数据
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                sql = """
+                    SELECT symbol, report_date, publish_date,
+                           revenue, net_profit, gross_profit_margin, net_profit_margin,
+                           roe, roa, eps, revenue_yoy, net_profit_yoy,
+                           debt_to_asset, current_ratio, quick_ratio,
+                           operating_cash_flow, total_assets, total_equity
+                    FROM fundamental_data_quarterly
+                    WHERE symbol = %s
+                      AND report_date BETWEEN %s AND %s
+                    ORDER BY COALESCE(publish_date, report_date)
+                """
+                df = pd.read_sql(
+                    sql,
+                    conn,
+                    params=(
+                        symbol,
+                        pd.Timestamp(start_date).date(),
+                        pd.Timestamp(end_date).date()
+                    )
+                )
+                return df
+        except Exception as e:
+            logger.debug(f"{symbol}: 区间季度数据读取失败 - {e}")
+            return pd.DataFrame()
+    
+    def get_daily_valuation_history(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> pd.DataFrame:
+        """
+        获取指定区间的日度估值数据
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                sql = """
+                    SELECT symbol, trade_date,
+                           pe_ttm, pb
+                    FROM fundamental_data_daily
+                    WHERE symbol = %s
+                      AND trade_date BETWEEN %s AND %s
+                    ORDER BY trade_date
+                """
+                df = pd.read_sql(
+                    sql,
+                    conn,
+                    params=(
+                        symbol,
+                        pd.Timestamp(start_date).date(),
+                        pd.Timestamp(end_date).date()
+                    )
+                )
+                return df
+        except Exception as e:
+            logger.debug(f"{symbol}: 区间估值数据读取失败 - {e}")
+            return pd.DataFrame()
+    
+    def save_daily_expanded(self, symbol: str, df: pd.DataFrame) -> int:
+        """
+        保存季报日频化后的数据
+        """
+        if df is None or df.empty:
+            return 0
+        
+        df = df.copy()
+        df['trade_date'] = pd.to_datetime(df['date']).dt.date
+        df.drop(columns=['date'], inplace=True, errors='ignore')
+        df = df.where(pd.notna(df), None)
+        
+        columns = [
+            'revenue', 'net_profit', 'net_profit_margin', 'roe', 'eps',
+            'revenue_yoy_growth', 'net_profit_yoy_growth',
+            'debt_to_asset', 'current_ratio', 'quick_ratio',
+            'pe_ttm', 'pb'
+        ]
+        
+        records = []
+        for _, row in df.iterrows():
+            record = (
+                symbol,
+                row['trade_date'],
+                row.get('revenue'),
+                row.get('net_profit'),
+                row.get('net_profit_margin'),
+                row.get('roe'),
+                row.get('eps'),
+                row.get('revenue_yoy'),
+                row.get('net_profit_yoy'),
+                row.get('debt_to_asset'),
+                row.get('current_ratio'),
+                row.get('quick_ratio'),
+                row.get('pe_ttm'),
+                row.get('pb')
+            )
+            records.append(record)
+        
+        if not records:
+            return 0
+        
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                sql = """
+                    INSERT INTO fundamental_data_daily_expanded (
+                        symbol, trade_date,
+                        revenue, net_profit, net_profit_margin, roe, eps,
+                        revenue_yoy, net_profit_yoy,
+                        debt_to_asset, current_ratio, quick_ratio,
+                        pe_ttm, pb
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s
+                    ) ON DUPLICATE KEY UPDATE
+                        revenue = VALUES(revenue),
+                        net_profit = VALUES(net_profit),
+                        net_profit_margin = VALUES(net_profit_margin),
+                        roe = VALUES(roe),
+                        eps = VALUES(eps),
+                        revenue_yoy = VALUES(revenue_yoy),
+                        net_profit_yoy = VALUES(net_profit_yoy),
+                        debt_to_asset = VALUES(debt_to_asset),
+                        current_ratio = VALUES(current_ratio),
+                        quick_ratio = VALUES(quick_ratio),
+                        pe_ttm = VALUES(pe_ttm),
+                        pb = VALUES(pb),
+                        updated_at = CURRENT_TIMESTAMP
+                """
+                cursor.executemany(sql, records)
+                conn.commit()
+                return len(records)
+        except Exception as e:
+            logger.error(f"{symbol}: 保存日频化基本面数据失败 - {e}")
+            return 0
+    
+    def delete_daily_expanded(self, symbol_variants: List[str]) -> None:
+        if not symbol_variants:
+            return
+        placeholders = ','.join(['%s'] * len(symbol_variants))
+        sql = f"DELETE FROM fundamental_data_daily_expanded WHERE symbol IN ({placeholders})"
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, symbol_variants)
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"删除日频化数据失败: {e}")
     
     def get_data_coverage(self, symbols: List[str]) -> pd.DataFrame:
         """

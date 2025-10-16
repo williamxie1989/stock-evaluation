@@ -3,34 +3,30 @@
 
 
 def get_conservative_lgbm_params() -> dict:
-    """返回优化的 LightGBM 参数配置（✅ 已应用保守调优）。"""
+    """返回保守的 LightGBM 参数配置（Optuna禁用时的fallback）。
+    
+    注意: 当enable_optuna=True时，这些参数会被Optuna优化结果覆盖。
+    这些参数应与prediction_config.py中的LIGHTGBM_PARAMS保持一致。
+    """
     return {
-        'n_estimators': 300,      # ✅ 已调优: 增加树数量
-        'max_depth': 5,           # ✅ 已调优: 增加模型深度
-        'learning_rate': 0.03,    # ✅ 已调优: 降低学习率配合更多树
-        'num_leaves': 31,
-        'min_child_samples': 50,  # ✅ 已调优: 增强正则化
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'reg_alpha': 0.1,         # L1正则化
-        'reg_lambda': 1.0,        # L2正则化
-        'early_stopping_rounds': 30
+        'n_estimators': 300,
+        'learning_rate': 0.03,
+        'early_stopping_rounds': 30,
+        'verbose': -1
     }
 
 
 def get_conservative_xgb_params() -> dict:
-    """返回优化的 XGBoost 参数配置（✅ 已应用保守调优）。"""
+    """返回保守的 XGBoost 参数配置（Optuna禁用时的fallback）。
+    
+    注意: 当enable_optuna=True时，这些参数会被Optuna优化结果覆盖。
+    这些参数应与prediction_config.py中的XGBOOST_PARAMS保持一致。
+    """
     return {
-        'n_estimators': 300,      # ✅ 已调优: 增加树数量
-        'max_depth': 5,           # ✅ 已调优: 增加模型深度
-        'learning_rate': 0.03,    # ✅ 已调优: 降低学习率
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'reg_alpha': 0.1,         # L1正则化
-        'reg_lambda': 1.0,        # L2正则化
-        'min_child_weight': 5,    # ✅ 已调优: 增强正则化
-        'gamma': 0.1,             # ✅ 已调优: 增强正则化
-        'early_stopping_rounds': 30
+        'n_estimators': 300,
+        'learning_rate': 0.03,
+        'early_stopping_rounds': 30,
+        'verbosity': 0
     }
 
 

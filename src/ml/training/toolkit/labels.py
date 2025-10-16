@@ -394,7 +394,13 @@ def add_labels_corrected(
 
     result = result.loc[valid_mask].copy()
 
-    # 🔒 移除所有可能导致数据泄漏的未来收益列
+    # � 方案C2修改: 保留future_residual_return供后续使用，但不作为训练特征
+    # 先备份future_residual_return（如果存在）
+    residual_return_backup = None
+    if 'future_residual_return' in result.columns:
+        residual_return_backup = result['future_residual_return'].copy()
+
+    # �🔒 移除所有可能导致数据泄漏的未来收益列
     # 这些列仅用于标签计算，不应作为特征使用
     leakage_cols = [
         'future_return',           # 未来绝对收益 - 直接泄漏！
@@ -409,5 +415,11 @@ def add_labels_corrected(
     if cols_to_drop:
         logger.info(f"🔒 移除泄漏特征列: {cols_to_drop}")
         result.drop(columns=cols_to_drop, inplace=True)
+
+    # 🔴 方案C2修改: 恢复future_residual_return（但标记为非特征列）
+    # 这个列将在train_c2_solution.py中用于替换label_reg
+    if residual_return_backup is not None:
+        result['future_residual_return'] = residual_return_backup
+        logger.info("✅ 保留 future_residual_return 列供回归标签使用（非训练特征）")
 
     return result

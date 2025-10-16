@@ -11,7 +11,7 @@ import argparse
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import OrderedDict
 
 # 添加项目根路径
@@ -61,6 +61,13 @@ def prepare_training_data(
     classification_strategy: str = LABEL_STRATEGY,
     label_quantile: float = LABEL_POSITIVE_QUANTILE,
     label_min_samples: int = LABEL_MIN_SAMPLES_PER_DATE,
+    label_negative_quantile: Optional[float] = LABEL_NEGATIVE_QUANTILE,
+    label_threshold: float = CLS_THRESHOLD,
+    enable_label_neutral_band: bool = ENABLE_LABEL_NEUTRAL_BAND,
+    label_neutral_quantile: Optional[float] = LABEL_NEUTRAL_QUANTILE,
+    use_market_baseline: bool = LABEL_USE_MARKET_BASELINE,
+    use_industry_neutral: bool = LABEL_USE_INDUSTRY_NEUTRAL,
+    market_column: str = 'MKT',
     enable_fundamental: bool = False
 ) -> pd.DataFrame:
     """
@@ -80,6 +87,28 @@ def prepare_training_data(
         结束日期
     prediction_period : int
         预测周期（天）
+    classification_strategy : str
+        标签策略（absolute/quantile）
+    label_quantile : float
+        quantile策略上分位数
+    label_min_samples : int
+        quantile策略每日最小样本
+    label_negative_quantile : float or None
+        quantile策略下分位数
+    label_threshold : float
+        回退absolute策略的涨幅阈值
+    enable_label_neutral_band : bool
+        是否开启中性区
+    label_neutral_quantile : float or None
+        中性区上界
+    use_market_baseline : bool
+        是否使用市场基准构建超额收益
+    use_industry_neutral : bool
+        是否做行业中性
+    market_column : str
+        市场基准列名
+    enable_fundamental : bool
+        是否启用基本面特征
     
     Returns
     -------
@@ -93,7 +122,19 @@ def prepare_training_data(
     logger.info(f"日期范围: {start_date} ~ {end_date}")
     logger.info(f"预测周期: {prediction_period}天")
     logger.info(f"价格策略: 特征用不复权 + 标签用前复权")
-    logger.info(f"标签策略: {classification_strategy} (quantile={label_quantile:.2f})")
+    if classification_strategy.lower() == 'quantile':
+        logger.info(
+            "标签策略: %s (上分位数=%.2f, 下分位数=%s, 最小样本=%d)",
+            classification_strategy,
+            label_quantile,
+            f"{label_negative_quantile:.2f}" if label_negative_quantile is not None else "未设置",
+            label_min_samples
+        )
+    else:
+        logger.info("标签策略: %s (阈值=%.3f)", classification_strategy, label_threshold)
+    logger.info(f"中性区: {'启用' if enable_label_neutral_band else '关闭'} (上界={label_neutral_quantile})")
+    logger.info(f"市场基准: {'启用' if use_market_baseline else '关闭'} (列名={market_column})")
+    logger.info(f"行业中性: {'启用' if use_industry_neutral else '关闭'}")
     logger.info(f"基本面特征: {'启用' if enable_fundamental else '禁用'}")
 
     from src.data.unified_data_access import UnifiedDataAccessLayer, DataAccessConfig
@@ -302,7 +343,14 @@ def prepare_training_data(
             prediction_period=prediction_period,
             classification_strategy=classification_strategy,
             label_quantile=label_quantile,
-            label_min_samples=label_min_samples
+            label_min_samples=label_min_samples,
+            label_negative_quantile=label_negative_quantile,
+            label_threshold=label_threshold,
+            enable_neutral_band=enable_label_neutral_band,
+            label_neutral_quantile=label_neutral_quantile,
+            use_market_baseline=use_market_baseline,
+            use_industry_neutral=use_industry_neutral,
+            market_column=market_column
         )
         
         # 合并所有批次结果
@@ -311,7 +359,10 @@ def prepare_training_data(
         
         all_data = batch_results
         failed_symbols.extend(batch_failed)
-        
+        failed_set = {s for s, _ in failed_symbols}
+        success_count = sum(1 for s in active_symbols if s not in failed_set)
+        quality_stats['success'] = success_count
+
         logger.info("")
         logger.info(f"批量训练数据准备完成:")
         logger.info(f"  总批次数: {len(all_data)}")
@@ -411,17 +462,18 @@ def prepare_training_data(
                         features_df=features_df,
                         price_data=price_adj,
                         prediction_period=prediction_period,
-                        threshold=CLS_THRESHOLD,  # absolute 策略兜底
+                        threshold=label_threshold,  # absolute 策略兜底
                         price_data_raw=price_raw,
                         classification_strategy=classification_strategy,
                         quantile=label_quantile,
                         min_samples_per_date=label_min_samples,
-                        negative_quantile=LABEL_NEGATIVE_QUANTILE,
-                        enable_neutral_band=ENABLE_LABEL_NEUTRAL_BAND,
-                        neutral_quantile=LABEL_NEUTRAL_QUANTILE,
+                        negative_quantile=label_negative_quantile,
+                        enable_neutral_band=enable_label_neutral_band,
+                        neutral_quantile=label_neutral_quantile,
                         market_returns=market_returns,
-                        use_market_baseline=LABEL_USE_MARKET_BASELINE,
-                        use_industry_neutral=LABEL_USE_INDUSTRY_NEUTRAL
+                        use_market_baseline=use_market_baseline,
+                        market_column=market_column,
+                        use_industry_neutral=use_industry_neutral
                     )
                     features_df = features_with_labels
                 except Exception as label_exc:
@@ -460,41 +512,11 @@ def prepare_training_data(
     
     df = pd.concat(all_data, ignore_index=True)
 
-    # 统一执行行业中性残差计算，确保使用跨股票截面信息
-    if LABEL_USE_INDUSTRY_NEUTRAL:
-        base_col = None
-        if LABEL_USE_MARKET_BASELINE and 'future_excess_return' in df.columns:
-            base_col = 'future_excess_return'
-        elif 'future_return' in df.columns:
-            base_col = 'future_return'
-
-        if base_col is None:
-            logger.warning("行业中性处理跳过: 未找到未来收益列")
-        elif 'industry' not in df.columns:
-            logger.warning("行业中性处理跳过: 数据缺少industry列")
-        else:
-            grouped = df.groupby(['date', 'industry'])[base_col]
-            group_counts = grouped.transform('count')
-            min_required = max(min(label_min_samples, 3), 2)
-            industry_mean = grouped.transform('mean')
-            residual_series = df[base_col] - industry_mean
-            sufficient_mask = group_counts >= min_required
-
-            df['future_residual_return'] = np.where(sufficient_mask, residual_series, np.nan)
-
-            updated_rows = int(sufficient_mask.sum())
-            if updated_rows > 0:
-                df.loc[sufficient_mask, 'label_reg'] = df.loc[sufficient_mask, 'future_residual_return']
-                logger.info(
-                    "行业中性已应用: %d 条记录 (阈值: >=%d 同日同行业样本)",
-                    updated_rows,
-                    min_required
-                )
-            else:
-                logger.info(
-                    "行业中性未应用: 所有日期同行业样本数不足 %d 条，保留原始收益标签",
-                    min_required
-                )
+    # 移除高缺失的长窗口特征（120 日相关列）
+    cols_to_drop = [col for col in df.columns if col.endswith('_120')]
+    if cols_to_drop:
+        logger.info(f"移除高缺失特征列: {cols_to_drop}")
+        df.drop(columns=cols_to_drop, inplace=True, errors='ignore')
 
     # 截面标准化/排序增强特征
     if ENABLE_CROSS_SECTIONAL_ENRICHMENT and 'date' in df.columns:
@@ -540,6 +562,36 @@ def prepare_training_data(
     logger.info("\n数据清洗统计:")
     logger.info(f"  前复权负数过滤: {quality_stats['qfq_negative_filtered']} 条")
     logger.info(f"  前复权极端值过滤: {quality_stats['qfq_extreme_filtered']} 条")
+
+    # 特征质量诊断
+    numeric_cols = [
+        col for col in df.columns
+        if col not in {'label_cls', 'label_reg'}
+        and pd.api.types.is_numeric_dtype(df[col])
+    ]
+    if numeric_cols:
+        try:
+            label_series = df['label_reg']
+            corr_pairs = []
+            for col in numeric_cols:
+                series = df[col]
+                if series.isna().all():
+                    continue
+                corr = series.corr(label_series)
+                if pd.notna(corr):
+                    corr_pairs.append((col, corr))
+            corr_pairs.sort(key=lambda item: abs(item[1]), reverse=True)
+            if corr_pairs:
+                logger.info("\n🏹 与label_reg相关性Top10:")
+                for col, corr in corr_pairs[:10]:
+                    logger.info("  %-30s %.4f", col, corr)
+            missing_ratio = df[numeric_cols].isna().mean().sort_values(ascending=False)
+            if not missing_ratio.empty:
+                logger.info("\n🧪 缺失率Top10:")
+                for col, ratio in missing_ratio.head(10).items():
+                    logger.info("  %-30s %.2f%%", col, ratio * 100)
+        except Exception as diag_exc:
+            logger.warning(f"特征诊断失败: {diag_exc}")
     
     if failed_symbols:
         logger.info(f"\n失败股票详情 (共{len(failed_symbols)}只):")
@@ -650,8 +702,14 @@ def add_labels_with_qfq(
     # 分类标签: 收益 > CLS_THRESHOLD
     merged['label_cls'] = (merged['future_return'] > CLS_THRESHOLD).astype(float)
     
-    # 回归标签: 收益率
-    merged['label_reg'] = merged['future_return']
+    # 🔴 方案C2修改: 支持使用残差收益作为回归标签
+    # 如果有 future_residual_return 列，优先使用它
+    if 'future_residual_return' in features_df.columns:
+        logger.info("✅ 使用 future_residual_return 作为回归标签（残差收益）")
+        merged['label_reg'] = features_df['future_residual_return']
+    else:
+        # 否则使用绝对收益
+        merged['label_reg'] = merged['future_return']
     
     # 删除临时列
     result = merged.drop(columns=['close_qfq', 'future_close_qfq', 'future_return'])
@@ -664,7 +722,21 @@ def train_models(
     model_save_dir: str = 'models/v2',
     enable_both_tasks: bool = True,
     classification_strategy: str = LABEL_STRATEGY,
-    prediction_period: int = PREDICTION_PERIOD_DAYS
+    prediction_period: int = PREDICTION_PERIOD_DAYS,
+    # Stage 5: 新增参数
+    enable_feature_selection: bool = False,
+    feature_selection_method: str = 'lightgbm',
+    feature_selection_threshold: str = 'median',
+    min_features: int = 15,
+    max_features: int = 30,
+    enable_optuna: bool = False,
+    optuna_trials: int = 100,
+    optuna_timeout: int = 3600,
+    optuna_sampler: str = 'tpe',
+    optuna_model_type: str = 'xgboost',
+    optuna_cv_folds: int = 5,
+    # 🔴 方案C2: 新增参数
+    normalize_regression_labels: bool = False
 ):
     """
     训练模型
@@ -677,12 +749,40 @@ def train_models(
         模型保存目录
     enable_both_tasks : bool
         是否训练分类和回归两个任务
+    classification_strategy : str
+        分类标签策略
     prediction_period : int
         预测周期（天数），用于模型文件命名
+    enable_feature_selection : bool
+        是否启用特征选择
+    feature_selection_method : str
+        特征选择方法
+    feature_selection_threshold : str
+        特征重要性阈值
+    min_features : int
+        最少保留特征数
+    max_features : int
+        最多保留特征数
+    enable_optuna : bool
+        是否启用Optuna优化
+    optuna_trials : int
+        Optuna试验次数
+    optuna_timeout : int
+        Optuna超时时间
+    optuna_sampler : str
+        Optuna采样器
+    optuna_model_type : str
+        Optuna优化的模型类型
+    optuna_cv_folds : int
+        Optuna交叉验证折数
     """
     logger.info("="*80)
     logger.info("开始训练模型")
     logger.info(f"标签策略: {classification_strategy}")
+    if enable_feature_selection:
+        logger.info(f"✅ Stage 5: 特征选择已启用 (方法={feature_selection_method}, 范围={min_features}-{max_features})")
+    if enable_optuna:
+        logger.info(f"✅ Stage 5: Optuna优化已启用 (试验={optuna_trials}, 模型={optuna_model_type})")
     logger.info("="*80)
     
     # 🔧 关键修复：识别实际存在的特征列（排除标签、元数据和未来信息）
@@ -717,7 +817,22 @@ def train_models(
         categorical_features=categorical_features,
         config={
             'use_rolling_cv': True,
-            'cv_n_splits': 5
+            'cv_n_splits': 5,
+            # Stage 5: 特征选择配置
+            'enable_feature_selection': enable_feature_selection,
+            'feature_selection_method': feature_selection_method,
+            'feature_selection_threshold': feature_selection_threshold,
+            'min_features': min_features,
+            'max_features': max_features,
+            # Stage 5: Optuna配置
+            'enable_optuna': enable_optuna,
+            'optuna_trials': optuna_trials,
+            'optuna_timeout': optuna_timeout,
+            'optuna_sampler': optuna_sampler,
+            'optuna_model_type': optuna_model_type,
+            'optuna_cv_folds': optuna_cv_folds,
+            # 🔴 方案C2: 回归标签标准化配置
+            'normalize_regression_labels': normalize_regression_labels
         }
     )
     
@@ -971,8 +1086,68 @@ def main():
                         help='quantile 策略使用的上分位数（例如 0.7 表示前30% 为正类）')
     parser.add_argument('--label-min-samples', type=int, default=LABEL_MIN_SAMPLES_PER_DATE,
                         help='quantile 策略下每个交易日的最小样本数，低于该值回退 absolute')
+    parser.add_argument('--label-threshold', type=float, default=CLS_THRESHOLD,
+                        help='quantile 样本不足时回退的绝对收益阈值，默认与配置一致')
+    parser.add_argument('--label-negative-quantile', type=float, default=LABEL_NEGATIVE_QUANTILE,
+                        help='quantile 策略下分位数（用于明确负类或中性区），默认配置值')
+    parser.add_argument('--label-neutral-quantile', type=float, default=LABEL_NEUTRAL_QUANTILE,
+                        help='启用中性区时的上界分位数')
+    parser.add_argument('--market-column', type=str, default='MKT',
+                        help='市场基准的列名，默认 MKT')
+    neutral_group = parser.add_mutually_exclusive_group()
+    neutral_group.add_argument('--enable-neutral-band', dest='enable_neutral_band', action='store_true',
+                               help='启用标签中性区')
+    neutral_group.add_argument('--disable-neutral-band', dest='enable_neutral_band', action='store_false',
+                               help='关闭标签中性区')
+    parser.set_defaults(enable_neutral_band=ENABLE_LABEL_NEUTRAL_BAND)
+    market_group = parser.add_mutually_exclusive_group()
+    market_group.add_argument('--use-market-baseline', dest='use_market_baseline', action='store_true',
+                              help='强制启用市场基准，构建超额收益')
+    market_group.add_argument('--disable-market-baseline', dest='use_market_baseline', action='store_false',
+                              help='禁用市场基准，直接预测绝对收益')
+    parser.set_defaults(use_market_baseline=LABEL_USE_MARKET_BASELINE)
+    industry_group = parser.add_mutually_exclusive_group()
+    industry_group.add_argument('--use-industry-neutral', dest='use_industry_neutral', action='store_true',
+                                help='启用行业截面去均值（行业中性）')
+    industry_group.add_argument('--disable-industry-neutral', dest='use_industry_neutral', action='store_false',
+                                help='禁用行业中性处理')
+    parser.set_defaults(use_industry_neutral=LABEL_USE_INDUSTRY_NEUTRAL)
     parser.add_argument('--enable-fundamental', action='store_true',
                         help='启用基本面特征（财务数据）')
+    
+    # ========== Stage 5: 特征选择参数组 ==========
+    fs_group = parser.add_argument_group('Stage 5: 特征选择参数')
+    fs_group.add_argument('--enable-feature-selection', action='store_true',
+                         help='启用特征选择')
+    fs_group.add_argument('--feature-selection-method', type=str, 
+                         choices=['lightgbm', 'xgboost', 'random_forest'],
+                         default='lightgbm',
+                         help='特征选择方法 (default: lightgbm)')
+    fs_group.add_argument('--min-features', type=int, default=15,
+                         help='最少保留特征数 (default: 15)')
+    fs_group.add_argument('--max-features', type=int, default=30,
+                         help='最多保留特征数 (default: 30)')
+    fs_group.add_argument('--feature-selection-threshold', type=str, default='median',
+                         help='特征重要性阈值: median/mean/<float> (default: median)')
+    
+    # ========== Stage 5: Optuna超参数优化参数组 ==========
+    optuna_group = parser.add_argument_group('Stage 5: Optuna超参数优化')
+    optuna_group.add_argument('--enable-optuna', action='store_true',
+                             help='启用Optuna超参数优化')
+    optuna_group.add_argument('--optuna-trials', type=int, default=100,
+                             help='优化试验次数 (default: 100)')
+    optuna_group.add_argument('--optuna-timeout', type=int, default=3600,
+                             help='优化超时时间（秒） (default: 3600)')
+    optuna_group.add_argument('--optuna-sampler', type=str, 
+                             choices=['tpe', 'random', 'cmaes'],
+                             default='tpe',
+                             help='Optuna采样器 (default: tpe)')
+    optuna_group.add_argument('--optuna-model-type', type=str,
+                             choices=['xgboost', 'lightgbm'],
+                             default='xgboost',
+                             help='优化的模型类型 (default: xgboost)')
+    optuna_group.add_argument('--optuna-cv-folds', type=int, default=5,
+                             help='Optuna交叉验证折数 (default: 5)')
     
     args = parser.parse_args()
     
@@ -1004,6 +1179,14 @@ def main():
     logger.info(f"  日期范围: {start_date} ~ {end_date}")
     logger.info(f"  预测周期: {args.prediction_period}天")
     logger.info(f"  模型目录: {args.model_dir}")
+
+    label_negative_quantile = args.label_negative_quantile
+    if label_negative_quantile is not None and label_negative_quantile < 0:
+        label_negative_quantile = None
+
+    label_neutral_quantile = args.label_neutral_quantile
+    if label_neutral_quantile is not None and label_neutral_quantile < 0:
+        label_neutral_quantile = None
     
     # 准备数据
     df = prepare_training_data(
@@ -1014,6 +1197,13 @@ def main():
         classification_strategy=args.label_strategy,
         label_quantile=args.label_quantile,
         label_min_samples=args.label_min_samples,
+        label_negative_quantile=label_negative_quantile,
+        label_threshold=args.label_threshold,
+        enable_label_neutral_band=args.enable_neutral_band,
+        label_neutral_quantile=label_neutral_quantile,
+        use_market_baseline=args.use_market_baseline,
+        use_industry_neutral=args.use_industry_neutral,
+        market_column=args.market_column,
         enable_fundamental=args.enable_fundamental
     )
     
@@ -1025,7 +1215,20 @@ def main():
         model_save_dir=args.model_dir,
         enable_both_tasks=enable_both,
         classification_strategy=args.label_strategy,
-        prediction_period=args.prediction_period
+        prediction_period=args.prediction_period,
+        # ========== Stage 5: 特征选择参数 ==========
+        enable_feature_selection=args.enable_feature_selection,
+        feature_selection_method=args.feature_selection_method,
+        feature_selection_threshold=args.feature_selection_threshold,
+        min_features=args.min_features,
+        max_features=args.max_features,
+        # ========== Stage 5: Optuna超参数优化 ==========
+        enable_optuna=args.enable_optuna,
+        optuna_trials=args.optuna_trials,
+        optuna_timeout=args.optuna_timeout,
+        optuna_sampler=args.optuna_sampler,
+        optuna_model_type=args.optuna_model_type,
+        optuna_cv_folds=args.optuna_cv_folds
     )
     
     logger.info("\n" + "="*80)

@@ -15,7 +15,7 @@ def improved_time_series_split(
     y: pd.Series,
     dates: pd.Series,
     test_size_ratio: float = 0.2,
-    embargo_days: int = 5,
+    embargo_days: int = 40,  # 🔧 修复: 从5天改为40天 (预测期30天+10天缓冲)
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """执行带 embargo 期的时间序列切分。"""
@@ -74,7 +74,7 @@ def rolling_window_time_series_split(
     dates: pd.Series,
     train_window_years: float = 3.0,
     test_size_ratio: float = 0.2,
-    embargo_days: int = 5,
+    embargo_days: int = 40,  # 🔧 修复: 从5天改为40天 (预测期30天+10天缓冲)
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """
@@ -136,13 +136,13 @@ def rolling_window_time_series_split(
     return X_train, X_val, y_train, y_val
 
 
-def rolling_window_split(
+def get_time_series_split(
     X: pd.DataFrame,
     y: pd.Series,
     dates: pd.Series,
     train_years: float = 3.0,
     val_years: float = 1.0,
-    embargo_days: int = 5,
+    embargo_days: int = 40,  # 🔧 修复: 从5天改为40天 (预测期30天+10天缓冲)
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """
@@ -203,6 +203,25 @@ def rolling_window_split(
     X_val = X_sorted[val_mask].reset_index(drop=True)
     y_val = y_sorted[val_mask].reset_index(drop=True)
 
+    if len(X_train) == 0 or len(X_val) == 0:
+        fallback_ratio = val_years / max(train_years + val_years, 1e-6)
+        fallback_ratio = max(0.1, min(0.5, fallback_ratio))
+        if verbose:
+            logger.warning(
+                "滚动窗口切分样本不足(训练=%d, 验证=%d)，回退到改进时间切分 (test_ratio=%.2f)",
+                len(X_train),
+                len(X_val),
+                fallback_ratio
+            )
+        return improved_time_series_split(
+            X,
+            y,
+            dates,
+            test_size_ratio=fallback_ratio,
+            embargo_days=embargo_days,
+            verbose=verbose
+        )
+
     if verbose:
         logger.info("滚动窗口切分统计:")
         logger.info("  训练窗口: %.1f 年", train_years)
@@ -231,3 +250,52 @@ def rolling_window_split(
             logger.info("  标签分布差异: %.2f%%", label_diff)
 
     return X_train, X_val, y_train, y_val
+
+
+# 🔧 兼容性别名：rolling_window_split = get_time_series_split
+# 为了兼容旧代码（enhanced_trainer_v2.py），提供别名
+def rolling_window_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    train_years: float = 3.0,
+    val_years: float = 1.0,
+    embargo_days: int = 40,
+    verbose: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """
+    滚动窗口时间序列切分（兼容性包装器）
+    
+    这是 get_time_series_split 的别名函数，用于兼容旧代码。
+    参数名称适配：train_years, val_years → 传递给 get_time_series_split
+    
+    Parameters
+    ----------
+    X : pd.DataFrame
+        特征数据
+    y : pd.Series
+        标签数据
+    dates : pd.Series
+        日期序列
+    train_years : float, default=3.0
+        训练集窗口长度（年）
+    val_years : float, default=1.0
+        验证集窗口长度（年）
+    embargo_days : int, default=40
+        禁用期天数（防止标签泄漏）
+    verbose : bool, default=True
+        是否打印详细信息
+        
+    Returns
+    -------
+    X_train, X_val, y_train, y_val
+    """
+    return get_time_series_split(
+        X=X,
+        y=y,
+        dates=dates,
+        train_years=train_years,
+        val_years=val_years,
+        embargo_days=embargo_days,
+        verbose=verbose
+    )

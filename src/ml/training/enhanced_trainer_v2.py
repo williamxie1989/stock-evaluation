@@ -201,6 +201,20 @@ class EnhancedTrainerV2:
         logger.info("初始化 EnhancedTrainerV2")
         logger.info(f"  数值特征: {len(numerical_features)}")
         logger.info(f"  类别特征: {len(categorical_features)}")
+        
+        # Stage 5: 特征选择配置
+        self.enable_feature_selection = self.config.get('enable_feature_selection', False)
+        if self.enable_feature_selection:
+            logger.info("  ✅ 特征选择: 已启用")
+            logger.info(f"     方法: {self.config.get('feature_selection_method', 'lightgbm')}")
+            logger.info(f"     范围: {self.config.get('min_features', 15)}-{self.config.get('max_features', 30)} 特征")
+        
+        # Stage 5: Optuna超参数优化配置
+        self.enable_optuna = self.config.get('enable_optuna', False)
+        if self.enable_optuna:
+            logger.info("  ✅ Optuna优化: 已启用")
+            logger.info(f"     试验次数: {self.config.get('optuna_trials', 100)}")
+            logger.info(f"     采样器: {self.config.get('optuna_sampler', 'tpe')}")
 
         self.cv_fold_info: List[Dict[str, Any]] = []
         self._cv_sorted_frames: Optional[Tuple[pd.DataFrame, pd.Series, pd.Series]] = None
@@ -647,6 +661,143 @@ class EnhancedTrainerV2:
         
         return preprocessor
     
+    def _select_features_for_task(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        task: str = 'classification'
+    ) -> Tuple[List[str], np.ndarray]:
+        """
+        执行特征选择
+        
+        Parameters
+        ----------
+        X : DataFrame
+            特征数据
+        y : Series
+            标签数据
+        task : str
+            任务类型 ('classification' 或 'regression')
+        
+        Returns
+        -------
+        selected_features : List[str]
+            选定的特征名列表
+        importances : ndarray
+            特征重要性
+        """
+        from src.ml.preprocessing.feature_selection import select_features_for_task
+        
+        logger.info(f"执行{task}特征选择...")
+        
+        # 🔧 关键修复: 确保数据类型正确
+        X_converted = X.copy()
+        for col in X_converted.columns:
+            if X_converted[col].dtype == 'object':
+                X_converted[col] = pd.to_numeric(X_converted[col], errors='coerce')
+        
+        # 检查是否有缺失值
+        if X_converted.isna().any().any():
+            logger.warning("特征选择前检测到缺失值，将进行填充")
+            X_converted = X_converted.fillna(X_converted.median())
+        
+        logger.debug(f"特征数据类型: {X_converted.dtypes.to_dict()}")
+        
+        selected_features, importances = select_features_for_task(
+            X_converted, y,
+            task=task,
+            method=self.config.get('feature_selection_method', 'lightgbm'),
+            threshold=self.config.get('feature_selection_threshold', 'median'),
+            min_features=self.config.get('min_features', 15),
+            max_features=self.config.get('max_features', 30)
+        )
+        
+        logger.info(f"✅ 特征选择完成: {len(X.columns)} → {len(selected_features)}")
+        
+        return selected_features, importances
+    
+    def _optuna_optimize(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        dates: Optional[pd.Series],
+        task: str = 'classification'
+    ) -> Dict[str, Any]:
+        """
+        执行Optuna超参数优化
+        
+        Parameters
+        ----------
+        X : DataFrame
+            特征数据
+        y : Series
+            标签数据
+        dates : Series or None
+            日期序列
+        task : str
+            任务类型 ('classification' 或 'regression')
+        
+        Returns
+        -------
+        best_params : dict
+            最优超参数
+        """
+        from src.ml.optimization.optuna_optimizer import OptunaOptimizer
+        
+        logger.info(f"执行{task} Optuna超参数优化...")
+        
+        # 🔧 关键修复: Optuna只支持数值特征，需要过滤类别特征
+        numerical_cols = [col for col in X.columns if col not in self.categorical_features]
+        if len(numerical_cols) < len(X.columns):
+            logger.info(f"Optuna优化将使用 {len(numerical_cols)} 个数值特征（排除 {len(self.categorical_features)} 个类别特征）")
+            X_for_optuna = X[numerical_cols].copy()
+        else:
+            X_for_optuna = X.copy()
+        
+        # 确保数据类型正确
+        for col in X_for_optuna.columns:
+            if X_for_optuna[col].dtype == 'object':
+                X_for_optuna[col] = pd.to_numeric(X_for_optuna[col], errors='coerce')
+        
+        # 填充缺失值
+        if X_for_optuna.isna().any().any():
+            logger.warning("Optuna优化前检测到缺失值，将进行填充")
+            X_for_optuna = X_for_optuna.fillna(X_for_optuna.median())
+        
+        optimizer_config = {
+            'n_trials': self.config.get('optuna_trials', 100),
+            'timeout': self.config.get('optuna_timeout', 3600),
+            'sampler': self.config.get('optuna_sampler', 'tpe'),
+            'cv_folds': self.config.get('optuna_cv_folds', 5),
+            'n_jobs': 1  # 避免嵌套并行
+        }
+        
+        optimizer = OptunaOptimizer(optimizer_config)
+        
+        # 根据任务类型和模型类型选择优化方法
+        model_type = self.config.get('optuna_model_type', 'xgboost')
+        
+        if task == 'classification':
+            if model_type == 'xgboost':
+                result = optimizer.optimize_xgboost_classification(X_for_optuna, y, dates)
+            elif model_type == 'lightgbm':
+                result = optimizer.optimize_lightgbm_classification(X_for_optuna, y, dates)
+            else:
+                logger.warning(f"不支持的模型类型: {model_type}，跳过Optuna优化")
+                return {}
+        else:  # regression
+            if model_type == 'xgboost':
+                result = optimizer.optimize_xgboost_regression(X_for_optuna, y, dates)
+            else:
+                logger.warning(f"回归任务仅支持XGBoost优化，跳过")
+                return {}
+        
+        logger.info(f"✅ Optuna优化完成")
+        logger.info(f"  最优得分: {result['best_score']:.4f}")
+        logger.info(f"  试验次数: {result['n_trials']}")
+        
+        return result['best_params']
+    
     def train_classification_model(
         self,
         X: pd.DataFrame,
@@ -677,6 +828,35 @@ class EnhancedTrainerV2:
         logger.info("="*80)
         logger.info(f"开始训练分类模型: {model_type}")
         logger.info("="*80)
+        
+        # Stage 5: 特征选择 (在数据切分前执行)
+        selected_features = None
+        feature_importances = None
+        original_numerical_features = self.numerical_features.copy()
+        original_categorical_features = self.categorical_features.copy()
+        
+        if self.enable_feature_selection:
+            selected_features, feature_importances = self._select_features_for_task(
+                X, y, task='classification'
+            )
+            # 只保留选定的特征
+            X = X[selected_features]
+            logger.info(f"特征选择后数据形状: {X.shape}")
+            
+            # 🔧 关键修复: 更新numerical_features和categorical_features
+            # 只保留仍然存在的特征
+            self.numerical_features = [f for f in self.numerical_features if f in selected_features]
+            self.categorical_features = [f for f in self.categorical_features if f in selected_features]
+            logger.info(f"更新特征集合: 数值特征 {len(self.numerical_features)}, 类别特征 {len(self.categorical_features)}")
+        
+        # Stage 5: Optuna超参数优化 (在数据切分前执行)
+        if self.enable_optuna and model_type in ['xgboost', 'lightgbm']:
+            best_params = self._optuna_optimize(X, y, dates, task='classification')
+            # 🔧 Stage5修复: Optuna优化结果优先（覆盖用户传入的参数）
+            if best_params:
+                logger.info("应用Optuna优化参数（Optuna优先覆盖）")
+                model_params.update(best_params)  # ✅ 使用update覆盖，而非只填充缺失项
+                logger.info(f"  优化后参数: {list(best_params.keys())}")
         
         # 切分数据
         X_train, X_val, y_train, y_val = self._prepare_timeseries_split(
@@ -851,8 +1031,13 @@ class EnhancedTrainerV2:
         if self.config.get('use_rolling_cv', False) and self._cv_pairs and self._cv_sorted_frames is not None:
             self._log_fold_classification_diagnostics(model_wrapper, calibrator, optimal_threshold)
 
+        # 🔧 恢复原始特征列表（如果进行了特征选择）
+        if self.enable_feature_selection:
+            self.numerical_features = original_numerical_features
+            self.categorical_features = original_categorical_features
+
         # 特征选择（如果需要）
-        selected_features = None
+        selected_features_legacy = None
         if self.config['enable_feature_selection']:
             if self.categorical_features:
                 logger.info("存在类别特征，跳过原始空间特征选择以避免object类型问题")
@@ -860,7 +1045,7 @@ class EnhancedTrainerV2:
                 logger.info("执行特征选择...")
                 from src.ml.preprocessing.feature_selection import select_features_for_task
                 
-                selected_features, _ = select_features_for_task(
+                selected_features_legacy, _ = select_features_for_task(
                     X_train[self.numerical_features],
                     y_train,
                     task='classification',
@@ -874,11 +1059,20 @@ class EnhancedTrainerV2:
             'model_type': model_type,
             'pipeline': model_wrapper,
             'calibrator': calibrator,
-            'selected_features': selected_features,
+            'selected_features': selected_features if selected_features else selected_features_legacy,
             'metrics': metrics,
             'threshold': optimal_threshold,
             'training_date': datetime.now().strftime('%Y-%m-%d'),
-            'config': self.config.copy()
+            'config': self.config.copy(),
+            # Stage 5: 添加元数据
+            'stage5_metadata': {
+                'feature_selection_enabled': self.enable_feature_selection,
+                'feature_importances': feature_importances.tolist() if feature_importances is not None else None,
+                'original_feature_count': len(original_numerical_features) + len(original_categorical_features) if self.enable_feature_selection else None,
+                'selected_feature_count': len(selected_features) if selected_features else None,
+                'optuna_enabled': self.enable_optuna,
+                'optuna_params': {k: v for k, v in model_params.items() if k in ['n_estimators', 'max_depth', 'learning_rate', 'subsample', 'colsample_bytree']} if self.enable_optuna else None
+            }
         }
         
         logger.info("✅ 分类模型训练完成\n")
@@ -916,13 +1110,63 @@ class EnhancedTrainerV2:
         logger.info(f"开始训练回归模型: {model_type}")
         logger.info("="*80)
         
+        # Stage 5: 特征选择 (在数据切分前执行)
+        selected_features = None
+        feature_importances = None
+        original_numerical_features = self.numerical_features.copy()
+        original_categorical_features = self.categorical_features.copy()
+        
+        if self.enable_feature_selection:
+            selected_features, feature_importances = self._select_features_for_task(
+                X, y, task='regression'
+            )
+            # 只保留选定的特征
+            X = X[selected_features]
+            logger.info(f"特征选择后数据形状: {X.shape}")
+            
+            # 🔧 关键修复: 更新numerical_features和categorical_features
+            # 只保留仍然存在的特征
+            self.numerical_features = [f for f in self.numerical_features if f in selected_features]
+            self.categorical_features = [f for f in self.categorical_features if f in selected_features]
+            logger.info(f"更新特征集合: 数值特征 {len(self.numerical_features)}, 类别特征 {len(self.categorical_features)}")
+        
+        # Stage 5: Optuna超参数优化 (在数据切分前执行)
+        if self.enable_optuna and model_type == 'xgboost':  # 回归仅支持XGBoost
+            best_params = self._optuna_optimize(X, y, dates, task='regression')
+            # 🔧 Stage5修复: Optuna优化结果优先（覆盖用户传入的参数）
+            if best_params:
+                logger.info("应用Optuna优化参数（Optuna优先覆盖）")
+                model_params.update(best_params)  # ✅ 使用update覆盖，而非只填充缺失项
+                logger.info(f"  优化后参数: {list(best_params.keys())}")
+        
         # 切分数据
         X_train, X_val, y_train, y_val = self._prepare_timeseries_split(
             X, y, dates
         )
         
         logger.info(f"数据切分: 训练集 {len(X_train)}, 验证集 {len(X_val)}")
-        logger.info(f"目标统计: 均值 {y_train.mean():.4f}, 标准差 {y_train.std():.4f}")
+        logger.info(f"目标统计（标准化前）: 均值 {y_train.mean():.4f}, 标准差 {y_train.std():.4f}")
+        
+        # 🔴 方案C2: 回归标签标准化
+        y_scaler = None
+        if self.config.get('normalize_regression_labels', False):
+            from sklearn.preprocessing import StandardScaler
+            logger.info("✅ 启用回归标签标准化（StandardScaler）")
+            
+            y_scaler = StandardScaler()
+            y_train_scaled = y_scaler.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+            y_val_scaled = y_scaler.transform(y_val.values.reshape(-1, 1)).ravel()
+            
+            logger.info(f"  标准化后均值: {y_train_scaled.mean():.4f}")
+            logger.info(f"  标准化后标准差: {y_train_scaled.std():.4f}")
+            
+            # 替换原始标签
+            y_train_original = y_train.copy()
+            y_val_original = y_val.copy()
+            y_train = pd.Series(y_train_scaled, index=y_train.index)
+            y_val = pd.Series(y_val_scaled, index=y_val.index)
+        else:
+            logger.info("回归标签未标准化")
 
         if self.config.get('use_rolling_cv', False) and self.cv_fold_info:
             logger.info("时间序列折统计:")
@@ -1005,6 +1249,17 @@ class EnhancedTrainerV2:
         y_pred_train = model_wrapper.predict(X_train)
         y_pred_val = model_wrapper.predict(X_val)
         
+        # 🔴 方案C2: 如果标签被标准化，需要反标准化预测结果
+        if y_scaler is not None:
+            logger.info("反标准化预测结果...")
+            y_pred_train = y_scaler.inverse_transform(y_pred_train.reshape(-1, 1)).ravel()
+            y_pred_val = y_scaler.inverse_transform(y_pred_val.reshape(-1, 1)).ravel()
+            
+            # 使用原始标签进行评估
+            y_train = y_train_original
+            y_val = y_val_original
+            logger.info("使用原始标签尺度评估性能")
+        
         # 评估
         from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
         
@@ -1030,8 +1285,13 @@ class EnhancedTrainerV2:
         if self.config.get('use_rolling_cv', False) and self._cv_pairs and self._cv_sorted_frames is not None:
             self._log_fold_regression_diagnostics(model_wrapper)
         
+        # 🔧 恢复原始特征列表（如果进行了特征选择）
+        if self.enable_feature_selection:
+            self.numerical_features = original_numerical_features
+            self.categorical_features = original_categorical_features
+        
         # 特征选择（如果需要）
-        selected_features = None
+        selected_features_legacy = None
         if self.config['enable_feature_selection']:
             if self.categorical_features:
                 logger.info("存在类别特征，跳过原始空间特征选择以避免object类型问题")
@@ -1039,7 +1299,7 @@ class EnhancedTrainerV2:
                 logger.info("执行特征选择...")
                 from src.ml.preprocessing.feature_selection import select_features_for_task
                 
-                selected_features, _ = select_features_for_task(
+                selected_features_legacy, _ = select_features_for_task(
                     X_train[self.numerical_features],
                     y_train,
                     task='regression',
@@ -1052,12 +1312,23 @@ class EnhancedTrainerV2:
             'task': 'regression',
             'model_type': model_type,
             'pipeline': model_wrapper,
+            'y_scaler': y_scaler,  # 🔴 方案C2: 保存标签标准化器
             'calibrator': None,  # 回归不需要校准
-            'selected_features': selected_features,
+            'selected_features': selected_features if selected_features else selected_features_legacy,
             'metrics': metrics,
             'threshold': None,
             'training_date': datetime.now().strftime('%Y-%m-%d'),
-            'config': self.config.copy()
+            'config': self.config.copy(),
+            # Stage 5: 添加元数据
+            'stage5_metadata': {
+                'feature_selection_enabled': self.enable_feature_selection,
+                'feature_importances': feature_importances.tolist() if feature_importances is not None else None,
+                'original_feature_count': len(original_numerical_features) + len(original_categorical_features) if self.enable_feature_selection else None,
+                'selected_feature_count': len(selected_features) if selected_features else None,
+                'optuna_enabled': self.enable_optuna,
+                'optuna_params': {k: v for k, v in model_params.items() if k in ['n_estimators', 'max_depth', 'learning_rate', 'subsample', 'colsample_bytree']} if self.enable_optuna else None,
+                'label_normalization_enabled': y_scaler is not None  # 🔴 方案C2: 记录是否使用了标签标准化
+            }
         }
         
         logger.info("✅ 回归模型训练完成\n")
