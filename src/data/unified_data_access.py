@@ -39,7 +39,7 @@ class DataAccessConfig:
     enable_data_validation: bool = True
     preferred_data_sources: List[str] = None
     # 价格调整模式：origin(未复权), qfq(前复权), hfq(后复权)
-    default_adjust_mode: str = "origin"
+    default_adjust_mode: str = "qfq"
     
     def __post_init__(self):
         # 如果没有显式传入 preferred_data_sources，则尝试读取环境变量覆盖，否则使用默认值
@@ -1509,6 +1509,8 @@ class UnifiedDataAccessLayer:
         if not self.config.use_cache or df is None or df.empty:
             return
         try:
+            if not df.columns.is_unique:
+                df = df.loc[:, ~df.columns.duplicated()].copy()
             import uuid
             path = self._l2_cache_path(cache_key)
             # 使用唯一临时文件名避免并发写入冲突

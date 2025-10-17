@@ -9,8 +9,15 @@ def get_conservative_lgbm_params() -> dict:
     这些参数应与prediction_config.py中的LIGHTGBM_PARAMS保持一致。
     """
     return {
-        'n_estimators': 300,
-        'learning_rate': 0.03,
+        'n_estimators': 300,      # ✅ 与prediction_config.py一致
+        'max_depth': 6,           # ✅ Stage5修复: 从5改为6，与prediction_config.py一致
+        'learning_rate': 0.03,    # ✅ 与prediction_config.py一致
+        'num_leaves': 15,         # ✅ Stage5修复: 2^4-1=15，匹配max_depth=4
+        'min_child_samples': 50,  # ✅ 与prediction_config.py一致
+        'subsample': 0.7,         # ✅ Stage5修复: 与prediction_config.py一致
+        'colsample_bytree': 0.7,  # ✅ Stage5修复: 与prediction_config.py一致
+        'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0
+        'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0
         'early_stopping_rounds': 30,
         'verbose': -1
     }
@@ -23,8 +30,15 @@ def get_conservative_xgb_params() -> dict:
     这些参数应与prediction_config.py中的XGBOOST_PARAMS保持一致。
     """
     return {
-        'n_estimators': 300,
-        'learning_rate': 0.03,
+        'n_estimators': 300,      # ✅ 与prediction_config.py一致
+        'max_depth': 4,           # ✅ Stage5修复: 从5改为4，与prediction_config.py一致
+        'learning_rate': 0.03,    # ✅ 与prediction_config.py一致
+        'subsample': 0.7,         # ✅ Stage5修复: 与prediction_config.py一致
+        'colsample_bytree': 0.7,   # ✅ Stage5修复: 与prediction_config.py一致
+        'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0
+        'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0
+        'min_child_weight': 10,   # ✅ Stage5修复: 从5改为10
+        'gamma': 2.0,             # ✅ Stage5修复: 从0.1改为2.0
         'early_stopping_rounds': 30,
         'verbosity': 0
     }

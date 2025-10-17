@@ -112,12 +112,12 @@ class OptunaOptimizer:
             # 定义搜索空间 - 🔧 修复: 加强正则化约束，防止过拟合
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                'max_depth': trial.suggest_int('max_depth', 3, 4),  # 🔧 从3-10改为3-4
+                'max_depth': trial.suggest_int('max_depth', 3, 6),  # 🔧 从3-10改为3-6
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
                 'subsample': trial.suggest_float('subsample', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
                 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'min_child_weight': trial.suggest_int('min_child_weight', 5, 15),  # 🔧 从1-10改为5-15
-                'gamma': trial.suggest_float('gamma', 1.0, 5.0),  # 🔧 从0-5改为1-5
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 15),  # 🔧 从1-10改为5-15
+                'gamma': trial.suggest_float('gamma', 0.1, 10.0),  # 🔧 从0-5改为0.1=5
                 'reg_alpha': trial.suggest_float('reg_alpha', 3.0, 10.0),  # 🔧 从0-10改为3-10
                 'reg_lambda': trial.suggest_float('reg_lambda', 5.0, 10.0),  # 🔧 从0-10改为5-10
                 'random_state': 42,

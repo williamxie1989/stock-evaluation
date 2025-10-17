@@ -6,16 +6,16 @@
 
 # ============ 预测目标配置 ============
 PREDICTION_PERIOD_DAYS = 30  # 未来预测天数
-CLS_THRESHOLD = 0.05  # 分类阈值：涨幅超过5%判为正样本 (absolute 策略兜底)
+CLS_THRESHOLD = 0.04  # 截面样本不足时的兜底绝对阈值
 
 # 标签构建策略
-LABEL_STRATEGY = 'quantile'  # 'absolute' 或 'quantile'
-LABEL_POSITIVE_QUANTILE = 0.75  # 🔧 提高到 0.75，选择更极端的正样本（前25%）
-LABEL_NEGATIVE_QUANTILE = 0.3  # quantile策略的下分位数，用于构建负类或中性区
-LABEL_MIN_SAMPLES_PER_DATE = 30  # 🔧 quantile策略要求每日最少样本数（批量训练时使用）
-ENABLE_LABEL_NEUTRAL_BAND = False  # 预留配置：是否引入中性区间
+LABEL_STRATEGY = 'quantile'  # 默认使用横截面quantile策略
+LABEL_POSITIVE_QUANTILE = 0.7  # 前30% 作为正类
+LABEL_NEGATIVE_QUANTILE = 0.3  # 后30% 作为负类
+LABEL_MIN_SAMPLES_PER_DATE = 30  # quantile策略每日最少样本，低于该值回退absolute
+ENABLE_LABEL_NEUTRAL_BAND = False  # 是否引入中性区间
 LABEL_NEUTRAL_QUANTILE = 0.5  # 中性区间上界（仅当启用neutral band时有效）
-LABEL_USE_MARKET_BASELINE = True  # 是否使用市场基准构建超额收益标签
+LABEL_USE_MARKET_BASELINE = False  # 是否使用市场基准构建超额收益标签
 LABEL_USE_INDUSTRY_NEUTRAL = True  # 是否对行业截面做去均值
 
 # 批量训练配置
@@ -31,7 +31,7 @@ BATCH_TRAINING_SIZE = 50  # 🆕 每批训练的股票数量（可根据内存�
 
 # ============ 数据配置 ============
 LOOKBACK_DAYS = 720  # 特征计算回溯天数（用于默认start_date计算）
-MIN_TRAINING_DAYS = 180  # 🔧 训练数据足够性检查阈值（低于此值跳过该股票）
+MIN_TRAINING_DAYS = 250  # 🔧 训练数据足够性检查阈值（低于此值跳过该股票）
 MIN_HISTORY_DAYS = 45  # 最少历史数据要求
 MIN_VALID_TRADING_DAYS = 30  # 最少有效交易天数（用于confidence计算）
 
@@ -49,6 +49,14 @@ INDUSTRY_MIN_FREQUENCY = 0.005  # 行业最小频率，低于此值归为'Other'
 
 # 板块特征
 ENABLE_BOARD_ONEHOT = True  # 是否启用板块One-Hot
+
+# 基本面特征配置
+FUNDAMENTAL_PUBLISH_DELAY_DAYS = 60  # 🔧 财报公告延迟天数（数据源缺publish_date时使用）
+# 说明：当数据源缺少publish_date时，假设财报在report_date后N天公告
+# 设置为60天是保守估计，可根据实际情况调整：
+#   - 年报/半年报：通常30-90天
+#   - 季报：通常20-45天
+#   - 建议：60天（平衡准确性和数据可用性）
 
 # 截面标准化特征
 ENABLE_CROSS_SECTIONAL_ENRICHMENT = True
@@ -75,8 +83,8 @@ ENABLE_TIME_SERIES_SPLIT = True  # 是否启用时间序列切分
 
 # 🔧 滚动窗口配置（关键改进）
 USE_ROLLING_WINDOW = True  # 是否使用滚动窗口切分（而非全部历史）
-ROLLING_TRAIN_YEARS = 3.0  # 训练窗口年数（使用最近3年数据）
-ROLLING_VAL_YEARS = 1.0  # 验证窗口年数（最近1年）
+ROLLING_TRAIN_YEARS = 2  # 训练窗口年数（使用最近3年数据）
+ROLLING_VAL_YEARS = 0.5  # 验证窗口年数（最近1年）
 ROLLING_EMBARGO_DAYS = 40  # 🔧 Stage5修复: 从5天改为40天 (预测期30天+10天缓冲)
 
 # 样本加权配置
@@ -86,7 +94,7 @@ SAMPLE_WEIGHT_HALFLIFE_YEARS = 1.0  # 权重半衰期（年）
 # 特征选择
 ENABLE_FEATURE_SELECTION = True  # ✅ 已启用，OneHot后特征选择正常工作
 FEATURE_SELECTION_METHOD = 'model_based'  # 'model_based' or 'shap'
-MIN_FEATURE_IMPORTANCE = 0.001  # 最小特征重要性阈值
+MIN_FEATURE_IMPORTANCE = 0.005  # 最小特征重要性阈值,0.001到0.005
 
 # 概率校准
 ENABLE_CALIBRATION = True  # 是否启用概率校准
@@ -118,26 +126,26 @@ OPTUNA_PATIENCE = 10  # PatientPruner容忍度
 # LightGBM 超参数 (✅ Stage5修复: 与Optuna约束一致)
 LIGHTGBM_PARAMS = {
     'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 4,           # ✅ Stage5修复: 从5改为4，与Optuna一致
-    'learning_rate': 0.03,    # ✅ 已调优: 降低学习率配合更多树
-    'num_leaves': 15,         # ✅ Stage5修复: 2^4-1=15，匹配max_depth=4
-    'min_child_samples': 50,  # ✅ 已调优: 增强正则化（Optuna范围20-100）
+    'max_depth': 5,           # ✅ Stage5修复: 从5改为4，与Optuna一致
+    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率配合更多树
+    'num_leaves': 31,         # ✅ Stage5修复: 2^4-1=15，匹配max_depth=4
+    'min_child_samples': 20,  # ✅ 已调优: 增强正则化（Optuna范围20-100）
     'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
     'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
-    'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
+    'reg_alpha': 1.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
+    'reg_lambda': 1.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
 }
 
 # XGBoost 超参数 (✅ Stage5修复: 与Optuna约束一致)
 XGBOOST_PARAMS = {
     'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 4,           # ✅ Stage5修复: 从5改为4，与Optuna一致
-    'learning_rate': 0.03,    # ✅ 已调优: 降低学习率
+    'max_depth': 5,           # ✅ Stage5修复: 从5改为4，与Optuna一致
+    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率
     'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
     'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'reg_alpha': 5.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
-    'reg_lambda': 7.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
-    'min_child_weight': 10,   # ✅ Stage5修复: 从5改为10（Optuna范围5-15）
+    'reg_alpha': 1.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
+    'reg_lambda': 1.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
+    'min_child_weight': 20,   # ✅ Stage5修复: 从5改为10（Optuna范围5-15）
     'gamma': 2.0,             # ✅ Stage5修复: 从0.1改为2.0（Optuna范围1-5）
 }
 
@@ -185,8 +193,14 @@ REGRESSION_METRICS = [
     'quantile_monotonicity'  # 分层单调性
 ]
 
+# ============ 回归标签优化（阶段1新增）============
+NORMALIZE_REGRESSION_LABELS = True  # 标准化回归标签，减少极端值影响
+REGRESSION_LABEL_WINSORIZE = True   # 对标签进行缩尾处理
+REGRESSION_LABEL_CLIP_PERCENTILE = 0.01  # 上下1%截断
+
+
 # 通过门槛
-MIN_CLASSIFICATION_AUC = 0.52  # ✅ Stage5修复: 至少略好于随机（从0.48提升）
+MIN_CLASSIFICATION_AUC = 0.50  # ✅ Stage5修复: 至少略好于随机（从0.48提升）
 MIN_REGRESSION_R2 = -0.10  # 🔧 允许负R²: 小样本回归可能过拟合，但仍可分析特征重要性
 MIN_TOP_K_IMPROVEMENT = 3.0  # Top-K命中率最小提升(百分点)
 

@@ -18,7 +18,12 @@ def improved_time_series_split(
     embargo_days: int = 40,  # 🔧 修复: 从5天改为40天 (预测期30天+10天缓冲)
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    """执行带 embargo 期的时间序列切分。"""
+    """
+    执行带 embargo 期的时间序列切分。
+    
+    ⚠️ 重要: 返回的数据已经 reset_index，索引不再对应原始位置
+    如需验证日期，请使用返回的 dates 列或通过 dates_sorted 切片
+    """
     dates_dt = pd.to_datetime(dates)
     order = dates_dt.argsort()
 
@@ -37,6 +42,14 @@ def improved_time_series_split(
     y_train = y_sorted.iloc[:train_end_idx].reset_index(drop=True)
     X_val = X_sorted.iloc[embargo_end_idx:].reset_index(drop=True)
     y_val = y_sorted.iloc[embargo_end_idx:].reset_index(drop=True)
+
+    # 🔧 修复: 同时返回对应的日期，便于外部验证
+    train_dates = dates_sorted.iloc[:train_end_idx].reset_index(drop=True)
+    val_dates = dates_sorted.iloc[embargo_end_idx:].reset_index(drop=True)
+    
+    # 将日期添加到 DataFrame 中
+    X_train['_date'] = train_dates
+    X_val['_date'] = val_dates
 
     if verbose:
         logger.info("时序切分统计:")
@@ -125,13 +138,18 @@ def rolling_window_time_series_split(
         )
         logger.info("    正样本率: %.2f%%", y_train.mean() * 100)
         logger.info("  Embargo期: %d 天", embargo_days)
-        logger.info("  验证集: %d 样本", len(X_val))
-        logger.info(
-            "    时间范围: %s ~ %s",
-            dates_sorted.iloc[val_start_idx].strftime('%Y-%m-%d'),
-            dates_sorted.iloc[-1].strftime('%Y-%m-%d')
-        )
-        logger.info("    正样本率: %.2f%%", y_val.mean() * 100)
+    logger.info("  验证集: %d 样本", len(X_val))
+    logger.info(
+        "    时间范围: %s ~ %s",
+        dates_sorted.iloc[val_start_idx].strftime('%Y-%m-%d'),
+        dates_sorted.iloc[-1].strftime('%Y-%m-%d')
+    )
+    logger.info("    正样本率: %.2f%%", y_val.mean() * 100)
+
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    X_train['_date'] = dates_sorted.iloc[train_start_idx:train_end_idx].reset_index(drop=True)
+    X_val['_date'] = dates_sorted.iloc[val_start_idx:].reset_index(drop=True)
 
     return X_train, X_val, y_train, y_val
 
@@ -248,6 +266,11 @@ def get_time_series_split(
         if len(X_train) > 0 and len(X_val) > 0:
             label_diff = abs(y_train.mean() - y_val.mean()) * 100
             logger.info("  标签分布差异: %.2f%%", label_diff)
+
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    X_train['_date'] = dates_sorted[train_mask].reset_index(drop=True)
+    X_val['_date'] = dates_sorted[val_mask].reset_index(drop=True)
 
     return X_train, X_val, y_train, y_val
 

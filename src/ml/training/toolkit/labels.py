@@ -114,7 +114,8 @@ def add_labels_corrected(
         'extreme_raw': 0,
         'quantile_fallback_rows': 0,
         'neutral_dropped': 0,
-        'market_baseline_rows': 0
+        'market_baseline_rows': 0,
+        'industry_residual_rows': 0
     }
 
     if not 0 < quantile < 1:
@@ -277,7 +278,17 @@ def add_labels_corrected(
                 result['future_residual_return'] = residual_series
                 if (~sufficient_mask).any():
                     result.loc[~sufficient_mask, 'future_residual_return'] = np.nan
-                target_series = result['future_residual_return'].where(sufficient_mask, base_series)
+                residual_rows = int(sufficient_mask.sum())
+                coverage = residual_rows / len(result) if len(result) else 0.0
+                logger.info("  行业中性覆盖率: %.2f%% (%d/%d)", coverage * 100, residual_rows, len(result))
+                if coverage < 0.35:
+                    logger.warning("  行业中性覆盖率过低(<35%%)，回退使用原始收益标签")
+                    stats['industry_residual_rows'] = 0
+                    result['future_residual_return'] = np.nan
+                    target_series = base_series
+                else:
+                    stats['industry_residual_rows'] = residual_rows
+                    target_series = result['future_residual_return'].where(sufficient_mask, base_series)
             else:
                 logger.debug("行业中性跳过: 日期/行业样本不足，使用原始收益标签")
                 result['future_residual_return'] = np.nan

@@ -60,7 +60,7 @@ class FundamentalFeatureGenerator:
     V2优化: 优先从数据库读取，大幅减少API调用
     """
     
-    def __init__(self, cache_enabled: bool = True, db_manager=None, use_db_cache: bool = True):
+    def __init__(self, cache_enabled: bool = True, db_manager=None, use_db_cache: bool = True, publish_delay_days: int = 60):
         """
         Parameters
         ----------
@@ -70,20 +70,23 @@ class FundamentalFeatureGenerator:
             数据库管理器（如提供，将优先从数据库读取）
         use_db_cache : bool
             是否使用数据库缓存（优先级高于API调用）
+        publish_delay_days : int
+            财报公告延迟天数（当数据源缺publish_date时使用）
         """
         self.cache_enabled = cache_enabled
         self.cache = FundamentalDataCache() if cache_enabled else None
         self.db_manager = db_manager
         self.use_db_cache = use_db_cache
+        self.publish_delay_days = publish_delay_days  # 🔧 新增参数
         
         # 初始化数据库持久化管理器
         if db_manager and use_db_cache:
             from src.data.db.fundamental_data_manager import FundamentalDataManager
             self.data_manager = FundamentalDataManager(db_manager)
-            logger.info("基本面特征生成器初始化完成（启用数据库缓存）")
+            logger.info(f"基本面特征生成器初始化完成（启用数据库缓存，财报延迟={publish_delay_days}天）")
         else:
             self.data_manager = None
-            logger.info("基本面特征生成器初始化完成（无数据库缓存）")
+            logger.info(f"基本面特征生成器初始化完成（无数据库缓存，财报延迟={publish_delay_days}天）")
         
         if get_symbol_standardizer:
             try:
@@ -211,7 +214,19 @@ class FundamentalFeatureGenerator:
         if not quarterly_df.empty:
             quarterly_df['report_date'] = pd.to_datetime(quarterly_df['report_date'])
             quarterly_df['publish_date'] = pd.to_datetime(quarterly_df['publish_date'])
-            quarterly_df['effective_date'] = quarterly_df['publish_date'].fillna(quarterly_df['report_date'])
+            
+            # 🔧 关键修复：数据源缺少publish_date时使用保守延迟假设
+            # 使用配置的延迟天数（默认60天），避免前视偏差
+            missing_publish = quarterly_df['publish_date'].isna()
+            if missing_publish.any():
+                logger.debug(f"{symbol}: {missing_publish.sum()}条记录缺少publish_date，使用report_date+{self.publish_delay_days}天")
+                quarterly_df.loc[missing_publish, 'effective_date'] = (
+                    quarterly_df.loc[missing_publish, 'report_date'] + pd.Timedelta(days=self.publish_delay_days)
+                )
+                quarterly_df.loc[~missing_publish, 'effective_date'] = quarterly_df.loc[~missing_publish, 'publish_date']
+            else:
+                quarterly_df['effective_date'] = quarterly_df['publish_date']
+            
             quarterly_df.sort_values('effective_date', inplace=True)
             quarterly_df.set_index('effective_date', inplace=True)
             quarterly_df = quarterly_df.reindex(date_index, method='ffill')

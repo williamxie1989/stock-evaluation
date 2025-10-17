@@ -26,7 +26,8 @@ from config.prediction_config import (
     ENABLE_INDUSTRY_FEATURES,
     ENABLE_BOARD_ONEHOT,
     MIN_STOCKS_FOR_MARKET,
-    INDUSTRY_MIN_FREQUENCY
+    INDUSTRY_MIN_FREQUENCY,
+    FUNDAMENTAL_PUBLISH_DELAY_DAYS  # 🔧 新增导入
 )
 
 # 导入特征生成器
@@ -96,7 +97,8 @@ class UnifiedFeatureBuilder:
             self.fundamental_generator = FundamentalFeatureGenerator(
                 cache_enabled=enable_cache,
                 db_manager=db_manager,  # 传递db_manager以启用数据库缓存
-                use_db_cache=True  # 优先从数据库读取
+                use_db_cache=True,  # 优先从数据库读取
+                publish_delay_days=FUNDAMENTAL_PUBLISH_DELAY_DAYS  # 🔧 传递配置参数
             )
         else:
             self.fundamental_generator = None

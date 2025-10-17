@@ -8,7 +8,17 @@ import numpy as np
 import pandas as pd
 from typing import List, Optional, Tuple, Dict
 import logging
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.feature_selection import (
+    f_classif,
+    f_regression,
+    mutual_info_classif,
+    mutual_info_regression
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,125 +196,209 @@ def select_features_for_task(
     threshold: str = 'median',
     min_features: int = 10,
     max_features: Optional[int] = None,
+    cv_splits: int = 5,
+    candidate_step: Optional[int] = None,
+    scoring: Optional[str] = None,
+    cv_n_jobs: int = 1,
+    random_state: int = 42,
     **estimator_params
 ) -> Tuple[List[str], np.ndarray]:
-    """
-    为特定任务选择特征
-    
-    Parameters
-    ----------
-    X : DataFrame
-        特征数据
-    y : Series
-        目标变量
-    task : str
-        任务类型: 'classification' 或 'regression'
-    method : str, default='lightgbm'
-        选择方法: 'lightgbm', 'xgboost', 'random_forest'
-    threshold : str or float, default='median'
-        重要性阈值
-    min_features : int, default=10
-        最少保留特征数
-    max_features : int or None, default=None
-        最多保留特征数
-    **estimator_params : dict
-        传递给估计器的参数
-    
-    Returns
-    -------
-    selected_features : List[str]
-        选定的特征名称列表
-    importances : ndarray
-        特征重要性
-    """
-    # 创建估计器
+    """多策略融合 + 时间序列交叉验证的特征选择。"""
+
+    if task not in {'classification', 'regression'}:
+        raise ValueError(f"Unsupported task: {task}")
+
+    feature_names = X.columns.tolist()
+    if not feature_names:
+        return [], np.array([])
+
+    X_numeric = X.copy()
+    for col in feature_names:
+        if X_numeric[col].dtype == 'object':
+            X_numeric[col] = pd.to_numeric(X_numeric[col], errors='coerce')
+    X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
+    medians = X_numeric.median()
+    X_filled = X_numeric.fillna(medians)
+
+    X_matrix = X_filled.to_numpy(dtype=float)
+    y_array = np.asarray(y)
+    n_features = X_matrix.shape[1]
+
+    if max_features is None or max_features > n_features:
+        max_features = n_features
+    min_features = max(1, min(min_features, n_features))
+    if min_features > max_features:
+        min_features = max_features
+
+    def _safe_normalize(scores: np.ndarray) -> np.ndarray:
+        scores = np.nan_to_num(scores.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        if np.allclose(scores, 0):
+            return np.zeros_like(scores)
+        mn, mx = scores.min(), scores.max()
+        if np.isclose(mx, mn):
+            return np.ones_like(scores)
+        return (scores - mn) / (mx - mn)
+
+    # 单变量
+    try:
+        if task == 'classification' and len(np.unique(y_array)) > 1:
+            uni_scores, _ = f_classif(X_matrix, y_array)
+        elif task == 'regression':
+            uni_scores, _ = f_regression(X_matrix, y_array)
+        else:
+            uni_scores = np.zeros(n_features)
+    except Exception as exc:
+        logger.debug("单变量打分失败: %s", exc)
+        uni_scores = np.zeros(n_features)
+    uni_scores = _safe_normalize(uni_scores)
+
+    # 互信息
+    try:
+        if task == 'classification' and len(np.unique(y_array)) > 1:
+            mi_scores = mutual_info_classif(X_matrix, y_array, random_state=random_state)
+        elif task == 'regression':
+            mi_scores = mutual_info_regression(X_matrix, y_array, random_state=random_state)
+        else:
+            mi_scores = np.zeros(n_features)
+    except Exception as exc:
+        logger.debug("互信息打分失败: %s", exc)
+        mi_scores = np.zeros(n_features)
+    mi_scores = _safe_normalize(mi_scores)
+
+    # 模型重要性
     if method == 'lightgbm':
         from lightgbm import LGBMClassifier, LGBMRegressor
-        if task == 'classification':
-            estimator = LGBMClassifier(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=-1,
-                **estimator_params
-            )
-        else:
-            estimator = LGBMRegressor(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=-1,
-                **estimator_params
-            )
+        base_estimator = (LGBMClassifier if task == 'classification' else LGBMRegressor)(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=-1,
+            n_jobs=1,
+            random_state=random_state,
+            verbosity=-1,
+            **estimator_params
+        )
     elif method == 'xgboost':
         from xgboost import XGBClassifier, XGBRegressor
-        if task == 'classification':
-            estimator = XGBClassifier(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=0,
-                **estimator_params
-            )
-        else:
-            estimator = XGBRegressor(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=0,
-                **estimator_params
-            )
+        base_estimator = (XGBClassifier if task == 'classification' else XGBRegressor)(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            n_jobs=1,
+            random_state=random_state,
+            verbosity=0,
+            **estimator_params
+        )
     elif method == 'random_forest':
-        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-        if task == 'classification':
-            estimator = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42,
-                **estimator_params
-            )
-        else:
-            estimator = RandomForestRegressor(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42,
-                **estimator_params
-            )
+        base_estimator = (RandomForestClassifier if task == 'classification' else RandomForestRegressor)(
+            n_estimators=500,
+            max_depth=None,
+            random_state=random_state,
+            n_jobs=1,
+            **estimator_params
+        )
     else:
         raise ValueError(f"Unknown method: {method}")
-    
-    # 创建选择器
-    selector = ModelBasedFeatureSelector(
-        estimator=estimator,
-        threshold=threshold,
-        min_features=min_features,
-        max_features=max_features
-    )
-    
-    # 拟合
-    selector.fit(X, y)
-    
-    # 获取选定特征
-    feature_names = X.columns.tolist()
-    selected_indices = selector.get_support(indices=True)
-    selected_features = [feature_names[i] for i in selected_indices]
-    
-    logger.info(f"{task} 任务特征选择完成:")
-    logger.info(f"  原始特征数: {len(feature_names)}")
-    logger.info(f"  选定特征数: {len(selected_features)}")
-    
-    # 显示top特征
-    importances = selector.feature_importances_
-    top_indices = np.argsort(importances)[-10:][::-1]
-    logger.info(f"  Top 10 特征:")
-    for i in top_indices:
-        logger.info(f"    {feature_names[i]}: {importances[i]:.4f}")
-    
-    return selected_features, selector.feature_importances_
+
+    try:
+        base_estimator.fit(X_matrix, y_array)
+        model_scores = getattr(base_estimator, 'feature_importances_', np.zeros(n_features))
+    except Exception as exc:
+        logger.debug("模型重要性计算失败: %s", exc)
+        model_scores = np.zeros(n_features)
+    model_scores = _safe_normalize(model_scores)
+
+    scores_df = pd.DataFrame({
+        'feature': feature_names,
+        'univariate': uni_scores,
+        'mutual_info': mi_scores,
+        'model': model_scores
+    })
+    scores_df['combined'] = scores_df[['univariate', 'mutual_info', 'model']].mean(axis=1)
+    scores_df.sort_values(by='combined', ascending=False, inplace=True)
+
+    logger.info("特征打分汇总 (Top 10):")
+    for _, row in scores_df.head(10).iterrows():
+        logger.info(
+            "  %s | combined=%.4f uni=%.4f mi=%.4f model=%.4f",
+            row['feature'], row['combined'], row['univariate'], row['mutual_info'], row['model']
+        )
+
+    ordered_features = scores_df['feature'].tolist()
+
+    if candidate_step is None:
+        candidate_step = max(1, (max_features - min_features) // 5)
+    candidate_sizes = sorted(set([min_features, max_features] + list(range(min_features, max_features + 1, candidate_step))))
+
+    max_possible_splits = len(X_numeric) - 1
+    if max_possible_splits < 2:
+        logger.warning("样本量过小，跳过CV评估，直接返回Top特征")
+        selected_features = ordered_features[:max_features]
+        combined_scores_aligned = scores_df.set_index('feature')['combined'].reindex(feature_names).fillna(0.0)
+        importances = combined_scores_aligned.to_numpy(dtype=float)
+        return selected_features, importances
+
+    n_splits = min(cv_splits, max_possible_splits)
+    n_splits = max(2, n_splits)
+    cv = TimeSeriesSplit(n_splits=n_splits)
+    if scoring is None:
+        scoring = 'roc_auc' if task == 'classification' else 'r2'
+
+    best_score = -np.inf
+    best_size = candidate_sizes[0]
+    best_cv_scores: Optional[np.ndarray] = None
+
+    for size in candidate_sizes:
+        subset_features = ordered_features[:size]
+        subset_data = X_numeric[subset_features]
+
+        cv_model = clone(base_estimator)
+        pipeline_steps = [('imputer', SimpleImputer(strategy='median'))]
+        pipeline_steps.append(('model', cv_model))
+        cv_pipeline = Pipeline(pipeline_steps)
+
+        try:
+            cv_scores = cross_val_score(
+                cv_pipeline,
+                subset_data,
+                y_array,
+                cv=cv,
+                scoring=scoring,
+                n_jobs=cv_n_jobs
+            )
+        except ValueError:
+            fallback = 'accuracy' if task == 'classification' else 'neg_mean_squared_error'
+            cv_scores = cross_val_score(
+                cv_pipeline,
+                subset_data,
+                y_array,
+                cv=cv,
+                scoring=fallback,
+                n_jobs=cv_n_jobs
+            )
+            cv_scores = np.nan_to_num(cv_scores, nan=0.0)
+
+        mean_score = float(np.nanmean(cv_scores))
+        logger.info(
+            "候选特征数 %d | CV(%s)=%.4f ± %.4f",
+            size, scoring, mean_score, float(np.nanstd(cv_scores))
+        )
+
+        if mean_score > best_score:
+            best_score = mean_score
+            best_size = size
+            best_cv_scores = cv_scores
+
+    selected_features = ordered_features[:best_size]
+    logger.info("✅ 最终保留 %d 个特征 (CV最佳 %.4f)", len(selected_features), best_score)
+    if best_cv_scores is not None:
+        logger.info("  折别得分: %s", np.array2string(np.asarray(best_cv_scores), precision=4))
+
+    combined_scores_aligned = scores_df.set_index('feature')['combined'].reindex(feature_names).fillna(0.0)
+    importances = combined_scores_aligned.to_numpy(dtype=float)
+
+    return selected_features, importances
 
 
 def select_features_separately(

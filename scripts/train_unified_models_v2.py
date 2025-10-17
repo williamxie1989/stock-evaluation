@@ -159,6 +159,8 @@ def prepare_training_data(
     def _standardize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
         """标准化日线数据格式，便于特征与市场因子复用"""
         tmp = df.copy()
+        if not tmp.columns.is_unique:
+            tmp = tmp.loc[:, ~tmp.columns.duplicated()]
         tmp.columns = tmp.columns.str.lower()
 
         if 'date' in tmp.columns:
@@ -202,7 +204,7 @@ def prepare_training_data(
                 symbol,
                 start_date,
                 end_date,
-                adjust_mode='none'
+                adjust_mode=None
             )
 
             # 🔧 使用 MIN_TRAINING_DAYS 作为数据足够性检查阈值（而非 LOOKBACK_DAYS）
@@ -236,6 +238,8 @@ def prepare_training_data(
                 continue
 
             qfq_df = qfq_df.copy()
+            if not qfq_df.columns.is_unique:
+                qfq_df = qfq_df.loc[:, ~qfq_df.columns.duplicated()]
             if 'date' not in qfq_df.columns:
                 qfq_df = qfq_df.reset_index()
             if 'date' not in qfq_df.columns:
@@ -537,6 +541,8 @@ def prepare_training_data(
                 rank_col = f'cs_rank_{col}'
                 df[z_col] = grouped[col].transform(_zscore)
                 df[rank_col] = grouped[col].transform(lambda x: x.rank(pct=True, method='average'))
+                df[z_col] = df[z_col].fillna(0.0)
+                df[rank_col] = df[rank_col].fillna(0.5)
 
             logger.info("  截面增强列: %d 个", len(available_cols) * 2)
         else:
@@ -786,7 +792,7 @@ def train_models(
     logger.info("="*80)
     
     # 🔧 关键修复：识别实际存在的特征列（排除标签、元数据和未来信息）
-    excluded_cols = {'date', 'symbol', 'label_cls', 'label_reg', 'future_return', 'future_return_raw',
+    excluded_cols = {'date', '_date', 'symbol', 'label_cls', 'label_reg', 'future_return', 'future_return_raw',
                      'future_excess_return', 'future_residual_return',
                      'open', 'high', 'low', 'close', 'volume', 'amount', 'source',
                      'open_qfq', 'high_qfq', 'low_qfq', 'close_qfq',
