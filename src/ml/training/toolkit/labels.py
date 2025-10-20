@@ -175,10 +175,12 @@ def add_labels_corrected(
         return market_df
 
     symbols = features_df['symbol'].unique()
+    total_symbols = len(symbols)
+    logger.info("  开始处理 %d 只股票...", total_symbols)
 
     for idx, symbol in enumerate(symbols, 1):
-        if idx % 50 == 0:
-            logger.info("  进度: %d/%d", idx, len(symbols))
+        if idx % 50 == 0 or idx == total_symbols:
+            logger.info("  进度: %d/%d (%.1f%%)", idx, total_symbols, idx / total_symbols * 100)
 
         symbol_features = features_df[features_df['symbol'] == symbol].copy()
         symbol_features.sort_values('date', inplace=True)
@@ -268,8 +270,9 @@ def add_labels_corrected(
             grouped = result.groupby(['date', '__industry__'])[base_col]
             group_counts = grouped.transform('count')
 
-            # 需要至少两个同日同行业样本才有意义进行残差计算
-            min_required = max(min(min_samples_per_date, 3), 2)
+            # 需要足够的同日同行业样本才有意义进行残差计算
+            effective_min = max(min(min_samples_per_date, 5), 3)
+            min_required = effective_min
             sufficient_mask = group_counts >= min_required
 
             if sufficient_mask.any():
@@ -280,7 +283,23 @@ def add_labels_corrected(
                     result.loc[~sufficient_mask, 'future_residual_return'] = np.nan
                 residual_rows = int(sufficient_mask.sum())
                 coverage = residual_rows / len(result) if len(result) else 0.0
-                logger.info("  行业中性覆盖率: %.2f%% (%d/%d)", coverage * 100, residual_rows, len(result))
+                poor_industries: List[str] = []
+                if coverage < 0.5:
+                    insufficient_groups = result.loc[~sufficient_mask, ['date', '__industry__']]
+                    poor_industries = (
+                        insufficient_groups['__industry__']
+                        .value_counts()
+                        .head(5)
+                        .index.astype(str)
+                        .tolist()
+                    )
+                logger.info(
+                    "  行业中性覆盖率: %.2f%% (%d/%d)%s",
+                    coverage * 100,
+                    residual_rows,
+                    len(result),
+                    f" | 覆盖不足行业Top: {poor_industries}" if poor_industries else ""
+                )
                 if coverage < 0.35:
                     logger.warning("  行业中性覆盖率过低(<35%%)，回退使用原始收益标签")
                     stats['industry_residual_rows'] = 0
