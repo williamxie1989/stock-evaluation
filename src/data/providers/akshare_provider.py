@@ -3,87 +3,154 @@ Akshare数据提供器 - 精简版
 """
 
 import logging
-import akshare as ak
-import pandas as pd
+import random
+import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Union
 
+import akshare as ak
+import pandas as pd
+from requests.exceptions import ConnectionError, HTTPError, RequestException, Timeout
+
 logger = logging.getLogger(__name__)
+
+
+class RequestRateLimiter:
+    """基于滑动窗口的简单限速器，避免频繁触发对端封禁。"""
+
+    def __init__(self, max_calls: int, period: float, min_interval: float = 0.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._timestamps = deque()
+        self._last_acquired: float = 0.0
+
+    def acquire(self) -> None:
+        if self.max_calls <= 0:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] > self.period:
+                    self._timestamps.popleft()
+
+                min_interval_wait = 0.0
+                if self.min_interval > 0:
+                    elapsed = now - self._last_acquired
+                    if elapsed < self.min_interval:
+                        min_interval_wait = self.min_interval - elapsed
+
+                if len(self._timestamps) < self.max_calls and min_interval_wait <= 0:
+                    self._timestamps.append(now)
+                    self._last_acquired = now
+                    return
+
+                oldest_wait = 0.0
+                if self._timestamps:
+                    oldest_wait = self.period - (now - self._timestamps[0])
+                wait_time = max(min_interval_wait, oldest_wait, 0.05)
+
+            jitter = random.uniform(0, 0.1)
+            time.sleep(wait_time + jitter)
+
 
 class AkshareDataProvider:
     """Akshare数据提供器"""
-    
-    def __init__(self, max_retries: int = 3, retry_delay: float = 2.0):
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        retry_delay: float = 2.0,
+        max_requests_per_minute: int = 90,
+        min_request_interval: float = 0.6,
+        retry_backoff_factor: float = 2.0,
+        retry_jitter: float = 0.3,
+        max_retry_delay: float = 20.0,
+        rate_limiter: Optional[RequestRateLimiter] = None,
+    ):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        logger.info(f"AkshareDataProvider retries configured: max_retries={max_retries}, retry_delay={retry_delay}s")
-    
+        self.retry_backoff_factor = retry_backoff_factor
+        self.retry_jitter = retry_jitter
+        self.max_retry_delay = max_retry_delay
+        self._rate_limiter = rate_limiter or RequestRateLimiter(
+            max_calls=max_requests_per_minute,
+            period=60.0,
+            min_interval=min_request_interval,
+        )
+        logger.info(
+            "AkshareDataProvider configured: retries=%s delay=%ss max_rpm=%s min_interval=%ss",
+            max_retries,
+            retry_delay,
+            max_requests_per_minute,
+            min_request_interval,
+        )
+
     def get_stock_data(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> Optional[pd.DataFrame]:
         """获取股票历史数据"""
-        # 转换股票代码格式，akshare只需要纯数字
-        clean_symbol = symbol.replace('.SH', '').replace('.SZ', '').replace('sh', '').replace('sz', '')
-        
-        # 支持 datetime 类型输入
-        if isinstance(start_date, datetime):
-            start_date = start_date.strftime('%Y%m%d')
-        if isinstance(end_date, datetime):
-            end_date = end_date.strftime('%Y%m%d')
-        # 转换日期格式，akshare需要YYYYMMDD格式
-        if '-' in start_date:
-            start_date = start_date.replace('-', '')
-        if '-' in end_date:
-            end_date = end_date.replace('-', '')
-        
-        # 规范化复权参数：akshare使用 ""(不复权)、"qfq"(前复权)、"hfq"(后复权)
-        if adjust is None:
-            adjust = ""
-        adjust = adjust.lower()
-        if adjust in ("none", "raw", "no", ""):
-            adjust_param = ""
-        elif adjust in ("qfq", "hfq"):
-            adjust_param = adjust
-        else:
-            logger.warning(f"未知的复权参数: {adjust}，使用不复权")
-            adjust_param = ""
+        clean_symbol = self._clean_symbol(symbol)
+        start_date_str, end_date_str = self._normalize_dates(start_date, end_date)
+        adjust_param = self._normalize_adjust(adjust)
 
-        for attempt in range(self.max_retries):
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
             try:
-                # 使用akshare获取股票数据
-                df = ak.stock_zh_a_hist(symbol=clean_symbol, period="daily", start_date=start_date, end_date=end_date, adjust=adjust_param)
-                if not df.empty:
-                    # 将中文列名转换为英文标准列名
-                    column_mapping = {
-                        '日期': 'date',
-                        '开盘': 'open',
-                        '收盘': 'close',
-                        '最高': 'high',
-                        '最低': 'low',
-                        '成交量': 'volume',
-                        '成交额': 'amount',
-                        '振幅': 'amplitude',
-                        '涨跌幅': 'change_pct',  # 避免使用MySQL保留关键字
-                        '涨跌额': 'change_amount',
-                        '换手率': 'turnover'
-                    }
-                    
-                    # 只映射存在的列
-                    existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
-                    if existing_mapping:
-                        df = df.rename(columns=existing_mapping)
-                    
-                    # 确保日期列格式正确
-                    if 'date' in df.columns:
-                        df['date'] = pd.to_datetime(df['date'])
-                    
-                    logger.info(f"成功获取 {symbol} 数据: {len(df)} 条记录 (adjust={adjust_param or 'none'})")
-                    return df
-            except Exception as e:
-                logger.warning(f"获取 {symbol} 数据失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
-                if attempt < self.max_retries - 1:
-                    import time
-                    time.sleep(self.retry_delay)
-        
-        logger.error(f"无法获取 {symbol} 的股票数据")
+                self._rate_limiter.acquire()
+                df = ak.stock_zh_a_hist(
+                    symbol=clean_symbol,
+                    period="daily",
+                    start_date=start_date_str,
+                    end_date=end_date_str,
+                    adjust=adjust_param,
+                )
+
+                if df is None or df.empty:
+                    logger.warning(
+                        "获取 %s (%s) 数据为空 (attempt %s/%s)", symbol, adjust_param or "none", attempt, self.max_retries
+                    )
+                    if attempt == self.max_retries:
+                        return None
+                    self._sleep_with_backoff(attempt)
+                    continue
+
+                df = self._normalize_columns(df)
+                logger.info(
+                    "成功获取 %s 数据: %s 条记录 (adjust=%s)",
+                    symbol,
+                    len(df),
+                    adjust_param or "none",
+                )
+                return df
+
+            except (HTTPError, ConnectionError, Timeout, RequestException) as req_err:
+                last_error = req_err
+                logger.warning(
+                    "网络错误获取 %s (%s) 数据失败 (attempt %s/%s): %s",
+                    symbol,
+                    adjust_param or "none",
+                    attempt,
+                    self.max_retries,
+                    req_err,
+                )
+            except Exception as err:
+                last_error = err
+                logger.warning(
+                    "获取 %s (%s) 数据异常 (attempt %s/%s): %s",
+                    symbol,
+                    adjust_param or "none",
+                    attempt,
+                    self.max_retries,
+                    err,
+                )
+
+            if attempt < self.max_retries:
+                self._sleep_with_backoff(attempt)
+
+        logger.error("无法获取 %s 的股票数据 (adjust=%s): %s", symbol, adjust_param or "none", last_error)
         return None
 
 
@@ -94,7 +161,6 @@ class AkshareDataProvider:
         明确使用akshare的新浪接口（stock_zh_a_hist adjust参数）获取复权数据。
         """
         try:
-            # 明确使用新浪接口
             raw = self.get_stock_data(symbol, start_date, end_date, adjust="")
             qfq = self.get_stock_data(symbol, start_date, end_date, adjust="qfq")
             hfq = self.get_stock_data(symbol, start_date, end_date, adjust="hfq")
@@ -185,6 +251,71 @@ class AkshareDataProvider:
         except Exception as e:
             logger.error(f"获取实时数据失败: {e}")
             return None
+
+    # ------------------------------------------------------------------ #
+    # 辅助方法
+    # ------------------------------------------------------------------ #
+
+    def _clean_symbol(self, symbol: str) -> str:
+        if not symbol:
+            return ""
+        normalized = symbol.strip()
+        lower = normalized.lower()
+        if lower.endswith('.sh') or lower.endswith('.sz'):
+            normalized = normalized[:-3]
+        if lower.startswith('sh') or lower.startswith('sz'):
+            normalized = normalized[2:]
+        return normalized
+
+    def _normalize_dates(self, start_date: Union[str, datetime], end_date: Union[str, datetime]) -> tuple[str, str]:
+        def _normalize(value: Union[str, datetime]) -> str:
+            if isinstance(value, datetime):
+                return value.strftime('%Y%m%d')
+            value_str = str(value).strip()
+            for sep in ('-', '/', '.'):
+                if sep in value_str:
+                    value_str = value_str.replace(sep, '')
+            return value_str
+
+        return _normalize(start_date), _normalize(end_date)
+
+    def _normalize_adjust(self, adjust: Optional[str]) -> str:
+        if noaksharedjust:
+            return ""
+        adjust_lower = adjust.lower()
+        if adjust_lower in ("", "none", "raw", "no"):
+            return ""
+        if adjust_lower in ("qfq", "hfq"):
+            return adjust_lower
+        logger.warning("未知的复权参数: %s，使用不复权", adjust)
+        return ""
+
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        column_mapping = {
+            '日期': 'date',
+            '开盘': 'open',
+            '收盘': 'close',
+            '最高': 'high',
+            '最低': 'low',
+            '成交量': 'volume',
+            '成交额': 'amount',
+            '振幅': 'amplitude',
+            '涨跌幅': 'change_pct',
+            '涨跌额': 'change_amount',
+            '换手率': 'turnover',
+        }
+        existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
+        if existing_mapping:
+            df = df.rename(columns=existing_mapping)
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        return df
+
+    def _sleep_with_backoff(self, attempt: int) -> None:
+        base_delay = self.retry_delay * (self.retry_backoff_factor ** (attempt - 1))
+        delay = min(base_delay, self.max_retry_delay)
+        jitter = random.uniform(0, self.retry_jitter) if self.retry_jitter > 0 else 0.0
+        time.sleep(delay + jitter)
     
     def _get_single_realtime_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """获取单个股票的实时数据"""
@@ -195,7 +326,7 @@ class AkshareDataProvider:
             start_date = (datetime.now() - timedelta(days=7)).strftime('%Y%m%d')
             
             # 转换股票代码格式，akshare只需要纯数字
-            clean_symbol = symbol.replace('.SH', '').replace('.SZ', '').replace('sh', '').replace('sz', '')
+            clean_symbol = self._clean_symbol(symbol)
             
             df = ak.stock_zh_a_hist(symbol=clean_symbol, period='daily', start_date=start_date, end_date=end_date)
             if not df.empty:
@@ -441,3 +572,95 @@ class AkshareDataProvider:
         except Exception as e:
             logger.error(f"Akshare连接测试失败: {e}")
         return False
+
+    def get_trade_calendar(self, start_date: str = None, end_date: str = None, market: str = "ALL") -> Optional[pd.DataFrame]:
+        """获取交易日历数据
+        
+        Args:
+            start_date: 开始日期，格式YYYY-MM-DD或YYYYMMDD，默认None表示从最早开始
+            end_date: 结束日期，格式YYYY-MM-DD或YYYYMMDD，默认None表示到最新
+            market: 市场类型，可选值："SH"(上海)、"SZ"(深圳)、"ALL"(全部)，默认"ALL"
+            
+        Returns:
+            交易日历DataFrame，包含trade_date(交易日)、is_trading_day(是否交易日)、market(市场)列
+        """
+        try:
+            # 设置默认日期范围
+            if start_date is None:
+                start_date = "19900101"  # 从1990年开始
+            if end_date is None:
+                end_date = datetime.now().strftime("%Y%m%d")
+            
+            # 转换日期格式
+            if '-' in start_date:
+                start_date = start_date.replace('-', '')
+            if '-' in end_date:
+                end_date = end_date.replace('-', '')
+            
+            logger.info(f"获取交易日历数据: market={market}, start_date={start_date}, end_date={end_date}")
+            
+            # 使用AKShare的tool_trade_date_hist_sina接口获取交易日历
+            df = ak.tool_trade_date_hist_sina()
+            
+            if df.empty:
+                logger.warning("获取交易日历数据为空")
+                return None
+            
+            # 重命名列
+            df = df.rename(columns={'trade_date': 'trade_date'})
+            
+            # 确保日期格式正确
+            df['trade_date'] = pd.to_datetime(df['trade_date'])
+            
+            # 过滤日期范围
+            df = df[(df['trade_date'] >= pd.to_datetime(start_date)) & 
+                    (df['trade_date'] <= pd.to_datetime(end_date))]
+            
+            if df.empty:
+                logger.warning(f"在指定日期范围内未找到交易日历数据: {start_date} 到 {end_date}")
+                return None
+            
+            # 添加是否交易日标记（AKShare返回的都是交易日）
+            df['is_trading_day'] = True
+            
+            # 根据市场类型处理数据
+            if market == "SH":
+                df['market'] = "SH"
+            elif market == "SZ":
+                df['market'] = "SZ"
+            else:  # ALL
+                # 为每个日期创建上海和深圳两条记录
+                sh_df = df.copy()
+                sh_df['market'] = "SH"
+                sz_df = df.copy()
+                sz_df['market'] = "SZ"
+                df = pd.concat([sh_df, sz_df], ignore_index=True)
+            
+            # 排序并重置索引
+            df = df.sort_values(['trade_date', 'market']).reset_index(drop=True)
+            
+            logger.info(f"成功获取交易日历数据: {len(df)} 条记录")
+            return df
+            
+        except Exception as e:
+            logger.error(f"获取交易日历数据失败: {e}")
+            return None
+
+    def get_trade_calendar_with_cache(self, start_date: str = None, end_date: str = None, 
+                                     market: str = "ALL", cache_days: int = 7) -> Optional[pd.DataFrame]:
+        """获取交易日历数据（带缓存功能）
+        
+        Args:
+            start_date: 开始日期
+            end_date: 结束日期
+            market: 市场类型
+            cache_days: 缓存天数，默认7天
+            
+        Returns:
+            交易日历DataFrame
+        """
+        # 简单的缓存实现 - 在实际项目中可以使用更复杂的缓存机制
+        cache_key = f"trade_calendar_{market}_{start_date}_{end_date}"
+        
+        # 这里可以添加缓存逻辑，但为了简化，直接调用原始方法
+        return self.get_trade_calendar(start_date, end_date, market)

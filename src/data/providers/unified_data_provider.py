@@ -6,7 +6,7 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Sequence
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -47,7 +47,12 @@ class DataQualityMetrics:
 
 
 class UnifiedDataProvider(UnifiedDataProviderInterface):
-    def add_akshare_provider_with_adjust(self, as_primary: bool = True):
+    def add_akshare_provider_with_adjust(
+        self,
+        as_primary: bool = True,
+        provider: Optional["AkshareDataProvider"] = None,
+        provider_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         """
         快捷注册AkshareDataProvider，支持复权扩展能力
         """
@@ -56,19 +61,31 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
         except ImportError:
             from .akshare_provider import AkshareDataProvider
 
+        if provider is None:
+            provider_kwargs = provider_kwargs or {}
+            provider = AkshareDataProvider(**provider_kwargs)
+
         class AkshareUnifiedAdapter(DataProviderInterface):
-            def __init__(self):
-                self.provider = AkshareDataProvider()
+            def __init__(self, shared_provider: AkshareDataProvider):
+                self.provider = shared_provider
 
             def get_stock_data(self, symbol: str, start_date: str, end_date: str, adjust: str = ""):
-                # 兼容unified接口，支持adjust参数
-                if hasattr(self.provider, 'get_stock_data'):
+                if hasattr(self.provider, "get_stock_data"):
                     return self.provider.get_stock_data(symbol, start_date, end_date, adjust=adjust)
                 return None
 
             def get_stock_data_with_adjust(self, symbol: str, start_date: str, end_date: str):
-                if hasattr(self.provider, 'get_stock_data_with_adjust'):
+                if hasattr(self.provider, "get_stock_data_with_adjust"):
                     return self.provider.get_stock_data_with_adjust(symbol, start_date, end_date)
+                return None
+
+            def get_historical_data(self, symbol: str, start_date: str, end_date: str, adjust_mode: Optional[str] = None):
+                adjust_param = adjust_mode if adjust_mode in ("qfq", "hfq") else ""
+                if adjust_param and hasattr(self.provider, "get_stock_data"):
+                    return self.provider.get_stock_data(symbol, start_date, end_date, adjust=adjust_param)
+                # 默认使用不复权
+                if hasattr(self.provider, "get_stock_data"):
+                    return self.provider.get_stock_data(symbol, start_date, end_date, adjust=adjust_param)
                 return None
 
             def get_realtime_data(self, symbols):
@@ -78,10 +95,9 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
                 return self.provider.get_financial_data(symbol)
 
             def get_market_overview(self):
-                # 可选实现
                 return {}
 
-        adapter = AkshareUnifiedAdapter()
+        adapter = AkshareUnifiedAdapter(provider)
         if as_primary:
             self.add_primary_provider(adapter)
         else:
@@ -306,18 +322,34 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
         
         return metrics
     
-    def get_historical_data(self, symbol: str, start_date: str, end_date: str, 
-                          quality_threshold: float = 0.8) -> Optional[pd.DataFrame]:
+    def get_historical_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        quality_threshold: float = 0.8,
+        adjust_mode: Optional[str] = None,
+        fields: Optional[Sequence[str]] = None,
+    ) -> Optional[pd.DataFrame]:
         """获取历史数据，支持质量评估和自动切换 - 添加快速失败机制"""
-        cache_key = self._get_cache_key("historical", symbol=symbol, start_date=start_date, end_date=end_date)
+        adjust_tag = (adjust_mode or "none").lower()
+        fields_tag = ",".join(sorted(fields)) if fields else "all"
+        cache_key = self._get_cache_key(
+            "historical",
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust_tag,
+            fields=fields_tag,
+        )
         
         # 检查缓存
         cached_data = self._get_from_cache(cache_key)
         if cached_data is not None:
-            return cached_data
+            return cached_data.copy() if isinstance(cached_data, pd.DataFrame) else cached_data
         
         # 检查是否已经在处理中，防止循环调用
-        processing_key = f"historical_{symbol}_{start_date}_{end_date}"
+        processing_key = f"historical_{symbol}_{start_date}_{end_date}_{adjust_tag}_{fields_tag}"
         if not hasattr(self, '_processing_requests'):
             self._processing_requests = {}
         if self._processing_requests.get(processing_key, False):
@@ -332,14 +364,14 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
             for provider in self.primary_providers:
                 try:
                     logger.info(f"Trying primary provider {provider.__class__.__name__} for {symbol}")
-                    data = None
-                    
-                    # 优先尝试 get_historical_data 方法
-                    if hasattr(provider, 'get_historical_data'):
-                        data = provider.get_historical_data(symbol, start_date, end_date)
-                    # 其次尝试 get_stock_data 方法
-                    elif hasattr(provider, 'get_stock_data'):
-                        data = provider.get_stock_data(symbol, start_date, end_date)
+                    data = self._fetch_from_provider(
+                        provider,
+                        symbol,
+                        start_date,
+                        end_date,
+                        adjust_mode=adjust_mode,
+                        fields=fields,
+                    )
                     
                     if data is not None and not data.empty:
                         # 评估数据质量
@@ -367,14 +399,14 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
                 
                 try:
                     logger.info(f"Trying fallback provider {provider.__class__.__name__} for {symbol} (attempt {fallback_attempts + 1}/{max_fallback_attempts})")
-                    data = None
-                    
-                    # 优先尝试 get_historical_data 方法
-                    if hasattr(provider, 'get_historical_data'):
-                        data = provider.get_historical_data(symbol, start_date, end_date)
-                    # 其次尝试 get_stock_data 方法
-                    elif hasattr(provider, 'get_stock_data'):
-                        data = provider.get_stock_data(symbol, start_date, end_date)
+                    data = self._fetch_from_provider(
+                        provider,
+                        symbol,
+                        start_date,
+                        end_date,
+                        adjust_mode=adjust_mode,
+                        fields=fields,
+                    )
                     
                     if data is not None and not data.empty:
                         # 评估数据质量（备用源可以降低标准）
@@ -399,7 +431,118 @@ class UnifiedDataProvider(UnifiedDataProviderInterface):
             
         finally:
             # 清除处理标记
-            self._processing_requests[processing_key] = False
+            if hasattr(self, "_processing_requests"):
+                self._processing_requests.pop(processing_key, None)
+
+    def _fetch_from_provider(
+        self,
+        provider: DataProviderInterface,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        *,
+        adjust_mode: Optional[str] = None,
+        fields: Optional[Sequence[str]] = None,
+    ) -> Optional[pd.DataFrame]:
+        adjust_mode_lower = (adjust_mode or "").lower()
+        data: Optional[pd.DataFrame] = None
+
+        if adjust_mode_lower in ("qfq", "hfq") and hasattr(provider, "get_stock_data_with_adjust"):
+            try:
+                combined = provider.get_stock_data_with_adjust(symbol, start_date, end_date)
+            except TypeError:
+                combined = provider.get_stock_data_with_adjust(symbol, start_date, end_date)  # type: ignore[arg-type]
+            except Exception as exc:
+                logger.debug("Provider %s get_stock_data_with_adjust failed: %s", provider.__class__.__name__, exc)
+                combined = None
+
+            if combined is not None and not combined.empty:
+                adjusted = combined.copy()
+                rename_map = {
+                    f"open_{adjust_mode_lower}": "open",
+                    f"high_{adjust_mode_lower}": "high",
+                    f"low_{adjust_mode_lower}": "low",
+                    f"close_{adjust_mode_lower}": "close",
+                }
+                available_sources = [src for src in rename_map if src in adjusted.columns]
+                if len(available_sources) == len(rename_map):
+                    for src, dst in rename_map.items():
+                        adjusted[dst] = adjusted[src]
+                    adjusted = adjusted.drop(columns=available_sources, errors="ignore")
+                    data = adjusted
+                else:
+                    data = combined  # 部分列缺失时，回退到原始结果
+
+        if data is None:
+            if hasattr(provider, "get_historical_data"):
+                try:
+                    data = self._call_provider_method(
+                        provider.get_historical_data,
+                        symbol,
+                        start_date,
+                        end_date,
+                        adjust_mode=adjust_mode,
+                        fields=fields,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Provider %s get_historical_data failed: %s",
+                        provider.__class__.__name__,
+                        exc,
+                    )
+                    data = None
+
+        if data is None and hasattr(provider, "get_stock_data"):
+            adjust_param = adjust_mode_lower if adjust_mode_lower in ("qfq", "hfq") else ""
+            try:
+                data = provider.get_stock_data(symbol, start_date, end_date, adjust=adjust_param)
+            except Exception as exc:
+                logger.debug(
+                    "Provider %s get_stock_data failed: %s",
+                    provider.__class__.__name__,
+                    exc,
+                )
+                data = None
+
+        if data is not None and not data.empty and fields:
+            available = [col for col in fields if col in data.columns]
+            if available:
+                data = data.loc[:, available].copy()
+
+        return data
+
+    def _call_provider_method(
+        self,
+        func,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        *,
+        adjust_mode: Optional[str] = None,
+        fields: Optional[Sequence[str]] = None,
+    ) -> Optional[pd.DataFrame]:
+        kwargs: Dict[str, Any] = {}
+        if adjust_mode is not None:
+            kwargs["adjust_mode"] = adjust_mode
+        if fields is not None:
+            kwargs["fields"] = fields
+
+        try:
+            return func(symbol, start_date, end_date, **kwargs)
+        except TypeError as exc:
+            if "adjust_mode" in kwargs:
+                kwargs.pop("adjust_mode")
+                try:
+                    return func(symbol, start_date, end_date, **kwargs)
+                except TypeError:
+                    pass
+            if "fields" in kwargs:
+                kwargs.pop("fields")
+                try:
+                    return func(symbol, start_date, end_date, **kwargs)
+                except TypeError:
+                    pass
+            raise exc
     
     def get_realtime_data(self, symbols: List[str], max_retries: int = 3) -> Optional[Dict[str, Dict[str, Any]]]:
         """获取实时数据，支持失败重试"""

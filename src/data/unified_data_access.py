@@ -1666,6 +1666,9 @@ class UnifiedDataAccessLayer:
                 symbol,
                 start_dt.strftime("%Y-%m-%d"),
                 end_dt.strftime("%Y-%m-%d"),
+                adjust_mode=adjust_mode,
+                fields=list(fields) if fields else None,
+                quality_threshold=self.config.quality_threshold,
             )
             if missing_df is not None and not missing_df.empty:
                 df = missing_df

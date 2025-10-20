@@ -1,15 +1,15 @@
 """
-并发数据同步服务模块 - 精简版
+并发数据同步服务模块 - 接入统一数据访问层与 Akshare 限频实现
 """
 
-import logging
-import pandas as pd
-import numpy as np
-from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime, timedelta
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import logging
 import threading
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from src.data.providers.akshare_provider import AkshareDataProvider
+from src.data.unified_data_access import DataAccessConfig, UnifiedDataAccessLayer
 
 logger = logging.getLogger(__name__)
 
@@ -17,106 +17,180 @@ logger = logging.getLogger(__name__)
 class ConcurrentDataSyncService:
     """并发数据同步服务"""
 
-    def __init__(self, data_provider=None, max_workers: int = 4, config: Optional[Dict[str, Any]] = None, **kwargs):
-        """创建并发数据同步服务
+    def __init__(
+        self,
+        data_access: Optional[UnifiedDataAccessLayer] = None,
+        provider: Optional[AkshareDataProvider] = None,
+        *,
+        max_workers: int = 4,
+        config: Optional[Dict[str, Any]] = None,
+        sync_delay: float = 0.6,
+        step_days: int = 90,
+        max_retries: int = 3,
+        rollback_on_failure: bool = True,
+    ):
+        """
+        创建并发数据同步服务
 
         Args:
-            data_provider: 统一数据访问层或兼容的数据提供器实例，外部注入避免类内部重复创建
-            max_workers: 线程池大小
-            config: 其他配置
-            **kwargs: 额外参数，如 db_batch_size
+            data_access: 统一数据访问层实例，默认自动创建
+            provider: Akshare 数据提供器（共享限速器），默认自动创建
+            max_workers: 最大并发协程数量
+            config: 自定义数据访问配置
+            sync_delay: 同步间隔，建议与 provider 限速保持一致
+            step_days: 每次同步的最大区间天数
+            max_retries: 单区间最大重试次数
+            rollback_on_failure: 是否在失败时回滚该区间的数据
         """
-        self.data_provider = data_provider
         self.max_workers = max_workers
-        self.config = config or {}
-        self.db_batch_size = kwargs.get('db_batch_size', 100)  # 支持db_batch_size参数
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.sync_delay = sync_delay
+        self.sync_step_days = step_days
+        self.sync_max_retries = max_retries
+        self.rollback_on_failure = rollback_on_failure
         self.sync_status: Dict[str, Any] = {}
         self.lock = threading.Lock()
 
+        self.shared_provider = provider or AkshareDataProvider()
+        if config is None:
+            config_obj = DataAccessConfig(default_adjust_mode="origin")
+        elif isinstance(config, DataAccessConfig):
+            config_obj = config
+        else:
+            config_obj = DataAccessConfig(**config)
+
+        self.config = config_obj
+        self.data_access = data_access or UnifiedDataAccessLayer(config=self.config)
+
+        # 注册 Akshare Provider，避免重复注册
+        registered = any(
+            getattr(p, "provider", None) is self.shared_provider
+            for p in getattr(self.data_access.unified_provider, "primary_providers", [])
+        )
+        if not registered:
+            self.data_access.unified_provider.add_akshare_provider_with_adjust(
+                as_primary=True,
+                provider=self.shared_provider,
+            )
+
         logger.info(
-            f"ConcurrentDataSyncService 初始化完成，工作线程数: {max_workers}, 批次大小: {self.db_batch_size}"
+            "ConcurrentDataSyncService 初始化完成: workers=%s, step_days=%s, max_retries=%s, delay=%.2fs",
+            max_workers,
+            step_days,
+            max_retries,
+            sync_delay,
         )
 
     async def sync_stock_data(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, Any]:
-        """同步股票数据"""
-        logger.info(f"开始同步 {len(stock_codes)} 只股票的数据")
-        
-        # 将股票代码分组以支持并发处理
-        batch_size = min(10, max(1, len(stock_codes) // self.max_workers))
-        batches = [stock_codes[i:i + batch_size] for i in range(0, len(stock_codes), batch_size)]
-        
-        tasks = []
-        for batch in batches:
-            task = asyncio.create_task(self._sync_batch(batch, start_date, end_date))
-            tasks.append(task)
-        
-        # 等待所有任务完成
+        """同步指定股票在给定日期区间内的数据"""
+        if not stock_codes:
+            return {
+                "total_stocks": 0,
+                "successful": 0,
+                "failed": 0,
+                "synced_rows": 0,
+                "errors": [],
+                "sync_time": datetime.now().isoformat(),
+            }
+
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+        logger.info("开始同步 %s 支股票: %s -> %s", len(stock_codes), start_date, end_date)
+
+        semaphore = asyncio.Semaphore(self.max_workers)
+        tasks = [
+            asyncio.create_task(self._sync_single_symbol(semaphore, symbol, start_dt, end_dt))
+            for symbol in stock_codes
+        ]
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # 合并结果
-        sync_summary = {
-            'total_stocks': len(stock_codes),
-            'successful': 0,
-            'failed': 0,
-            'errors': [],
-            'sync_time': datetime.now().isoformat()
+
+        summary = {
+            "total_stocks": len(stock_codes),
+            "successful": 0,
+            "failed": 0,
+            "synced_rows": 0,
+            "errors": [],
+            "sync_time": datetime.now().isoformat(),
         }
-        
+
         for result in results:
             if isinstance(result, Exception):
-                sync_summary['errors'].append(str(result))
-                sync_summary['failed'] += 1
+                summary["failed"] += 1
+                summary["errors"].append(str(result))
+                continue
+
+            if result.get("success"):
+                summary["successful"] += 1
+                summary["synced_rows"] += result.get("synced_rows", 0)
             else:
-                if result.get('success', False):
-                    sync_summary['successful'] += result.get('count', 0)
-                else:
-                    sync_summary['failed'] += 1
-                    if 'error' in result:
-                        sync_summary['errors'].append(result['error'])
-        
-        logger.info(f"数据同步完成: 成功 {sync_summary['successful']}, 失败 {sync_summary['failed']}")
-        return sync_summary
-    
-    async def _sync_batch(self, stock_codes: List[str], start_date: str, end_date: str) -> Dict[str, Any]:
-        """同步一批股票数据"""
-        try:
-            # 模拟数据同步过程
-            await asyncio.sleep(0.1)  # 模拟网络延迟
-            
+                summary["failed"] += 1
+                if "error" in result:
+                    summary["errors"].append(result["error"])
+
+        logger.info(
+            "同步完成: 成功 %s, 失败 %s, 新增记录 %s",
+            summary["successful"],
+            summary["failed"],
+            summary["synced_rows"],
+        )
+        return summary
+
+    async def _sync_single_symbol(
+        self,
+        semaphore: asyncio.Semaphore,
+        symbol: str,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> Dict[str, Any]:
+        async with semaphore:
             with self.lock:
-                for code in stock_codes:
-                    self.sync_status[code] = {
-                        'status': 'syncing',
-                        'last_sync': datetime.now().isoformat(),
-                        'progress': 0
+                self.sync_status[symbol] = {
+                    "status": "syncing",
+                    "last_sync": datetime.now().isoformat(),
+                    "progress": 0,
+                }
+
+            try:
+                stats = await self.data_access.sync_market_data_by_date(
+                    symbol=symbol,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    step_days=self.sync_step_days,
+                    delay=self.sync_delay,
+                    max_retries=self.sync_max_retries,
+                    rollback_on_failure=self.rollback_on_failure,
+                )
+
+                with self.lock:
+                    self.sync_status[symbol] = {
+                        "status": "completed",
+                        "last_sync": datetime.now().isoformat(),
+                        "progress": 100,
+                        "synced_rows": stats.get("synced", 0),
                     }
-            
-            # 模拟数据处理
-            await asyncio.sleep(0.2)
-            
-            # 更新状态
-            with self.lock:
-                for code in stock_codes:
-                    self.sync_status[code] = {
-                        'status': 'completed',
-                        'last_sync': datetime.now().isoformat(),
-                        'progress': 100
+
+                return {
+                    "success": True,
+                    "symbol": symbol,
+                    "synced_rows": stats.get("synced", 0),
+                }
+
+            except Exception as exc:
+                logger.error("同步 %s 失败: %s", symbol, exc)
+                with self.lock:
+                    self.sync_status[symbol] = {
+                        "status": "failed",
+                        "last_sync": datetime.now().isoformat(),
+                        "progress": 0,
+                        "error": str(exc),
                     }
-            
-            return {
-                'success': True,
-                'count': len(stock_codes),
-                'codes': stock_codes
-            }
-            
-        except Exception as e:
-            logger.error(f"同步批次失败: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'count': 0
-            }
+                return {
+                    "success": False,
+                    "symbol": symbol,
+                    "synced_rows": 0,
+                    "error": str(exc),
+                }
     
     def get_sync_status(self, stock_code: Optional[str] = None) -> Dict[str, Any]:
         """获取同步状态"""
@@ -159,10 +233,17 @@ class ConcurrentDataSyncService:
             'max_workers': self.max_workers,
             'service_status': 'running'
         }
-    
+        return {
+            "total_syncs": total_syncs,
+            "completed_syncs": completed_syncs,
+            "syncing_syncs": syncing_syncs,
+            "success_rate": completed_syncs / total_syncs if total_syncs > 0 else 0,
+            "max_workers": self.max_workers,
+            "service_status": "running",
+        }
+
     def shutdown(self) -> None:
         """关闭服务"""
-        self.executor.shutdown(wait=True)
         logger.info("ConcurrentDataSyncService 已关闭")
 
 
