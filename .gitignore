@@ -97,6 +97,7 @@ chromedriver/
 *.bak
 *.backup
 *.old
+*.backup_*
 
 # 系统文件
 Thumbs.db
@@ -142,7 +143,9 @@ R2_*.md
 *_REPORT.md
 BATCH_*.md
 FUNDAMENTAL_*.md
-
+STAGE*_*.md
+*_stage*.py
 
 # 批处理
 *.sh
+ABSOLUTE_THRESHOLD_QUICK_START.md
