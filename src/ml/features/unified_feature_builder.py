@@ -322,6 +322,7 @@ class UnifiedFeatureBuilder:
                 df_features = self._add_fundamental_features(df_features, as_of_date=None)
                 # _add_fundamental_features会保留symbol列，这里不需要删除
             
+            df_features = df_features.loc[:, ~df_features.columns.duplicated()]
             return df_features
             
         except Exception as e:
@@ -549,6 +550,21 @@ class UnifiedFeatureBuilder:
         
         df_fundamental = pd.concat(fundamentals_frames, ignore_index=True)
         df_fundamental = df_fundamental.loc[:, ~df_fundamental.columns.duplicated()]
+        if df_fundamental.empty:
+            return df
+
+        rename_map: Dict[str, str] = {}
+        existing_cols = set(df.columns) - {'symbol', 'date'}
+        for col in df_fundamental.columns:
+            if col in {'symbol', 'date'}:
+                continue
+            target = col
+            if target in existing_cols or target in rename_map.values():
+                target = f"fund_{col}"
+            rename_map[col] = target
+
+        if rename_map:
+            df_fundamental.rename(columns=rename_map, inplace=True)
         
         merged = df.merge(
             df_fundamental,

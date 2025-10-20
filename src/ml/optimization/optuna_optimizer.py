@@ -78,6 +78,126 @@ class OptunaOptimizer:
         
         logger.info(f"Optuna优化器初始化: {self.n_trials} trials, {self.sampler_type} sampler")
     
+    def _analyze_data_complexity(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
+        """
+        分析数据复杂度，为参数调整提供依据
+        
+        Parameters
+        ----------
+        X : DataFrame
+            特征数据
+        y : Series
+            目标变量
+            
+        Returns
+        -------
+        complexity_metrics : dict
+            数据复杂度指标:
+            - n_samples: 样本数量
+            - n_features: 特征数量
+            - feature_density: 特征密度 (非零特征比例)
+            - target_variance: 目标变量方差
+            - complexity_score: 综合复杂度评分
+        """
+        n_samples, n_features = X.shape
+        
+        # 计算特征密度 (非零特征比例)
+        if hasattr(X, 'sparse'):
+            feature_density = (X != 0).sum().sum() / (n_samples * n_features)
+        else:
+            feature_density = 1.0  # 稠密矩阵
+        
+        # 目标变量方差
+        target_variance = y.var() if len(y) > 1 else 0.0
+        
+        # 综合复杂度评分 (0-1范围)
+        complexity_score = min(1.0, 
+            (n_samples / 10000) * 0.3 +  # 样本规模影响
+            (n_features / 100) * 0.3 +   # 特征规模影响
+            feature_density * 0.2 +       # 特征密度影响
+            (target_variance / 10) * 0.2  # 目标复杂度影响
+        )
+        
+        metrics = {
+            'n_samples': n_samples,
+            'n_features': n_features,
+            'feature_density': feature_density,
+            'target_variance': target_variance,
+            'complexity_score': complexity_score
+        }
+        
+        logger.info(f"📊 数据复杂度分析: {n_samples}样本, {n_features}特征, "
+                   f"密度{feature_density:.3f}, 复杂度评分{complexity_score:.3f}")
+        
+        return metrics
+    
+    def _adjust_parameter_ranges(self, base_params: Dict[str, Any], 
+                                complexity_metrics: Dict[str, float],
+                                model_type: str) -> Dict[str, Any]:
+        """
+        基于数据复杂度动态调整参数搜索范围
+        
+        Parameters
+        ----------
+        base_params : dict
+            基础参数搜索范围
+        complexity_metrics : dict
+            数据复杂度指标
+        model_type : str
+            模型类型 ('xgboost_classification', 'xgboost_regression', 'lightgbm_classification')
+            
+        Returns
+        -------
+        adjusted_params : dict
+            调整后的参数搜索范围
+        """
+        complexity_score = complexity_metrics['complexity_score']
+        n_samples = complexity_metrics['n_samples']
+        n_features = complexity_metrics['n_features']
+        
+        adjusted_params = base_params.copy()
+        
+        # 基于样本量调整参数
+        if n_samples < 1000:
+            # 小样本数据：减少模型复杂度
+            if 'n_estimators' in adjusted_params:
+                adjusted_params['n_estimators'] = (50, 300)  # 减少树的数量
+            if 'max_depth' in adjusted_params:
+                adjusted_params['max_depth'] = (2, 6)  # 降低树深度
+            if 'learning_rate' in adjusted_params:
+                adjusted_params['learning_rate'] = (0.01, 0.3)  # 提高学习率
+        elif n_samples > 10000:
+            # 大样本数据：增加模型复杂度
+            if 'n_estimators' in adjusted_params:
+                adjusted_params['n_estimators'] = (200, 1000)  # 增加树的数量
+            if 'max_depth' in adjusted_params:
+                adjusted_params['max_depth'] = (5, 12)  # 增加树深度
+            if 'learning_rate' in adjusted_params:
+                adjusted_params['learning_rate'] = (0.001, 0.2)  # 降低学习率
+        
+        # 基于特征数量调整正则化参数
+        if n_features >= 50:
+            # 高维特征：加强正则化
+            if 'reg_alpha' in adjusted_params:
+                adjusted_params['reg_alpha'] = (0.1, 20.0)  # 增加L1正则化
+            if 'reg_lambda' in adjusted_params:
+                adjusted_params['reg_lambda'] = (0.1, 20.0)  # 增加L2正则化
+            if 'colsample_bytree' in adjusted_params:
+                adjusted_params['colsample_bytree'] = (0.3, 0.8)  # 降低特征采样率
+        
+        # 基于复杂度评分微调
+        if complexity_score > 0.7:
+            # 高复杂度数据：增加正则化
+            if 'gamma' in adjusted_params:
+                adjusted_params['gamma'] = (1.0, 20.0)  # 增加分裂阈值
+            if 'min_child_weight' in adjusted_params:
+                adjusted_params['min_child_weight'] = (5, 30)  # 增加叶子节点最小样本
+        
+        logger.info(f"🔧 基于数据复杂度调整参数范围: {model_type}")
+        logger.info(f"   样本量: {n_samples}, 特征数: {n_features}, 复杂度: {complexity_score:.3f}")
+        
+        return adjusted_params
+    
     def optimize_xgboost_classification(
         self,
         X: pd.DataFrame,
@@ -108,18 +228,37 @@ class OptunaOptimizer:
         logger.info("开始XGBoost分类器超参数优化")
         logger.info("="*80)
         
+        # 分析数据复杂度
+        complexity_metrics = self._analyze_data_complexity(X, y)
+        
+        # 基础参数搜索范围
+        base_params = {
+            'n_estimators': (100, 800),  # 🔧 扩展到100-800
+            'max_depth': (3, 5),
+            'learning_rate': (0.01, 0.2),
+            'subsample': (0.5, 0.75),
+            'colsample_bytree': (0.5, 0.8),
+            'min_child_weight': (5, 40),
+            'gamma': (0.5, 10.0),
+            'reg_alpha': (2, 20.0),
+            'reg_lambda': (2, 20.0),
+        }
+        
+        # 基于数据复杂度动态调整参数范围
+        adjusted_params = self._adjust_parameter_ranges(base_params, complexity_metrics, 'xgboost_classification')
+        
         def objective(trial):
-            # 定义搜索空间 - 🔧 修复: 加强正则化约束，防止过拟合
+            # 使用调整后的参数范围 - 🔧 第一阶段优化: 数据驱动参数调整
             params = {
-                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                'max_depth': trial.suggest_int('max_depth', 3, 6),  # 🔧 从3-10改为3-6
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'subsample': trial.suggest_float('subsample', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'min_child_weight': trial.suggest_int('min_child_weight', 1, 15),  # 🔧 从1-10改为5-15
-                'gamma': trial.suggest_float('gamma', 0.1, 10.0),  # 🔧 从0-5改为0.1=5
-                'reg_alpha': trial.suggest_float('reg_alpha', 3.0, 10.0),  # 🔧 从0-10改为3-10
-                'reg_lambda': trial.suggest_float('reg_lambda', 5.0, 10.0),  # 🔧 从0-10改为5-10
+                'n_estimators': trial.suggest_int('n_estimators', *adjusted_params['n_estimators']),
+                'max_depth': trial.suggest_int('max_depth', *adjusted_params['max_depth']),
+                'learning_rate': trial.suggest_float('learning_rate', *adjusted_params['learning_rate'], log=True),
+                'subsample': trial.suggest_float('subsample', *adjusted_params['subsample']),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', *adjusted_params['colsample_bytree']),
+                'min_child_weight': trial.suggest_int('min_child_weight', *adjusted_params['min_child_weight']),
+                'gamma': trial.suggest_float('gamma', *adjusted_params['gamma']),
+                'reg_alpha': trial.suggest_float('reg_alpha', *adjusted_params['reg_alpha']),
+                'reg_lambda': trial.suggest_float('reg_lambda', *adjusted_params['reg_lambda']),
                 'random_state': 42,
                 'verbosity': 0,
                 'n_jobs': 1  # 避免嵌套并行
@@ -129,9 +268,15 @@ class OptunaOptimizer:
             tscv = TimeSeriesSplit(n_splits=self.cv_folds)
             cv_scores = []
             
-            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
-                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            # 处理numpy数组和pandas DataFrame
+            if hasattr(X, 'iloc'):  # pandas DataFrame
+                for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+                    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            else:  # numpy数组
+                for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+                    X_train, X_val = X[train_idx], X[val_idx]
+                    y_train, y_val = y[train_idx], y[val_idx]
                 
                 # 训练模型
                 model = xgb.XGBClassifier(**params)
@@ -222,18 +367,37 @@ class OptunaOptimizer:
         logger.info("开始XGBoost回归器超参数优化")
         logger.info("="*80)
         
+        # 分析数据复杂度
+        complexity_metrics = self._analyze_data_complexity(X, y)
+        
+        # 基础参数搜索范围
+        base_params = {
+            'n_estimators': (100, 800),  # 🔧 扩展到100-800
+            'max_depth': (3, 8),  # 🔧 从3-4扩展到3-8
+            'learning_rate': (0.005, 0.5),  # 🔧 扩展到0.005-0.5
+            'subsample': (0.5, 0.9),  # 🔧 从0.6-0.8扩展到0.5-0.9
+            'colsample_bytree': (0.5, 0.9),  # 🔧 从0.6-0.8扩展到0.5-0.9
+            'min_child_weight': (1, 20),  # 🔧 扩展到1-20
+            'gamma': (0.0, 15.0),  # 🔧 扩展到0-15
+            'reg_alpha': (0.0, 15.0),  # 🔧 从3-10扩展到0-15
+            'reg_lambda': (0.0, 15.0),  # 🔧 从5-10扩展到0-15
+        }
+        
+        # 基于数据复杂度动态调整参数范围
+        adjusted_params = self._adjust_parameter_ranges(base_params, complexity_metrics, 'xgboost_regression')
+        
         def objective(trial):
-            # 🔧 修复: 加强正则化约束，防止过拟合
+            # 使用调整后的参数范围 - 🔧 第一阶段优化: 数据驱动参数调整
             params = {
-                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                'max_depth': trial.suggest_int('max_depth', 3, 4),  # 🔧 从3-10改为3-4
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'subsample': trial.suggest_float('subsample', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'min_child_weight': trial.suggest_int('min_child_weight', 5, 15),  # 🔧 从1-10改为5-15
-                'gamma': trial.suggest_float('gamma', 1.0, 5.0),  # 🔧 从0-5改为1-5
-                'reg_alpha': trial.suggest_float('reg_alpha', 3.0, 10.0),  # 🔧 从0-10改为3-10
-                'reg_lambda': trial.suggest_float('reg_lambda', 5.0, 10.0),  # 🔧 从0-10改为5-10
+                'n_estimators': trial.suggest_int('n_estimators', *adjusted_params['n_estimators']),
+                'max_depth': trial.suggest_int('max_depth', *adjusted_params['max_depth']),
+                'learning_rate': trial.suggest_float('learning_rate', *adjusted_params['learning_rate'], log=True),
+                'subsample': trial.suggest_float('subsample', *adjusted_params['subsample']),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', *adjusted_params['colsample_bytree']),
+                'min_child_weight': trial.suggest_int('min_child_weight', *adjusted_params['min_child_weight']),
+                'gamma': trial.suggest_float('gamma', *adjusted_params['gamma']),
+                'reg_alpha': trial.suggest_float('reg_alpha', *adjusted_params['reg_alpha']),
+                'reg_lambda': trial.suggest_float('reg_lambda', *adjusted_params['reg_lambda']),
                 'random_state': 42,
                 'verbosity': 0,
                 'n_jobs': 1
@@ -242,9 +406,15 @@ class OptunaOptimizer:
             tscv = TimeSeriesSplit(n_splits=self.cv_folds)
             cv_scores = []
             
-            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
-                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            # 处理numpy数组和pandas DataFrame
+            if hasattr(X, 'iloc'):  # pandas DataFrame
+                for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+                    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            else:  # numpy数组
+                for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+                    X_train, X_val = X[train_idx], X[val_idx]
+                    y_train, y_val = y[train_idx], y[val_idx]
                 
                 model = xgb.XGBRegressor(**params)
                 model.fit(
@@ -314,17 +484,35 @@ class OptunaOptimizer:
         logger.info("开始LightGBM分类器超参数优化")
         logger.info("="*80)
         
+        # 分析数据复杂度
+        complexity_metrics = self._analyze_data_complexity(X, y)
+        
+        # 基础参数搜索范围
+        base_params = {
+            'n_estimators': (100, 800),  # 🔧 扩展到100-800
+            'max_depth': (3, 8),  # 🔧 从3-4扩展到3-8
+            'learning_rate': (0.005, 0.5),  # 🔧 扩展到0.005-0.5
+            'subsample': (0.5, 0.9),  # 🔧 从0.6-0.8扩展到0.5-0.9
+            'colsample_bytree': (0.5, 0.9),  # 🔧 从0.6-0.8扩展到0.5-0.9
+            'min_child_samples': (10, 150),  # 🔧 扩展到10-150
+            'reg_alpha': (0.0, 15.0),  # 🔧 从3-10扩展到0-15
+            'reg_lambda': (0.0, 15.0),  # 🔧 从5-10扩展到0-15
+        }
+        
+        # 基于数据复杂度动态调整参数范围
+        adjusted_params = self._adjust_parameter_ranges(base_params, complexity_metrics, 'lightgbm_classification')
+        
         def objective(trial):
-            # 🔧 修复: 加强正则化约束，防止过拟合
+            # 使用调整后的参数范围 - 🔧 第一阶段优化: 数据驱动参数调整
             params = {
-                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                'max_depth': trial.suggest_int('max_depth', 3, 4),  # 🔧 从3-10改为3-4
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'subsample': trial.suggest_float('subsample', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.8),  # 🔧 从0.6-1.0改为0.6-0.8
-                'min_child_samples': trial.suggest_int('min_child_samples', 20, 100),  # 🔧 从5-100改为20-100
-                'reg_alpha': trial.suggest_float('reg_alpha', 3.0, 10.0),  # 🔧 从0-10改为3-10
-                'reg_lambda': trial.suggest_float('reg_lambda', 5.0, 10.0),  # 🔧 从0-10改为5-10
+                'n_estimators': trial.suggest_int('n_estimators', *adjusted_params['n_estimators']),
+                'max_depth': trial.suggest_int('max_depth', *adjusted_params['max_depth']),
+                'learning_rate': trial.suggest_float('learning_rate', *adjusted_params['learning_rate'], log=True),
+                'subsample': trial.suggest_float('subsample', *adjusted_params['subsample']),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', *adjusted_params['colsample_bytree']),
+                'min_child_samples': trial.suggest_int('min_child_samples', *adjusted_params['min_child_samples']),
+                'reg_alpha': trial.suggest_float('reg_alpha', *adjusted_params['reg_alpha']),
+                'reg_lambda': trial.suggest_float('reg_lambda', *adjusted_params['reg_lambda']),
                 'random_state': 42,
                 'verbosity': -1,
                 'n_jobs': 1
