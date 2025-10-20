@@ -196,7 +196,29 @@ class FundamentalFeatureGenerator:
         daily_valuation_df = self.data_manager.get_daily_valuation_history(std_symbol_with_suffix, start_buffer, end_date)
         if daily_valuation_df.empty and std_symbol_with_suffix != std_symbol:
             daily_valuation_df = self.data_manager.get_daily_valuation_history(std_symbol, start_buffer, end_date)
-        
+
+        if self.data_manager and (quarterly_df.empty or daily_valuation_df.empty):
+            try:
+                logger.info("%s: 基本面缓存缺失，触发数据刷新 (quarterly_empty=%s, daily_empty=%s)",
+                            symbol, quarterly_df.empty, daily_valuation_df.empty)
+                refresh_symbol = std_symbol_with_suffix
+                self.data_manager.bulk_update_from_akshare(
+                    symbols=[refresh_symbol],
+                    start_date=start_buffer.strftime('%Y-%m-%d'),
+                    end_date=end_date.strftime('%Y-%m-%d'),
+                    update_quarterly=quarterly_df.empty,
+                    update_daily=daily_valuation_df.empty,
+                    max_retries=2,
+                    retry_delay=1.0,
+                    per_symbol_sleep=0
+                )
+                if quarterly_df.empty:
+                    quarterly_df = self.data_manager.get_quarterly_history(refresh_symbol, start_buffer, end_date)
+                if daily_valuation_df.empty:
+                    daily_valuation_df = self.data_manager.get_daily_valuation_history(refresh_symbol, start_buffer, end_date)
+            except Exception as refresh_exc:
+                logger.warning("%s: 基本面数据刷新失败 - %s", symbol, refresh_exc)
+
         feature_df = pd.DataFrame(index=date_index)
         
         if not daily_valuation_df.empty:
@@ -250,6 +272,9 @@ class FundamentalFeatureGenerator:
             feature_df.drop(columns=empty_cols, inplace=True)
         feature_df['symbol'] = symbol
         feature_df = feature_df.reset_index().rename(columns={'index': 'date'})
+
+        if len(feature_df.columns) <= 2:
+            logger.warning("%s: 基本面特征刷新后仍为空，返回占位列", symbol)
         return feature_df
     
     def _validate_features(self, features: Dict[str, float]) -> Dict[str, float]:

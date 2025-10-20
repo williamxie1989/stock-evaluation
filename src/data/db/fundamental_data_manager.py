@@ -23,6 +23,10 @@ from datetime import datetime, timedelta, date
 import logging
 import akshare as ak
 from contextlib import contextmanager
+from urllib.parse import quote_plus
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,36 @@ class FundamentalDataManager:
             统一数据库管理器
         """
         self.db_manager = db_manager
+        self._engine: Optional[Engine] = None
         self._ensure_tables()
+    
+    def _get_sqlalchemy_engine(self) -> Engine:
+        """获取或创建 SQLAlchemy Engine，避免 pandas 对非受支持连接的告警。"""
+        if self._engine is not None:
+            return self._engine
+        
+        db_type = getattr(self.db_manager, 'db_type', 'sqlite')
+        config = getattr(self.db_manager, 'config', {})
+        
+        if db_type == 'mysql':
+            user = config.get('user', '')
+            password = config.get('password', '')
+            host = config.get('host', 'localhost')
+            port = config.get('port', 3306)
+            database = config.get('database', '')
+            charset = config.get('charset', 'utf8mb4')
+            # 使用quote_plus防止特殊字符导致的解析问题
+            user_enc = quote_plus(str(user))
+            password_enc = quote_plus(str(password))
+            url = f"mysql+mysqlconnector://{user_enc}:{password_enc}@{host}:{port}/{database}?charset={charset}"
+            self._engine = create_engine(url, pool_pre_ping=True)
+        else:
+            # 默认SQLite
+            database_path = config.get('database', ':memory:')
+            url = f"sqlite:///{database_path}"
+            self._engine = create_engine(url)
+        
+        return self._engine
     
     def _ensure_tables(self):
         """确保基本面数据表存在"""
@@ -368,27 +401,31 @@ class FundamentalDataManager:
             # 计算起始日期（往前推2年）
             start_date = end_date - timedelta(days=365 * 2)
             
-            with self.db_manager.get_connection() as conn:
-                sql = """
-                    SELECT * FROM fundamental_data_quarterly
-                    WHERE symbol = %s
-                      AND report_date <= %s
-                      AND report_date >= %s
-                    ORDER BY report_date DESC
-                    LIMIT %s
-                """
-                
-                df = pd.read_sql(
-                    sql, 
-                    conn, 
-                    params=(symbol, end_date.date(), start_date.date(), lookback_quarters)
-                )
-                
-                if df.empty:
-                    return None
-                
-                return df
+            # 使用SQLAlchemy连接字符串避免pandas警告
+            from sqlalchemy import create_engine
+            conn_str = self.db_manager.get_connection_string()
+            engine = create_engine(conn_str)
             
+            sql = """
+                SELECT * FROM fundamental_data_quarterly
+                WHERE symbol = %s
+                  AND report_date <= %s
+                  AND report_date >= %s
+                ORDER BY report_date DESC
+                LIMIT %s
+            """
+            
+            df = pd.read_sql(
+                sql, 
+                engine, 
+                params=(symbol, end_date.date(), start_date.date(), lookback_quarters)
+            )
+            
+            if df.empty:
+                return None
+            
+            return df
+        
         except Exception as e:
             logger.debug(f"{symbol}: 读取季度数据失败 - {e}")
             return None
@@ -414,21 +451,25 @@ class FundamentalDataManager:
             估值数据
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                sql = """
-                    SELECT * FROM fundamental_data_daily
-                    WHERE symbol = %s
-                      AND trade_date = %s
-                    LIMIT 1
-                """
-                
-                df = pd.read_sql(sql, conn, params=(symbol, trade_date.date()))
-                
-                if df.empty:
-                    return None
-                
-                return df.iloc[0]
+            # 使用SQLAlchemy连接字符串避免pandas警告
+            from sqlalchemy import create_engine
+            conn_str = self.db_manager.get_connection_string()
+            engine = create_engine(conn_str)
             
+            sql = """
+                SELECT * FROM fundamental_data_daily
+                WHERE symbol = %s
+                  AND trade_date = %s
+                LIMIT 1
+            """
+            
+            df = pd.read_sql(sql, engine, params=(symbol, trade_date.date()))
+            
+            if df.empty:
+                return None
+            
+            return df.iloc[0]
+        
         except Exception as e:
             logger.debug(f"{symbol}@{trade_date.date()}: 读取估值数据失败 - {e}")
             return None
@@ -443,28 +484,28 @@ class FundamentalDataManager:
         获取指定区间的全部季度财务数据
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                sql = """
-                    SELECT symbol, report_date, publish_date,
-                           revenue, net_profit, gross_profit_margin, net_profit_margin,
-                           roe, roa, eps, revenue_yoy, net_profit_yoy,
-                           debt_to_asset, current_ratio, quick_ratio,
-                           operating_cash_flow, total_assets, total_equity
-                    FROM fundamental_data_quarterly
-                    WHERE symbol = %s
-                      AND report_date BETWEEN %s AND %s
-                    ORDER BY COALESCE(publish_date, report_date)
-                """
-                df = pd.read_sql(
-                    sql,
-                    conn,
-                    params=(
-                        symbol,
-                        pd.Timestamp(start_date).date(),
-                        pd.Timestamp(end_date).date()
-                    )
+            sql = """
+                SELECT symbol, report_date, publish_date,
+                       revenue, net_profit, gross_profit_margin, net_profit_margin,
+                       roe, roa, eps, revenue_yoy, net_profit_yoy,
+                       debt_to_asset, current_ratio, quick_ratio,
+                       operating_cash_flow, total_assets, total_equity
+                FROM fundamental_data_quarterly
+                WHERE symbol = %s
+                  AND report_date BETWEEN %s AND %s
+                ORDER BY COALESCE(publish_date, report_date)
+            """
+            engine = self._get_sqlalchemy_engine()
+            df = pd.read_sql(
+                sql,
+                engine,
+                params=(
+                    symbol,
+                    pd.Timestamp(start_date).date(),
+                    pd.Timestamp(end_date).date()
                 )
-                return df
+            )
+            return df
         except Exception as e:
             logger.debug(f"{symbol}: 区间季度数据读取失败 - {e}")
             return pd.DataFrame()
@@ -479,25 +520,25 @@ class FundamentalDataManager:
         获取指定区间的日度估值数据
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                sql = """
-                    SELECT symbol, trade_date,
-                           pe_ttm, pb
-                    FROM fundamental_data_daily
-                    WHERE symbol = %s
-                      AND trade_date BETWEEN %s AND %s
-                    ORDER BY trade_date
-                """
-                df = pd.read_sql(
-                    sql,
-                    conn,
-                    params=(
-                        symbol,
-                        pd.Timestamp(start_date).date(),
-                        pd.Timestamp(end_date).date()
-                    )
+            sql = """
+                SELECT symbol, trade_date,
+                       pe_ttm, pb
+                FROM fundamental_data_daily
+                WHERE symbol = %s
+                  AND trade_date BETWEEN %s AND %s
+                ORDER BY trade_date
+            """
+            engine = self._get_sqlalchemy_engine()
+            df = pd.read_sql(
+                sql,
+                engine,
+                params=(
+                    symbol,
+                    pd.Timestamp(start_date).date(),
+                    pd.Timestamp(end_date).date()
                 )
-                return df
+            )
+            return df
         except Exception as e:
             logger.debug(f"{symbol}: 区间估值数据读取失败 - {e}")
             return pd.DataFrame()
@@ -610,45 +651,49 @@ class FundamentalDataManager:
             数据覆盖统计
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                # 查询每只股票的数据记录数
-                placeholders = ','.join(['%s'] * len(symbols))
-                sql = f"""
-                    SELECT 
-                        symbol,
-                        COUNT(*) as quarterly_count,
-                        MIN(report_date) as earliest_quarter,
-                        MAX(report_date) as latest_quarter
-                    FROM fundamental_data_quarterly
-                    WHERE symbol IN ({placeholders})
-                    GROUP BY symbol
-                """
-                
-                df_quarterly = pd.read_sql(sql, conn, params=symbols)
-                
-                sql = f"""
-                    SELECT 
-                        symbol,
-                        COUNT(*) as daily_count,
-                        MIN(trade_date) as earliest_date,
-                        MAX(trade_date) as latest_date
-                    FROM fundamental_data_daily
-                    WHERE symbol IN ({placeholders})
-                    GROUP BY symbol
-                """
-                
-                df_daily = pd.read_sql(sql, conn, params=symbols)
-                
-                # 合并结果
-                df = pd.merge(
-                    df_quarterly, 
-                    df_daily, 
-                    on='symbol', 
-                    how='outer', 
-                    suffixes=('_quarterly', '_daily')
-                )
-                
-                return df
+            # 使用SQLAlchemy连接字符串避免pandas警告
+            from sqlalchemy import create_engine
+            conn_str = self.db_manager.get_connection_string()
+            engine = create_engine(conn_str)
+            
+            # 查询每只股票的数据记录数
+            placeholders = ','.join(['%s'] * len(symbols))
+            sql = f"""
+                SELECT 
+                    symbol,
+                    COUNT(*) as quarterly_count,
+                    MIN(report_date) as earliest_quarter,
+                    MAX(report_date) as latest_quarter
+                FROM fundamental_data_quarterly
+                WHERE symbol IN ({placeholders})
+                GROUP BY symbol
+            """
+            
+            df_quarterly = pd.read_sql(sql, engine, params=symbols)
+            
+            sql = f"""
+                SELECT 
+                    symbol,
+                    COUNT(*) as daily_count,
+                    MIN(trade_date) as earliest_date,
+                    MAX(trade_date) as latest_date
+                FROM fundamental_data_daily
+                WHERE symbol IN ({placeholders})
+                GROUP BY symbol
+            """
+            
+            df_daily = pd.read_sql(sql, engine, params=symbols)
+            
+            # 合并结果
+            df = pd.merge(
+                df_quarterly, 
+                df_daily, 
+                on='symbol', 
+                how='outer', 
+                suffixes=('_quarterly', '_daily')
+            )
+            
+            return df
             
         except Exception as e:
             logger.error(f"查询数据覆盖率失败: {e}")
