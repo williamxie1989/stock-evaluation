@@ -6,11 +6,14 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import joblib
 import os
+import json
+import hashlib
+from pathlib import Path
 
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
@@ -29,6 +32,8 @@ if project_root not in sys.path:
 
 from config.prediction_config import *
 from src.ml.preprocessing.winsorizer import Winsorizer
+from src.ml.preprocessing.feature_selection import select_features_for_task, SafeSimpleImputer
+from pandas.util import hash_pandas_object
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +217,15 @@ class EnhancedTrainerV2:
             logger.info("  ✅ 特征选择: 已启用")
             logger.info(f"     方法: {self.config.get('feature_selection_method', 'lightgbm')}")
             logger.info(f"     范围: {self.config.get('min_features', 15)}-{self.config.get('max_features', 30)} 特征")
+            if self.config.get('feature_selection_method', 'lightgbm') == 'shap':
+                logger.info("     SHAP 抽样: %s, 背景: %s",
+                            self.config.get('shap_sample_size'),
+                            self.config.get('shap_background_size'))
+
+        self.enable_sample_weighting = bool(self.config.get('enable_sample_weighting', False))
+        self.sample_weight_halflife = float(self.config.get('sample_weight_halflife', SAMPLE_WEIGHT_HALFLIFE_YEARS))
+        if self.enable_sample_weighting:
+            logger.info("  ✅ 样本加权: 已启用 (半衰期=%.2f年)", self.sample_weight_halflife)
         
         # Stage 5: Optuna超参数优化配置
         self.enable_optuna = self.config.get('enable_optuna', False)
@@ -219,6 +233,17 @@ class EnhancedTrainerV2:
             logger.info("  ✅ Optuna优化: 已启用")
             logger.info(f"     试验次数: {self.config.get('optuna_trials', 100)}")
             logger.info(f"     采样器: {self.config.get('optuna_sampler', 'tpe')}")
+
+        # 数据驱动参数调整配置
+        self.enable_data_driven_param_adjustment = self.config.get('enable_data_driven_param_adjustment', ENABLE_DATA_DRIVEN_PARAM_ADJUSTMENT)
+        self.data_driven_adjustment_mode = self.config.get('data_driven_adjustment_mode', DATA_DRIVEN_ADJUSTMENT_MODE)
+        if self.enable_data_driven_param_adjustment:
+            logger.info("  ✅ 数据驱动参数调整: 已启用")
+            logger.info(f"     模式: {self.data_driven_adjustment_mode}")
+            logger.info(f"     小样本阈值: {self.config.get('small_sample_threshold', SMALL_SAMPLE_THRESHOLD)}")
+            logger.info(f"     大样本阈值: {self.config.get('large_sample_threshold', LARGE_SAMPLE_THRESHOLD)}")
+            logger.info(f"     高维特征阈值: {self.config.get('high_dimension_threshold', HIGH_DIMENSION_THRESHOLD)}")
+            logger.info(f"     高复杂度阈值: {self.config.get('high_complexity_threshold', HIGH_COMPLEXITY_THRESHOLD)}")
 
         self.cv_fold_info: List[Dict[str, Any]] = []
         self._cv_sorted_frames: Optional[Tuple[pd.DataFrame, pd.Series, pd.Series]] = None
@@ -234,20 +259,201 @@ class EnhancedTrainerV2:
             'calibration_method': CALIBRATION_METHOD,
             'calibration_cv': CALIBRATION_CV,
             'enable_feature_selection': ENABLE_FEATURE_SELECTION,
-            'min_features': 10,
-            'max_features': None,
-            'cls_threshold': CLS_THRESHOLD,
+            'min_features': FEATURE_SELECTION_MIN_FEATURES if 'FEATURE_SELECTION_MIN_FEATURES' in globals() else 10,
+            'max_features': FEATURE_SELECTION_MAX_FEATURES if 'FEATURE_SELECTION_MAX_FEATURES' in globals() else None,
+            'shap_sample_size': FEATURE_SELECTION_SHAP_SAMPLE_SIZE if 'FEATURE_SELECTION_SHAP_SAMPLE_SIZE' in globals() else None,
+            'shap_background_size': FEATURE_SELECTION_SHAP_BACKGROUND_SIZE if 'FEATURE_SELECTION_SHAP_BACKGROUND_SIZE' in globals() else None,
+            'shap_tree_limit': FEATURE_SELECTION_SHAP_TREE_LIMIT if 'FEATURE_SELECTION_SHAP_TREE_LIMIT' in globals() else None,
+            'cls_threshold': CLS_PRODUCTION_THRESHOLD if 'CLS_PRODUCTION_THRESHOLD' in globals() else CLS_THRESHOLD,
             'prediction_period': PREDICTION_PERIOD_DAYS,
             'enable_time_series_split': ENABLE_TIME_SERIES_SPLIT,
             'cv_n_splits': CV_N_SPLITS,
             'cv_embargo': CV_EMBARGO,
             'cv_allow_future': CV_ALLOW_FUTURE,
             'use_rolling_cv': False,
+            'enable_sample_weighting': ENABLE_SAMPLE_WEIGHTING,
+            'sample_weight_halflife': SAMPLE_WEIGHT_HALFLIFE_YEARS,
             'classification_metrics': CLASSIFICATION_METRICS,
             'regression_metrics': REGRESSION_METRICS,
-            'top_k_values': TOP_K_VALUES
+            'top_k_values': TOP_K_VALUES,
+            'reuse_feature_selection': FEATURE_SELECTION_CACHE_ENABLED,
+            'force_refresh_feature_selection': FEATURE_SELECTION_CACHE_FORCE_REFRESH,
+            'feature_selection_cache_dir': FEATURE_SELECTION_CACHE_DIR,
+            'feature_selection_cache_ttl_days': FEATURE_SELECTION_CACHE_TTL_DAYS,
+            'feature_selection_cache_version': FEATURE_SELECTION_CACHE_VERSION,
+            'enable_regression_task': ENABLE_REGRESSION_TASK if 'ENABLE_REGRESSION_TASK' in globals() else True
         }
 
+    def _get_feature_selection_cache_settings(self, task: str) -> Dict[str, Any]:
+        """组装特征选择缓存设置。"""
+        cache_dir = self.config.get('feature_selection_cache_dir')
+        enabled = bool(self.config.get('reuse_feature_selection', False))
+        if not cache_dir:
+            enabled = False
+        return {
+            'enabled': enabled,
+            'force_refresh': bool(self.config.get('force_refresh_feature_selection', False)),
+            'cache_dir': cache_dir,
+            'ttl_days': self.config.get('feature_selection_cache_ttl_days'),
+            'version': self.config.get('feature_selection_cache_version', 'v1'),
+            'method': self.config.get('feature_selection_method', 'lightgbm'),
+            'threshold': self.config.get('feature_selection_threshold', 'median'),
+            'min_features': self.config.get('min_features'),
+            'max_features': self.config.get('max_features'),
+            'task': task
+        }
+
+    def _build_feature_selection_cache_signature(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        settings: Dict[str, Any]
+    ) -> str:
+        """根据数据与配置生成缓存签名。"""
+        if not isinstance(y, pd.Series):
+            y_series = pd.Series(y).reset_index(drop=True)
+        else:
+            y_series = y.reset_index(drop=True)
+        row_fingerprint = hash_pandas_object(X, index=True).values.tobytes()
+        target_fingerprint = hash_pandas_object(y_series, index=True).values.tobytes()
+        meta = {
+            'task': settings.get('task'),
+            'method': settings.get('method'),
+            'threshold': settings.get('threshold'),
+            'min_features': settings.get('min_features'),
+            'max_features': settings.get('max_features'),
+            'version': settings.get('version'),
+            'columns': list(X.columns)
+        }
+        hasher = hashlib.blake2b(digest_size=20)
+        hasher.update(row_fingerprint)
+        hasher.update(target_fingerprint)
+        hasher.update(json.dumps(meta, sort_keys=True).encode('utf-8'))
+        return hasher.hexdigest()
+
+    def _load_feature_selection_cache(
+        self,
+        settings: Dict[str, Any],
+        signature: str,
+        X: pd.DataFrame
+    ) -> Optional[Tuple[List[str], np.ndarray]]:
+        """尝试从磁盘读取缓存的特征选择结果。"""
+        cache_dir = settings.get('cache_dir')
+        if not cache_dir:
+            return None
+        cache_path = Path(cache_dir) / f"{signature}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            with cache_path.open('r', encoding='utf-8') as fp:
+                payload = json.load(fp)
+        except Exception as exc:
+            logger.warning("特征选择缓存读取失败（%s）: %s", cache_path, exc)
+            return None
+
+        expected_version = settings.get('version')
+        if expected_version and payload.get('version') != expected_version:
+            logger.info("特征选择缓存版本不匹配（%s ≠ %s），忽略缓存", payload.get('version'), expected_version)
+            return None
+
+        cached_columns = payload.get('columns')
+        if cached_columns != list(X.columns):
+            logger.info("特征选择缓存列集合已变化，自动失效")
+            return None
+
+        ttl_days = settings.get('ttl_days')
+        if ttl_days and ttl_days > 0:
+            created_raw = payload.get('created_at')
+            if created_raw:
+                try:
+                    created_dt = datetime.fromisoformat(created_raw.replace('Z', '+00:00'))
+                except ValueError:
+                    created_dt = None
+                if created_dt:
+                    if created_dt.tzinfo is not None:
+                        created_dt_utc = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        created_dt_utc = created_dt
+                    if datetime.utcnow() - created_dt_utc > timedelta(days=int(ttl_days)):
+                        logger.info("特征选择缓存已超过 %d 天，重新计算", ttl_days)
+                        return None
+
+        selected_features = payload.get('selected_features') or []
+        importances_map = payload.get('importances') or {}
+        importances = np.array([float(importances_map.get(col, 0.0)) for col in X.columns], dtype=float)
+
+        logger.info("♻️ 复用特征选择缓存（%s）: %d → %d", signature[:12], len(X.columns), len(selected_features))
+        return selected_features, importances
+
+    def _save_feature_selection_cache(
+        self,
+        settings: Dict[str, Any],
+        signature: str,
+        X: pd.DataFrame,
+        selected_features: List[str],
+        importances: np.ndarray,
+        importance_columns: Optional[List[str]] = None
+    ) -> None:
+        """将特征选择结果写入磁盘缓存。"""
+        cache_dir = settings.get('cache_dir')
+        if not cache_dir:
+            return
+        path = Path(cache_dir)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("无法创建特征选择缓存目录 %s: %s", path, exc)
+            return
+        cache_path = path / f"{signature}.json"
+        if importance_columns is None:
+            importance_columns = list(X.columns[:len(importances)])
+        else:
+            importance_columns = list(importance_columns)
+
+        if len(importance_columns) != len(importances):
+            min_len = min(len(importance_columns), len(importances))
+            logger.debug(
+                "特征重要性列数与数值不一致，按最小长度对齐: columns=%d, importances=%d",
+                len(importance_columns),
+                len(importances)
+            )
+            importance_map = {
+                col: float(importances[idx])
+                for idx, col in enumerate(importance_columns[:min_len])
+            }
+        else:
+            importance_map = {
+                col: float(importances[idx])
+                for idx, col in enumerate(importance_columns)
+            }
+
+        payload = {
+            'version': settings.get('version'),
+            'signature': signature,
+            'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'columns': list(X.columns),
+            'row_count': int(len(X)),
+            'selected_features': list(selected_features),
+            'importance_columns': importance_columns,
+            'importances': importance_map,
+            'meta': {
+                'task': settings.get('task'),
+                'method': settings.get('method'),
+                'threshold': settings.get('threshold'),
+                'min_features': settings.get('min_features'),
+                'max_features': settings.get('max_features')
+            }
+        }
+        tmp_path = cache_path.with_suffix('.json.tmp')
+        try:
+            with tmp_path.open('w', encoding='utf-8') as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, cache_path)
+            logger.info("💾 已缓存特征选择结果（%s）: %d → %d", signature[:12], len(X.columns), len(selected_features))
+        except Exception as exc:
+            logger.warning("写入特征选择缓存失败（%s）: %s", cache_path, exc)
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
     def _prepare_timeseries_split(
         self,
         X: pd.DataFrame,
@@ -359,6 +565,23 @@ class EnhancedTrainerV2:
             hits[k] = float(top_hit)
         return hits
 
+    def _compute_time_decay_weights(self, dates: Optional[pd.Series]) -> Optional[np.ndarray]:
+        if not self.enable_sample_weighting:
+            return None
+        if dates is None or len(dates) == 0:
+            logger.warning("样本加权跳过：缺少日期信息")
+            return None
+        dates = pd.to_datetime(dates)
+        if dates.isna().all():
+            logger.warning("样本加权跳过：日期均为NaT")
+            return None
+        halflife_years = max(self.sample_weight_halflife, 1e-6)
+        decay_rate = np.log(2) / (halflife_years * 365.0)
+        max_date = dates.max()
+        delta_days = (max_date - dates).dt.days.astype(float)
+        weights = np.exp(-decay_rate * np.clip(delta_days, a_min=0.0, a_max=None))
+        return weights.to_numpy(dtype=float)
+
     def _log_recent_window_metrics(
         self,
         y_true: pd.Series,
@@ -415,7 +638,7 @@ class EnhancedTrainerV2:
     def _find_optimal_threshold(y_true: pd.Series, y_score: np.ndarray) -> Tuple[float, Dict[str, float]]:
         # 覆盖更细颗粒度并强制包含配置阈值，避免遗漏0.03等业务设定
         base_grid = np.linspace(0.01, 0.99, 99)
-        thresholds = np.unique(np.concatenate([base_grid, np.array([CLS_THRESHOLD])]))
+        thresholds = np.unique(np.concatenate([base_grid, np.array([CLS_PRODUCTION_THRESHOLD if 'CLS_PRODUCTION_THRESHOLD' in globals() else CLS_THRESHOLD])]))
         best_threshold = 0.5
         best_f1 = -1.0
         best_metrics = {'precision': np.nan, 'recall': np.nan, 'f1': np.nan}
@@ -437,6 +660,21 @@ class EnhancedTrainerV2:
                 }
 
         return best_threshold, best_metrics
+
+    @staticmethod
+    def _evaluate_threshold_metrics(y_true: pd.Series, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
+        preds = (y_score >= threshold).astype(int)
+        if preds.sum() == 0:
+            return {
+                'precision': 0.0,
+                'recall': 0.0,
+                'f1': 0.0
+            }
+        return {
+            'precision': float(precision_score(y_true, preds, zero_division=0)),
+            'recall': float(recall_score(y_true, preds, zero_division=0)),
+            'f1': float(f1_score(y_true, preds, zero_division=0))
+        }
 
     def _log_fold_classification_diagnostics(
         self,
@@ -588,7 +826,8 @@ class EnhancedTrainerV2:
         X_val: np.ndarray,
         y_val: pd.Series,
         early_stopping_rounds: Optional[int],
-        model_params: Dict[str, Any]
+        model_params: Dict[str, Any],
+        sample_weight: Optional[np.ndarray] = None
     ) -> XGBoostClassifierWrapper:
         import xgboost as xgb
 
@@ -605,7 +844,7 @@ class EnhancedTrainerV2:
             'seed': 42
         }
 
-        dtrain = xgb.DMatrix(X_train, label=y_train.to_numpy())
+        dtrain = xgb.DMatrix(X_train, label=y_train.to_numpy(), weight=sample_weight)
         dval = xgb.DMatrix(X_val, label=y_val.to_numpy())
         callbacks = []
         if early_stopping_rounds:
@@ -734,7 +973,7 @@ class EnhancedTrainerV2:
 
         # 数值特征 pipeline
         numerical_pipe = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
+            ('imputer', SafeSimpleImputer(strategy='median', fallback_value=0.0)),
             ('winsorizer', Winsorizer(
                 quantile_range=(
                     self.config['winsor_clip_quantile'],
@@ -800,41 +1039,346 @@ class EnhancedTrainerV2:
         importances : ndarray
             特征重要性
         """
-        from src.ml.preprocessing.feature_selection import select_features_for_task
-        
         logger.info(f"执行{task}特征选择...")
         # 🔧 关键修复: 确保数据类型正确
         X_converted = X.copy()
         for col in X_converted.columns:
             if X_converted[col].dtype == 'object':
-                X_converted[col] = pd.to_numeric(X_converted[col], errors='coerce')
+                # 仅在实际存在数值时才转换，避免行业等纯分类列被强制转换为全NaN
+                converted = pd.to_numeric(X_converted[col], errors='coerce')
+                if converted.notna().any():
+                    X_converted[col] = converted
+                else:
+                    logger.debug("特征选择保留原始字符串列 %s（未检测到可转换的数值数据）", col)
 
-        # 检查是否有缺失值
-        if X_converted.isna().any().any():
-            logger.warning("特征选择前检测到缺失值，将进行填充")
-            X_converted = X_converted.fillna(X_converted.median())
+        logger.debug("特征数据类型: %s", {name: str(dtype) for name, dtype in X_converted.dtypes.items()})
 
-        logger.debug(f"特征数据类型: {X_converted.dtypes.to_dict()}")
+        cache_settings = self._get_feature_selection_cache_settings(task)
+        cache_signature: Optional[str] = None
+        if cache_settings.get('enabled'):
+            try:
+                cache_signature = self._build_feature_selection_cache_signature(X_converted, y, cache_settings)
+            except Exception as exc:
+                logger.warning("生成特征选择缓存签名失败，改为重新计算: %s", exc)
+                cache_signature = None
+            if cache_signature and cache_settings.get('force_refresh'):
+                logger.info("⟳ 忽略历史特征选择缓存并强制重算（%s）", cache_signature[:12])
+            if cache_signature and not cache_settings.get('force_refresh'):
+                cached = self._load_feature_selection_cache(cache_settings, cache_signature, X_converted)
+                if cached is not None:
+                    return cached
 
-        selected_features, importances = select_features_for_task(
+        shap_kwargs: Dict[str, Any] = {}
+        if self.config.get('feature_selection_method', 'lightgbm') == 'shap':
+            if self.config.get('shap_sample_size'):
+                shap_kwargs['shap_sample_size'] = self.config.get('shap_sample_size')
+            if self.config.get('shap_background_size'):
+                shap_kwargs['shap_background_size'] = self.config.get('shap_background_size')
+            if self.config.get('shap_tree_limit') is not None:
+                shap_kwargs['shap_tree_limit'] = self.config.get('shap_tree_limit')
+
+        selected_features, importances, importance_feature_names = select_features_for_task(
             X_converted, y,
             task=task,
             method=self.config.get('feature_selection_method', 'lightgbm'),
             threshold=self.config.get('feature_selection_threshold', 'median'),
-            min_features=self.config.get('min_features', 15),
-            max_features=self.config.get('max_features', 30),
-            cv_n_jobs=self.config.get('cv_n_jobs', -1)
+            min_features=self.config.get('min_features', FEATURE_SELECTION_MIN_FEATURES if 'FEATURE_SELECTION_MIN_FEATURES' in globals() else 15),
+            max_features=self.config.get('max_features', FEATURE_SELECTION_MAX_FEATURES if 'FEATURE_SELECTION_MAX_FEATURES' in globals() else 30),
+            cv_n_jobs=self.config.get('cv_n_jobs', -1),
+            **shap_kwargs
         )
+
+        if task == 'classification':
+            selected_features = self._append_categorical_features(selected_features, X, context="特征选择")
 
         logger.info(f"✅ 特征选择完成: {len(X.columns)} → {len(selected_features)}")
 
-        return selected_features, importances
+        importances_array = np.asarray(importances, dtype=float)
+        if cache_settings.get('enabled') and cache_signature:
+            self._save_feature_selection_cache(
+                cache_settings,
+                cache_signature,
+                X_converted,
+                selected_features,
+                importances_array,
+                list(importance_feature_names)
+            )
+
+        return selected_features, importances_array
 
     def _split_feature_types(self, selected_features: List[str]) -> Tuple[List[str], List[str]]:
         """根据初始特征集，将选定特征划分为数值和类别两类。"""
         numeric = [f for f in self._base_numerical_features if f in selected_features]
         categorical = [f for f in self._base_categorical_features if f in selected_features]
         return numeric, categorical
+
+    def _append_categorical_features(self, selected: List[str], X: pd.DataFrame, context: str = "") -> List[str]:
+        appended: List[str] = []
+        for cat in self._base_categorical_features:
+            if cat in X.columns and cat not in selected:
+                selected.append(cat)
+                appended.append(cat)
+        if appended:
+            msg = f"附加类别特征({context})" if context else "附加类别特征"
+            logger.info("%s: %s", msg, appended)
+        # 去重保持顺序
+        selected = list(dict.fromkeys(selected))
+        return selected
+
+    def _analyze_data_complexity(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]) -> Dict[str, float]:
+        """
+        分析数据复杂度，为参数调整提供依据
+        
+        Parameters
+        ----------
+        X : DataFrame or ndarray
+            特征数据
+        y : Series or ndarray
+            标签数据
+            
+        Returns
+        -------
+        metrics : dict
+            包含以下指标的字典：
+            - n_samples: 样本数量
+            - n_features: 特征数量
+            - feature_density: 特征密度 (非零特征比例)
+            - target_variance: 目标变量方差
+            - complexity_score: 综合复杂度评分
+        """
+        # 从配置获取阈值
+        small_sample_threshold = self.config.get('small_sample_threshold', SMALL_SAMPLE_THRESHOLD)
+        large_sample_threshold = self.config.get('large_sample_threshold', LARGE_SAMPLE_THRESHOLD)
+        high_dimension_threshold = self.config.get('high_dimension_threshold', HIGH_DIMENSION_THRESHOLD)
+        high_complexity_threshold = self.config.get('high_complexity_threshold', HIGH_COMPLEXITY_THRESHOLD)
+        
+        # 处理不同的输入类型
+        if isinstance(X, pd.DataFrame):
+            n_samples, n_features = X.shape
+        else:
+            n_samples, n_features = X.shape
+        
+        # 计算特征密度 (非零特征比例)
+        if hasattr(X, 'sparse'):
+            feature_density = (X != 0).sum().sum() / (n_samples * n_features)
+        else:
+            feature_density = 1.0  # 稠密矩阵
+        
+        # 目标变量方差
+        if isinstance(y, pd.Series):
+            target_variance = y.var() if len(y) > 1 else 0.0
+        else:
+            target_variance = np.var(y) if len(y) > 1 else 0.0
+        
+        # 综合复杂度评分 (0-1范围)，使用配置阈值
+        complexity_score = min(1.0, 
+            (n_samples / large_sample_threshold) * 0.3 +  # 样本规模影响
+            (n_features / high_dimension_threshold) * 0.3 +   # 特征规模影响
+            feature_density * 0.2 +       # 特征密度影响
+            (target_variance / 10) * 0.2  # 目标复杂度影响
+        )
+        
+        metrics = {
+            'n_samples': n_samples,
+            'n_features': n_features,
+            'feature_density': feature_density,
+            'target_variance': target_variance,
+            'complexity_score': complexity_score,
+            'small_sample_threshold': small_sample_threshold,
+            'large_sample_threshold': large_sample_threshold,
+            'high_dimension_threshold': high_dimension_threshold,
+            'high_complexity_threshold': high_complexity_threshold
+        }
+        
+        logger.info(f"📊 数据复杂度分析: {n_samples}样本, {n_features}特征, "
+                   f"密度{feature_density:.3f}, 复杂度评分{complexity_score:.3f}")
+        
+        return metrics
+
+    def _adjust_parameter_ranges(self, complexity_metrics: Dict[str, float], task: str, model_type: str) -> Dict[str, Any]:
+        """
+        基于数据复杂度动态调整参数范围
+        
+        Parameters
+        ----------
+        complexity_metrics : dict
+            数据复杂度指标
+        task : str
+            任务类型 ('classification' 或 'regression')
+        model_type : str
+            模型类型 ('xgboost', 'lightgbm', 'logistic', 'random_forest')
+            
+        Returns
+        -------
+        adjusted_params : dict
+            调整后的参数范围
+        """
+        n_samples = complexity_metrics['n_samples']
+        n_features = complexity_metrics['n_features']
+        complexity_score = complexity_metrics['complexity_score']
+        small_sample_threshold = complexity_metrics['small_sample_threshold']
+        large_sample_threshold = complexity_metrics['large_sample_threshold']
+        high_dimension_threshold = complexity_metrics['high_dimension_threshold']
+        high_complexity_threshold = complexity_metrics['high_complexity_threshold']
+        
+        adjusted_params = {}
+        
+        # 根据调整模式选择策略
+        if self.data_driven_adjustment_mode == 'conservative':
+            # 保守模式：使用更窄的参数范围
+            return self._get_conservative_params(model_type, task)
+        
+        # 自适应模式：基于数据复杂度动态调整
+        # 根据模型类型和任务类型调整参数
+        if model_type == 'xgboost':
+            if task == 'classification':
+                # 基础参数范围
+                base_params = {
+                    'n_estimators': (50, 1000),
+                    'max_depth': (3, 10),
+                    'learning_rate': (0.01, 0.3),
+                    'subsample': (0.6, 1.0),
+                    'colsample_bytree': (0.6, 1.0),
+                    'min_child_weight': (1, 10),
+                    'gamma': (0, 1.0),
+                    'reg_alpha': (0, 1.0),
+                    'reg_lambda': (0, 1.0)
+                }
+                
+                # 基于数据复杂度调整
+                if n_samples < small_sample_threshold:
+                    # 小样本：减少树数量和深度
+                    base_params['n_estimators'] = (30, 300)
+                    base_params['max_depth'] = (2, 6)
+                    base_params['learning_rate'] = (0.05, 0.2)
+                elif n_samples > large_sample_threshold:
+                    # 大样本：增加树数量和深度
+                    base_params['n_estimators'] = (200, 2000)
+                    base_params['max_depth'] = (5, 15)
+                
+                if n_features >= high_dimension_threshold:
+                    # 高维特征：加强正则化
+                    base_params['reg_alpha'] = (0.1, 2.0)
+                    base_params['reg_lambda'] = (0.1, 2.0)
+                    base_params['colsample_bytree'] = (0.3, 0.8)
+                
+                # 基于复杂度评分微调
+                if complexity_score > high_complexity_threshold:
+                    # 高复杂度数据：加强正则化
+                    base_params['reg_alpha'] = (base_params['reg_alpha'][0] * 1.5, base_params['reg_alpha'][1] * 1.5)
+                    base_params['reg_lambda'] = (base_params['reg_lambda'][0] * 1.5, base_params['reg_lambda'][1] * 1.5)
+                
+                adjusted_params = base_params
+                
+            elif task == 'regression':
+                # 回归任务参数调整
+                base_params = {
+                    'n_estimators': (50, 1000),
+                    'max_depth': (3, 10),
+                    'learning_rate': (0.01, 0.2),
+                    'subsample': (0.7, 1.0),
+                    'colsample_bytree': (0.7, 1.0),
+                    'min_child_weight': (1, 20),
+                    'gamma': (0, 0.5),
+                    'reg_alpha': (0, 2.0),
+                    'reg_lambda': (0, 2.0)
+                }
+                
+                # 回归任务特有的调整
+                if n_samples < small_sample_threshold // 2:  # 回归任务对样本量更敏感
+                    base_params['n_estimators'] = (30, 200)
+                    base_params['max_depth'] = (2, 5)
+                
+                if n_features > high_dimension_threshold * 0.6:  # 回归任务对特征维度更敏感
+                    base_params['colsample_bytree'] = (0.5, 0.9)
+                
+                adjusted_params = base_params
+        
+        elif model_type == 'lightgbm':
+            # LightGBM参数调整
+            base_params = {
+                'n_estimators': (50, 1000),
+                'num_leaves': (20, 150),
+                'max_depth': (3, 12),
+                'learning_rate': (0.01, 0.3),
+                'subsample': (0.6, 1.0),
+                'colsample_bytree': (0.6, 1.0),
+                'min_child_samples': (10, 100),
+                'reg_alpha': (0, 1.0),
+                'reg_lambda': (0, 1.0)
+            }
+            
+            # 基于数据复杂度调整
+            if n_samples < small_sample_threshold:
+                base_params['num_leaves'] = (10, 50)
+                base_params['max_depth'] = (2, 6)
+            
+            if n_features > high_dimension_threshold:
+                base_params['colsample_bytree'] = (0.4, 0.8)
+            
+            adjusted_params = base_params
+        
+        logger.info(f"🔧 参数范围调整: {model_type} {task}, "
+                   f"样本{n_samples}, 特征{n_features}, 复杂度{complexity_score:.3f}")
+        
+        return adjusted_params
+    
+    def _get_conservative_params(self, model_type: str, task: str) -> Dict[str, Any]:
+        """
+        获取保守模式的参数范围
+        
+        Parameters
+        ----------
+        model_type : str
+            模型类型
+        task : str
+            任务类型
+            
+        Returns
+        -------
+        params : dict
+            保守参数范围
+        """
+        if model_type == 'xgboost':
+            if task == 'classification':
+                return {
+                    'n_estimators': (100, 500),
+                    'max_depth': (3, 8),
+                    'learning_rate': (0.05, 0.2),
+                    'subsample': (0.7, 1.0),
+                    'colsample_bytree': (0.7, 1.0),
+                    'min_child_weight': (1, 5),
+                    'gamma': (0, 0.5),
+                    'reg_alpha': (0, 0.5),
+                    'reg_lambda': (0, 0.5)
+                }
+            else:  # regression
+                return {
+                    'n_estimators': (100, 500),
+                    'max_depth': (3, 8),
+                    'learning_rate': (0.05, 0.15),
+                    'subsample': (0.8, 1.0),
+                    'colsample_bytree': (0.8, 1.0),
+                    'min_child_weight': (1, 10),
+                    'gamma': (0, 0.3),
+                    'reg_alpha': (0, 1.0),
+                    'reg_lambda': (0, 1.0)
+                }
+        elif model_type == 'lightgbm':
+            return {
+                'n_estimators': (100, 500),
+                'num_leaves': (31, 100),
+                'max_depth': (3, 8),
+                'learning_rate': (0.05, 0.2),
+                'subsample': (0.7, 1.0),
+                'colsample_bytree': (0.7, 1.0),
+                'min_child_samples': (20, 50),
+                'reg_alpha': (0, 0.5),
+                'reg_lambda': (0, 0.5)
+            }
+        else:
+            # 对于其他模型类型，返回空字典
+            return {}
 
     def _build_cv_dataset(
         self,
@@ -1001,19 +1545,35 @@ class EnhancedTrainerV2:
         direction = 'maximize'
         study = optuna.create_study(direction=direction, sampler=sampler, pruner=pruner)
 
+        # 数据驱动参数调整：分析训练数据的复杂度
+        complexity_metrics = self._analyze_data_complexity(X_sorted, y_sorted)
+        adjusted_param_ranges = self._adjust_parameter_ranges(complexity_metrics, task, model_type)
+
         def _suggest_params(trial: optuna.Trial) -> Dict[str, Any]:
+            # 使用数据驱动调整后的参数范围
             if model_type == 'xgboost':
+                # 获取调整后的参数范围，如果未调整则使用默认范围
+                n_estimators_range = adjusted_param_ranges.get('n_estimators', (50, 1000))
+                max_depth_range = adjusted_param_ranges.get('max_depth', (3, 10))
+                learning_rate_range = adjusted_param_ranges.get('learning_rate', (0.01, 0.3))
+                subsample_range = adjusted_param_ranges.get('subsample', (0.6, 1.0))
+                colsample_bytree_range = adjusted_param_ranges.get('colsample_bytree', (0.6, 1.0))
+                min_child_weight_range = adjusted_param_ranges.get('min_child_weight', (1, 10))
+                gamma_range = adjusted_param_ranges.get('gamma', (0, 1.0))
+                reg_alpha_range = adjusted_param_ranges.get('reg_alpha', (0, 1.0))
+                reg_lambda_range = adjusted_param_ranges.get('reg_lambda', (0, 1.0))
+                
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),      # 🔥 扩大范围
-                    'max_depth': trial.suggest_int('max_depth', 2, 10),               # 🔥 扩大范围
-                    'learning_rate': trial.suggest_float('learning_rate', 0.005, 1.5, log=True),  # 🔥 扩大范围
-                    'subsample': trial.suggest_float('subsample', 0.5, 1.0),          # 🔥 扩大范围
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),  # 🔥 扩大范围
-                    'min_child_weight': trial.suggest_int('min_child_weight', 1, 50), # 🔥 扩大范围
-                    'gamma': trial.suggest_float('gamma', 0.01, 10.0),                # 🔥 扩大范围
-                    'reg_alpha': trial.suggest_float('reg_alpha', 0.1, 20.0),         # 🔥 扩大范围
-                    'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 20.0),       # 🔥 扩大范围
-                    'max_leaves': trial.suggest_int('max_leaves', 15, 255),           # 🔥 新增重要参数
+                    'n_estimators': trial.suggest_int('n_estimators', n_estimators_range[0], n_estimators_range[1]),
+                    'max_depth': trial.suggest_int('max_depth', max_depth_range[0], max_depth_range[1]),
+                    'learning_rate': trial.suggest_float('learning_rate', learning_rate_range[0], learning_rate_range[1], log=True),
+                    'subsample': trial.suggest_float('subsample', subsample_range[0], subsample_range[1]),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', colsample_bytree_range[0], colsample_bytree_range[1]),
+                    'min_child_weight': trial.suggest_int('min_child_weight', min_child_weight_range[0], min_child_weight_range[1]),
+                    'gamma': trial.suggest_float('gamma', gamma_range[0], gamma_range[1]),
+                    'reg_alpha': trial.suggest_float('reg_alpha', reg_alpha_range[0], reg_alpha_range[1]),
+                    'reg_lambda': trial.suggest_float('reg_lambda', reg_lambda_range[0], reg_lambda_range[1]),
+                    'max_leaves': trial.suggest_int('max_leaves', 15, 255),
                     'random_state': 42,
                     'n_jobs': 1,
                     'verbosity': 0
@@ -1026,21 +1586,37 @@ class EnhancedTrainerV2:
                 return params
 
             # LightGBM 分类
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', 50, 300),  # 🔥 扩大范围
-                'max_depth': trial.suggest_int('max_depth', 2, 10),           # 🔥 扩大范围
-                'learning_rate': trial.suggest_float('learning_rate', 0.005, 1.5, log=True),  # 🔥 扩大范围
-                'subsample': trial.suggest_float('subsample', 0.5, 1.0),      # 🔥 扩大范围
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),  # 🔥 扩大范围
-                'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),    # 🔥 扩大范围
-                'reg_alpha': trial.suggest_float('reg_alpha', 0.1, 20.0),     # 🔥 扩大范围
-                'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 20.0),   # 🔥 扩大范围
-                'num_leaves': trial.suggest_int('num_leaves', 15, 255),        # 🔥 新增重要参数
-                'random_state': 42,
-                'n_jobs': 1,
-                'verbosity': -1
-            }
-            return params
+            elif model_type == 'lightgbm':
+                # 获取调整后的参数范围
+                n_estimators_range = adjusted_param_ranges.get('n_estimators', (50, 1000))
+                num_leaves_range = adjusted_param_ranges.get('num_leaves', (20, 150))
+                max_depth_range = adjusted_param_ranges.get('max_depth', (3, 12))
+                learning_rate_range = adjusted_param_ranges.get('learning_rate', (0.01, 0.3))
+                subsample_range = adjusted_param_ranges.get('subsample', (0.6, 1.0))
+                colsample_bytree_range = adjusted_param_ranges.get('colsample_bytree', (0.6, 1.0))
+                min_child_samples_range = adjusted_param_ranges.get('min_child_samples', (10, 100))
+                reg_alpha_range = adjusted_param_ranges.get('reg_alpha', (0, 1.0))
+                reg_lambda_range = adjusted_param_ranges.get('reg_lambda', (0, 1.0))
+                
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', n_estimators_range[0], n_estimators_range[1]),
+                    'num_leaves': trial.suggest_int('num_leaves', num_leaves_range[0], num_leaves_range[1]),
+                    'max_depth': trial.suggest_int('max_depth', max_depth_range[0], max_depth_range[1]),
+                    'learning_rate': trial.suggest_float('learning_rate', learning_rate_range[0], learning_rate_range[1], log=True),
+                    'subsample': trial.suggest_float('subsample', subsample_range[0], subsample_range[1]),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', colsample_bytree_range[0], colsample_bytree_range[1]),
+                    'min_child_samples': trial.suggest_int('min_child_samples', min_child_samples_range[0], min_child_samples_range[1]),
+                    'reg_alpha': trial.suggest_float('reg_alpha', reg_alpha_range[0], reg_alpha_range[1]),
+                    'reg_lambda': trial.suggest_float('reg_lambda', reg_lambda_range[0], reg_lambda_range[1]),
+                    'random_state': 42,
+                    'n_jobs': 1,
+                    'verbosity': -1
+                }
+                return params
+            
+            else:
+                # 对于不支持的模型类型，返回空参数
+                return {}
 
         metric_name = 'auc' if task == 'classification' else 'r2'
 
@@ -1122,7 +1698,7 @@ class EnhancedTrainerV2:
         """根据任务类型创建基础模型实例。"""
         params = params.copy()
 
-        early_stopping_rounds = params.pop('early_stopping_rounds', None)
+        early_stopping_rounds = params.pop('early_stopping_rounds', 30)
         estimator = None
 
         if model_type == 'xgboost':
@@ -1215,6 +1791,13 @@ class EnhancedTrainerV2:
             if not selected_features:
                 logger.debug("折%d 无可用特征，跳过", fold['fold_id'])
                 continue
+
+            if task == 'classification':
+                selected_features = self._append_categorical_features(
+                    selected_features,
+                    X_train,
+                    context=f"CV折{fold['fold_id']}"
+                )
 
             num_feats, cat_feats = self._split_feature_types(selected_features)
             preprocessor = self.create_preprocessing_pipeline(num_feats, cat_feats)
@@ -1401,6 +1984,7 @@ class EnhancedTrainerV2:
                 y_train,
                 task='classification'
             )
+            selected_features = self._append_categorical_features(selected_features, X_train, context="训练集")
             logger.info("训练集特征选择: %d → %d", X_train.shape[1], len(selected_features))
         else:
             selected_features = list(X_train.columns)
@@ -1412,6 +1996,12 @@ class EnhancedTrainerV2:
 
         X_train_trans = preprocessor.transform(X_train[selected_features])
         X_val_trans = preprocessor.transform(X_val[selected_features])
+
+        train_dates = self._last_split_dates.get('train')
+        sample_weight_train = self._compute_time_decay_weights(train_dates)
+        if sample_weight_train is not None and len(sample_weight_train) != len(X_train_trans):
+            logger.warning("样本加权长度(%d)与训练集(%d)不一致，忽略", len(sample_weight_train), len(X_train_trans))
+            sample_weight_train = None
 
         # 6) 拟合最终模型
         early_stopping_rounds = model_params.get('early_stopping_rounds', 50)
@@ -1432,6 +2022,7 @@ class EnhancedTrainerV2:
             estimator.fit(
                 X_train_trans,
                 y_train,
+                sample_weight=sample_weight_train,
                 eval_set=[(X_val_trans, y_val)],
                 eval_metric='auc',
                 callbacks=[
@@ -1446,7 +2037,8 @@ class EnhancedTrainerV2:
                 X_val_trans,
                 y_val,
                 early_stopping_rounds,
-                model_params
+                model_params,
+                sample_weight=sample_weight_train
             )
         elif model_type == 'logistic':
             from sklearn.linear_model import LogisticRegression
@@ -1463,7 +2055,7 @@ class EnhancedTrainerV2:
             if penalty == 'elasticnet':
                 lr_params['l1_ratio'] = model_params.get('l1_ratio', 0.5)
             estimator = LogisticRegression(**lr_params)
-            estimator.fit(X_train_trans, y_train)
+            estimator.fit(X_train_trans, y_train, sample_weight=sample_weight_train)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -1514,9 +2106,17 @@ class EnhancedTrainerV2:
             metrics['val_brier_calibrated'] = cal_brier
             logger.info("校准后 Brier: %.4f (改善 %.4f)", cal_brier, metrics['val_brier'] - cal_brier)
 
+        production_threshold = float(self.config.get('cls_threshold', CLS_THRESHOLD))
+        prod_metrics = self._evaluate_threshold_metrics(y_val, calibrated_scores, production_threshold)
         optimal_threshold, threshold_metrics = self._find_optimal_threshold(y_val, calibrated_scores)
+        high_threshold = min(0.6, max(production_threshold + 0.05, optimal_threshold + 0.03))
+        high_metrics = self._evaluate_threshold_metrics(y_val, calibrated_scores, high_threshold)
         metrics['optimal_threshold'] = optimal_threshold
         metrics.update({f"optimal_{k}": v for k, v in threshold_metrics.items()})
+        metrics['production_threshold'] = production_threshold
+        metrics.update({f"production_{k}": v for k, v in prod_metrics.items()})
+        metrics['high_threshold'] = high_threshold
+        metrics.update({f"high_{k}": v for k, v in high_metrics.items()})
 
         logger.info(
             "最佳阈值 %.3f → 验证 Precision %.4f / Recall %.4f / F1 %.4f",
@@ -1524,6 +2124,13 @@ class EnhancedTrainerV2:
             threshold_metrics.get('precision', np.nan),
             threshold_metrics.get('recall', np.nan),
             threshold_metrics.get('f1', np.nan)
+        )
+        logger.info(
+            "生产阈值 %.3f → Precision %.4f / Recall %.4f / F1 %.4f",
+            production_threshold,
+            prod_metrics.get('precision', np.nan),
+            prod_metrics.get('recall', np.nan),
+            prod_metrics.get('f1', np.nan)
         )
 
         val_dates = None
