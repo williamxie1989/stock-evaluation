@@ -281,6 +281,21 @@ class MySQLDatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
             
+            # trade_calendar 表 - 交易日历数据
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS trade_calendar (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    trade_date DATE NOT NULL UNIQUE,
+                    is_trading_day TINYINT(1) NOT NULL DEFAULT 1,
+                    market VARCHAR(10) NOT NULL DEFAULT 'ALL',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_trade_calendar_date (trade_date),
+                    INDEX idx_trade_calendar_trading_day (is_trading_day),
+                    INDEX idx_trade_calendar_market (market)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            
             conn.commit()
             self.logger.info("数据库表结构初始化完成")
     
@@ -702,6 +717,138 @@ class MySQLDatabaseManager:
         except Error as e:
             self.logger.error(f"更新执行失败: {e}")
             conn.rollback()
+            raise
+
+    def upsert_trade_calendar(self, df: pd.DataFrame) -> int:
+        """
+        插入或更新交易日历数据
+        
+        Args:
+            df: 包含交易日历数据的DataFrame，需要包含trade_date、is_trading_day、market列
+            
+        Returns:
+            int: 影响的行数
+        """
+        if df is None or df.empty:
+            return 0
+            
+        # 数据预处理
+        data = df.copy()
+        
+        # 检查必要列
+        required_cols = ["trade_date", "is_trading_day"]
+        for col in required_cols:
+            if col not in data.columns:
+                raise ValueError(f"缺少必要列: {col}")
+        
+        # 添加缺失列
+        if 'market' not in data.columns:
+            data['market'] = 'ALL'
+        
+        # 日期标准化
+        data["trade_date"] = pd.to_datetime(data["trade_date"]).dt.strftime("%Y-%m-%d")
+        
+        # 转换为字典列表
+        records = data[["trade_date", "is_trading_day", "market"]].to_dict('records')
+        
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                
+                # MySQL的UPSERT语法
+                sql = """
+                    INSERT INTO trade_calendar (trade_date, is_trading_day, market)
+                    VALUES (%(trade_date)s, %(is_trading_day)s, %(market)s)
+                    ON DUPLICATE KEY UPDATE
+                        is_trading_day = VALUES(is_trading_day),
+                        market = VALUES(market),
+                        updated_at = CURRENT_TIMESTAMP
+                """
+                
+                cursor.executemany(sql, records)
+                conn.commit()
+                
+                affected_rows = cursor.rowcount
+                self.logger.info(f"交易日历数据写入完成: {len(records)}条记录, 影响行数: {affected_rows}")
+                return affected_rows
+                
+        except Error as e:
+            self.logger.error(f"交易日历数据写入失败: {e}")
+            conn.rollback()
+            raise
+
+    def get_trade_calendar(self, start_date: str = None, end_date: str = None, 
+                          market: str = None, is_trading_day: bool = None) -> pd.DataFrame:
+        """
+        获取交易日历数据
+        
+        Args:
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD)
+            market: 市场类型 (SH/SZ/ALL)
+            is_trading_day: 是否为交易日
+            
+        Returns:
+            pd.DataFrame: 交易日历数据
+        """
+        try:
+            with self.get_conn() as conn:
+                # 构建查询条件
+                where_clauses = []
+                params = []
+                
+                if start_date:
+                    where_clauses.append("trade_date >= %s")
+                    params.append(start_date)
+                
+                if end_date:
+                    where_clauses.append("trade_date <= %s")
+                    params.append(end_date)
+                
+                if market:
+                    where_clauses.append("market = %s")
+                    params.append(market)
+                
+                if is_trading_day is not None:
+                    where_clauses.append("is_trading_day = %s")
+                    params.append(int(is_trading_day))
+                
+                where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+                
+                sql = f"""
+                    SELECT trade_date, is_trading_day, market, created_at, updated_at
+                    FROM trade_calendar
+                    {where_sql}
+                    ORDER BY trade_date
+                """
+                
+                df = pd.read_sql_query(sql, conn, params=params)
+                return df
+                
+        except Error as e:
+            self.logger.error(f"获取交易日历数据失败: {e}")
+            raise
+
+    def get_latest_trade_date(self) -> str:
+        """获取最新的交易日"""
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT trade_date 
+                    FROM trade_calendar 
+                    WHERE is_trading_day = 1 
+                    ORDER BY trade_date DESC 
+                    LIMIT 1
+                """)
+                
+                result = cursor.fetchone()
+                if result:
+                    return result[0].strftime('%Y-%m-%d')
+                return None
+                
+        except Error as e:
+            self.logger.error(f"获取最新交易日失败: {e}")
             raise
 
 
