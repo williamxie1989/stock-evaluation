@@ -34,7 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from src.ml.training.train_unified_models import UnifiedModelTrainer  # noqa: E402
+from src.ml.training.v1.train_unified_models import UnifiedModelTrainer  # noqa: E402
 
 app = FastAPI(title="Remote Training Service", version="0.1.0")
 

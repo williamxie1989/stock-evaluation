@@ -21,7 +21,7 @@ sys.path.insert(0, project_root)
 
 # 导入原有的依赖
 from src.data.db.unified_database_manager import UnifiedDatabaseManager
-from src.ml.training.enhanced_ml_trainer import EnhancedMLTrainer
+from src.ml.training.v1.enhanced_ml_trainer import EnhancedMLTrainer
 from src.ml.features.enhanced_features import EnhancedFeatureGenerator
 
 # 配置日志
