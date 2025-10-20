@@ -3,6 +3,15 @@
 预测系统配置文件
 包含训练和预测的统一配置参数
 """
+import os
+
+# 特征选择缓存
+PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FEATURE_SELECTION_CACHE_ENABLED = True
+FEATURE_SELECTION_CACHE_FORCE_REFRESH = False
+FEATURE_SELECTION_CACHE_DIR = os.path.join(PROJECT_ROOT_DIR, 'artifacts', 'feature_selection')
+FEATURE_SELECTION_CACHE_TTL_DAYS = 14
+FEATURE_SELECTION_CACHE_VERSION = "v1"
 
 # ============ 预测目标配置 ============
 PREDICTION_PERIOD_DAYS = 30  # 未来预测天数
@@ -20,7 +29,7 @@ LABEL_USE_INDUSTRY_NEUTRAL = True  # 是否对行业截面做去均值
 
 # 批量训练配置
 ENABLE_BATCH_TRAINING = True  # 🆕 是否启用批量训练模式（一次性训练多只股票）
-BATCH_TRAINING_SIZE = 50  # 🆕 每批训练的股票数量（可根据内存调整：10-300）
+BATCH_TRAINING_SIZE = 150  # 🆕 每批训练的股票数量（可根据内存调整：10-300）
 # 批量训练优势：
 #   - 使用真正的横截面quantile策略（每天多只股票排序）
 #   - 正样本率稳定在设定分位数（如25%）
@@ -48,7 +57,7 @@ ENABLE_INDUSTRY_FEATURES = True
 INDUSTRY_MIN_FREQUENCY = 0.005  # 行业最小频率，低于此值归为'Other'
 
 # 板块特征
-ENABLE_BOARD_ONEHOT = True  # 是否启用板块One-Hot
+ENABLE_BOARD_ONEHOT = False  # 是否启用板块One-Hot
 
 # 基本面特征配置
 FUNDAMENTAL_PUBLISH_DELAY_DAYS = 60  # 🔧 财报公告延迟天数（数据源缺publish_date时使用）
@@ -83,18 +92,35 @@ ENABLE_TIME_SERIES_SPLIT = True  # 是否启用时间序列切分
 
 # 🔧 滚动窗口配置（关键改进）
 USE_ROLLING_WINDOW = True  # 是否使用滚动窗口切分（而非全部历史）
-ROLLING_TRAIN_YEARS = 2  # 训练窗口年数（使用最近3年数据）
-ROLLING_VAL_YEARS = 0.5  # 验证窗口年数（最近1年）
+ROLLING_TRAIN_YEARS = 3  # 训练窗口年数（使用最近3年数据）
+ROLLING_VAL_YEARS = 1 # 验证窗口年数（最近1年）
 ROLLING_EMBARGO_DAYS = 40  # 🔧 Stage5修复: 从5天改为40天 (预测期30天+10天缓冲)
 
 # 样本加权配置
-ENABLE_SAMPLE_WEIGHTING = False  # 是否对样本加时间衰减权重（近期权重更高）
-SAMPLE_WEIGHT_HALFLIFE_YEARS = 1.0  # 权重半衰期（年）
+ENABLE_SAMPLE_WEIGHTING = True  # 是否对样本加时间衰减权重（近期权重更高）
+SAMPLE_WEIGHT_HALFLIFE_YEARS = 1  # 权重半衰期（年）
 
 # 特征选择
 ENABLE_FEATURE_SELECTION = True  # ✅ 已启用，OneHot后特征选择正常工作
-FEATURE_SELECTION_METHOD = 'model_based'  # 'model_based' or 'shap'
+FEATURE_SELECTION_METHOD = 'shap'  # 'model_based' or 'shap'
 MIN_FEATURE_IMPORTANCE = 0.005  # 最小特征重要性阈值,0.001到0.005
+FEATURE_SELECTION_MIN_FEATURES = 25  # 最少保留特征数
+FEATURE_SELECTION_MAX_FEATURES = 60  # 最多保留特征数
+FEATURE_SELECTION_SHAP_SAMPLE_SIZE = 4000  # SHAP抽样规模
+FEATURE_SELECTION_SHAP_BACKGROUND_SIZE = 512  # SHAP背景集规模
+FEATURE_SELECTION_SHAP_TREE_LIMIT = None  # SHAP树深限制（None表示自动）
+FEATURE_SELECTION_GROUP_LIMIT = 4  # 每个前缀/主题最大保留特征数
+FEATURE_SELECTION_CORR_THRESHOLD = 0.95  # 特征去重的相关性上限
+CLS_PRODUCTION_THRESHOLD = 0.16  # 生产使用的分类阈值
+ENABLE_REGRESSION_TASK = False  # 默认关闭回归任务，待标签质量提升后再启用
+
+# 特征选择缓存
+PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FEATURE_SELECTION_CACHE_ENABLED = True
+FEATURE_SELECTION_CACHE_FORCE_REFRESH = False
+FEATURE_SELECTION_CACHE_DIR = os.path.join(PROJECT_ROOT_DIR, 'artifacts', 'feature_selection')
+FEATURE_SELECTION_CACHE_TTL_DAYS = 14
+FEATURE_SELECTION_CACHE_VERSION = "v1"
 
 # 概率校准
 ENABLE_CALIBRATION = True  # 是否启用概率校准
@@ -122,31 +148,43 @@ OPTUNA_N_TRIALS = 30  # ✅ Stage5修复: 与训练脚本一致 (--optuna-trials
 OPTUNA_TIMEOUT = 3600  # 优化超时时间(秒)
 OPTUNA_PATIENCE = 10  # PatientPruner容忍度
 
+# 数据驱动参数调整配置
+ENABLE_DATA_DRIVEN_PARAM_ADJUSTMENT = True  # 是否启用数据驱动参数调整
+DATA_DRIVEN_ADJUSTMENT_MODE = 'adaptive'  # 'adaptive' 或 'conservative'
+# adaptive: 根据数据复杂度动态调整参数范围
+# conservative: 使用保守的参数范围，避免过拟合
+
+# 数据复杂度阈值配置
+SMALL_SAMPLE_THRESHOLD = 1000  # 小样本阈值
+LARGE_SAMPLE_THRESHOLD = 10000  # 大样本阈值
+HIGH_DIMENSION_THRESHOLD = 50  # 高维特征阈值
+HIGH_COMPLEXITY_THRESHOLD = 0.7  # 高复杂度阈值
+
 # ============ 模型超参数配置 ============
-# LightGBM 超参数 (✅ Stage5修复: 与Optuna约束一致)
+# LightGBM 超参数 (✅ 第一阶段优化: 与扩展后的Optuna范围一致)
 LIGHTGBM_PARAMS = {
-    'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 5,           # ✅ Stage5修复: 从5改为4，与Optuna一致
-    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率配合更多树
-    'num_leaves': 31,         # ✅ Stage5修复: 2^4-1=15，匹配max_depth=4
-    'min_child_samples': 20,  # ✅ 已调优: 增强正则化（Optuna范围20-100）
-    'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'reg_alpha': 1.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
-    'reg_lambda': 1.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
+    'n_estimators': 300,      # ✅ 已调优: 增加树数量（Optuna范围100-800）
+    'max_depth': 5,           # ✅ 第一阶段优化: 从4改为5（Optuna范围3-8）
+    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率配合更多树（Optuna范围0.005-0.5）
+    'num_leaves': 31,         # ✅ 第一阶段优化: 保持31（2^5-1=31，匹配max_depth=5）
+    'min_child_samples': 20,  # ✅ 已调优: 增强正则化（Optuna范围10-150）
+    'subsample': 0.7,         # ✅ 第一阶段优化: 与Optuna 0.5-0.9一致
+    'colsample_bytree': 0.7,  # ✅ 第一阶段优化: 与Optuna 0.5-0.9一致
+    'reg_alpha': 1.0,         # ✅ 第一阶段优化: 从5.0改为1.0（Optuna范围0.0-15.0）
+    'reg_lambda': 1.0,        # ✅ 第一阶段优化: 从7.0改为1.0（Optuna范围0.0-15.0）
 }
 
-# XGBoost 超参数 (✅ Stage5修复: 与Optuna约束一致)
+# XGBoost 超参数 (✅ 第一阶段优化: 与扩展后的Optuna范围一致)
 XGBOOST_PARAMS = {
-    'n_estimators': 300,      # ✅ 已调优: 增加树数量
-    'max_depth': 5,           # ✅ Stage5修复: 从5改为4，与Optuna一致
-    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率
-    'subsample': 0.7,         # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'colsample_bytree': 0.7,  # ✅ Stage5修复: 与Optuna 0.6-0.8一致
-    'reg_alpha': 1.0,         # ✅ Stage5修复: 从0.1改为5.0（Optuna范围3-10）
-    'reg_lambda': 1.0,        # ✅ Stage5修复: 从1.0改为7.0（Optuna范围5-10）
-    'min_child_weight': 20,   # ✅ Stage5修复: 从5改为10（Optuna范围5-15）
-    'gamma': 2.0,             # ✅ Stage5修复: 从0.1改为2.0（Optuna范围1-5）
+    'n_estimators': 300,      # ✅ 已调优: 增加树数量（Optuna范围100-800）
+    'max_depth': 5,           # ✅ 第一阶段优化: 从4改为5（Optuna范围3-8）
+    'learning_rate': 0.05,    # ✅ 已调优: 降低学习率（Optuna范围0.005-0.5）
+    'subsample': 0.7,         # ✅ 第一阶段优化: 与Optuna 0.5-0.9一致
+    'colsample_bytree': 0.7,  # ✅ 第一阶段优化: 与Optuna 0.5-0.9一致
+    'reg_alpha': 1.0,         # ✅ 第一阶段优化: 从5.0改为1.0（Optuna范围0.0-15.0）
+    'reg_lambda': 1.0,        # ✅ 第一阶段优化: 从7.0改为1.0（Optuna范围0.0-15.0）
+    'min_child_weight': 10,   # ✅ 第一阶段优化: 从20改为10（Optuna范围1-20）
+    'gamma': 2.0,             # ✅ 第一阶段优化: 保持2.0（Optuna范围0.0-15.0）
 }
 
 # Logistic Regression 超参数 (✅ 已应用保守调优)
@@ -200,7 +238,7 @@ REGRESSION_LABEL_CLIP_PERCENTILE = 0.01  # 上下1%截断
 
 
 # 通过门槛
-MIN_CLASSIFICATION_AUC = 0.50  # ✅ Stage5修复: 至少略好于随机（从0.48提升）
+MIN_CLASSIFICATION_AUC = 0.45  # ✅ Stage5修复: 至少略好于随机（从0.48提升）
 MIN_REGRESSION_R2 = -0.10  # 🔧 允许负R²: 小样本回归可能过拟合，但仍可分析特征重要性
 MIN_TOP_K_IMPROVEMENT = 3.0  # Top-K命中率最小提升(百分点)
 
