@@ -407,6 +407,7 @@ class UnifiedDatabaseManager:
                         daily_return_pct DOUBLE,
                         total_return_pct DOUBLE,
                         last_valued_at DATETIME,
+                        rebalance_interval_days INT DEFAULT 30,
                         created_at DATETIME NOT NULL,
                         updated_at DATETIME NOT NULL
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -501,6 +502,7 @@ class UnifiedDatabaseManager:
                         daily_return_pct REAL,
                         total_return_pct REAL,
                         last_valued_at TEXT,
+                        rebalance_interval_days INTEGER DEFAULT 30,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
@@ -561,8 +563,40 @@ class UnifiedDatabaseManager:
             self.execute_update(nav_history_sql)
             self.execute_update(rebalance_sql)
             logger.info("确保 predictions 与 portfolio 系列表存在")
+            # 执行迁移：添加 rebalance_interval_days 字段
+            self._migrate_add_rebalance_interval_days()
         except Exception as e:
             logger.error(f"确保表存在失败: {e}")
+    
+    def _migrate_add_rebalance_interval_days(self):
+        """迁移：为 portfolios 表添加 rebalance_interval_days 字段"""
+        try:
+            # 检查字段是否已存在
+            table_info = self.get_table_info('portfolios')
+            field_names = []
+            if self.db_type == 'mysql':
+                field_names = [row.get('Field', '') for row in table_info]
+            else:
+                field_names = [row.get('name', '') for row in table_info]
+            
+            if 'rebalance_interval_days' not in field_names:
+                if self.db_type == 'mysql':
+                    alter_sql = """
+                        ALTER TABLE portfolios 
+                        ADD COLUMN rebalance_interval_days INT DEFAULT 30
+                        AFTER last_valued_at
+                    """
+                else:
+                    alter_sql = """
+                        ALTER TABLE portfolios 
+                        ADD COLUMN rebalance_interval_days INTEGER DEFAULT 30
+                    """
+                self.execute_update(alter_sql)
+                logger.info("成功为 portfolios 表添加 rebalance_interval_days 字段")
+            else:
+                logger.debug("portfolios 表已包含 rebalance_interval_days 字段，跳过迁移")
+        except Exception as e:
+            logger.warning(f"迁移 rebalance_interval_days 字段失败（可能已存在）: {e}")
     
     def get_table_info(self, table_name: str) -> List[Dict[str, Any]]:
         """

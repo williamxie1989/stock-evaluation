@@ -145,10 +145,13 @@ class IntelligentStockSelector:
         
         # 新增：为V2模型创建统一特征构建器
         try:
+            # 启用基本面特征（financial features），以满足V2模型对财务字段的依赖
             self.unified_feature_builder = UnifiedFeatureBuilder(
                 data_access=self.data_access,
                 db_manager=self.db,
-                lookback_days=180  # 与V2训练一致
+                lookback_days=180,  # 与V2训练一致
+                enable_fundamental=True,
+                enable_cache=True,
             )
             logger.info("✅ UnifiedFeatureBuilder 初始化成功")
         except Exception as e:
@@ -813,6 +816,45 @@ class IntelligentStockSelector:
 
         logger.warning("特征获取结果为空")
         return pd.DataFrame()
+
+    def _build_v2_input(self, features_df: pd.DataFrame, expected_features: List[str]) -> pd.DataFrame:
+        """
+        为V2模型构建输入DataFrame，确保列名与模型期望完全一致。
+        优先使用精确匹配，若不存在则尝试大小写不敏感匹配；仍不存在则填充0。
+
+        Returns: DataFrame with columns in the order of expected_features
+        """
+        # 构造大小写到原列名的映射，以支持不一致的命名风格
+        col_map = {col: col for col in features_df.columns}
+        lower_map = {col.lower(): col for col in features_df.columns}
+
+        out = {}
+        for feat in expected_features:
+            if feat in features_df.columns:
+                out[feat] = features_df[feat].astype(float).fillna(0)
+            else:
+                # 尝试大小写不敏感匹配
+                match = lower_map.get(feat.lower())
+                if match:
+                    out[feat] = features_df[match].astype(float).fillna(0)
+                else:
+                    # 进一步尝试将 '.' 替换为 '_' 或反之
+                    alt = feat.replace('.', '_')
+                    match2 = lower_map.get(alt.lower())
+                    if match2:
+                        out[feat] = features_df[match2].astype(float).fillna(0)
+                    else:
+                        # 不存在，则填充0
+                        out[feat] = 0.0
+
+        Xv2 = pd.DataFrame(out)
+        # 如果索引长度与原始不同（如标量填充），尝试广播长度
+        if len(Xv2) != len(features_df):
+            try:
+                Xv2 = Xv2.reindex(index=features_df.index).fillna(0)
+            except Exception:
+                pass
+        return Xv2
     
     def predict_stocks(self, symbols: List[str], top_n: int = 10) -> List[Dict[str, Any]]:
         """
@@ -917,7 +959,8 @@ class IntelligentStockSelector:
                         else:
                             # 使用训练配置中的特征列表
                             logger.warning("V2模型无selected_features且pipeline无feature_names_in_，使用所有数值特征")
-                            expected_features = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
+                            # Xc 尚未定义，此处使用 features_df 的列作为回退来源
+                            expected_features = [c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]
                     else:
                         expected_features = selected_features
                         logger.info(f"V2模型使用selected_features: {len(expected_features)} 个特征")
@@ -954,12 +997,11 @@ class IntelligentStockSelector:
                     logger.warning(f"V1模型所需特征缺失严重({len(available)}/{len(expected_features)}), 回退到数值特征全集")
                     expected_features = [c for c in Xc.columns if c != 'symbol' and np.issubdtype(Xc[c].dtype, np.number)]
                 
-                # 确保所有期望特征均存在
-                for col in expected_features:
-                    if col not in Xc.columns:
-                        Xc[col] = 0
-                
-                Xc = Xc[expected_features].fillna(0)
+                # 为V2模型使用专用构建器，确保列名与模型期望严格匹配（大小写不敏感）
+                if is_v2:
+                    Xc = self._build_v2_input(features_df, expected_features)
+                else:
+                    Xc = Xc.reindex(columns=expected_features).fillna(0)
                 
                 # 方差检查（仅对V1模型）
                 if not is_v2 and np.isclose(Xc.var().sum(), 0):
@@ -1074,7 +1116,8 @@ class IntelligentStockSelector:
                             logger.info(f"V2回归模型从pipeline获取特征: {len(expected_features_r)} 个")
                         else:
                             logger.warning("V2回归模型无selected_features且pipeline无feature_names_in_，使用所有数值特征")
-                            expected_features_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
+                            # Xr 尚未定义，此处使用 features_df 的列作为回退来源
+                            expected_features_r = [c for c in features_df.columns if c != 'symbol' and np.issubdtype(features_df[c].dtype, np.number)]
                     else:
                         expected_features_r = selected_features_r
                         logger.info(f"V2回归模型使用selected_features: {len(expected_features_r)} 个特征")
@@ -1107,12 +1150,11 @@ class IntelligentStockSelector:
                     logger.warning(f"V1回归模型所需特征缺失严重({len(available_r)}/{len(expected_features_r)}), 回退")
                     expected_features_r = [c for c in Xr.columns if c != 'symbol' and np.issubdtype(Xr[c].dtype, np.number)]
                 
-                # 确保所有期望特征均存在
-                for col in expected_features_r:
-                    if col not in Xr.columns:
-                        Xr[col] = 0
-                
-                Xr = Xr[expected_features_r].fillna(0)
+                # 为V2回归模型使用专用构建器，确保列名兼容并填充缺失特征
+                if is_v2_reg:
+                    Xr = self._build_v2_input(features_df, expected_features_r)
+                else:
+                    Xr = Xr.reindex(columns=expected_features_r).fillna(0)
                 
                 # 方差检查（仅对V1模型）
                 if not is_v2_reg and np.isclose(Xr.var().sum(), 0):

@@ -36,11 +36,16 @@ import time
 import asyncio
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
+import warnings
 
 # 配置日志
 logger = logging.getLogger(__name__)
 logging.getLogger('src.data.field_mapping').setLevel(logging.WARNING)
 logging.getLogger('src.ml.features.enhanced_features').setLevel(logging.WARNING)
+
+# 抑制 py_mini_racer 的资源警告（不影响功能的已知问题）
+warnings.filterwarnings("ignore", message=".*mr_free_context.*")
+warnings.filterwarnings("ignore", category=ResourceWarning, module="py_mini_racer")
 
 _APP_TZ_NAME = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
 try:
@@ -158,7 +163,7 @@ except Exception as e:
 # 初始化服务（使用统一数据访问层）
 data_sync_service = DataSyncService(data_provider=_unified_data_access)
 # 注入统一数据访问层实例，避免内部重复创建提供器
-concurrent_data_sync_service = ConcurrentDataSyncService(data_provider=_unified_data_access, max_workers=8, db_batch_size=50)
+concurrent_data_sync_service = ConcurrentDataSyncService(data_access=_unified_data_access, max_workers=8)
 # 已移除 concurrent_data_provider 实例化，统一通过 _unified_data_access
 market_selector_service = MarketSelectorService()
 
@@ -258,7 +263,7 @@ async def startup_event():
     
     print("应用启动，检查数据状态...")
     # 支持通过环境变量跳过启动时的数据同步，以便快速启动服务进行接口联调
-    if os.environ.get("SKIP_STARTUP_SYNC", "0") in ("1", "1", "1"):
+    if os.environ.get("SKIP_STARTUP_SYNC", "0") in ("1", "true", "True"):
         print("已设置SKIP_STARTUP_SYNC，跳过启动时数据初始化。")
         return
 
@@ -876,6 +881,7 @@ def api_create_portfolio(request: dict):
     }
     weight_overrides = {k: v for k, v in weight_overrides_raw.items() if v is not None} or None
     candidate_limit = _parse_int_param(request.get("candidate_limit"))
+    rebalance_interval_days = _parse_int_param(request.get("rebalance_interval_days"))
     try:
         if mode == "auto":
             data = create_portfolio_auto(
@@ -885,6 +891,7 @@ def api_create_portfolio(request: dict):
                 auto_trading=auto_trading_param,
                 weight_overrides=weight_overrides,
                 candidate_limit=candidate_limit,
+                rebalance_interval_days=rebalance_interval_days,
             )
         elif mode == "backtrack":
             backtrack_str = request.get("backtrack_date")
@@ -902,6 +909,7 @@ def api_create_portfolio(request: dict):
                 auto_trading=auto_trading_param,
                 weight_overrides=weight_overrides,
                 candidate_limit=candidate_limit,
+                rebalance_interval_days=rebalance_interval_days,
             )
         else:
             return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported mode"})

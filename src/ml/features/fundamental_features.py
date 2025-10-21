@@ -175,10 +175,25 @@ class FundamentalFeatureGenerator:
         """
         if self.data_manager is None:
             return pd.DataFrame(columns=['symbol', 'date'])
-        if dates is None or len(dates) == 0:
+
+        # 防御性处理：dates 可能为标量或非可迭代对象，确保转换为可迭代的日期序列
+        if dates is None:
             return pd.DataFrame(columns=['symbol', 'date'])
-        
-        date_index = pd.DatetimeIndex(pd.to_datetime(dates)).dropna().sort_values().unique()
+
+        # 如果传入单个 Timestamp / datetime / str，则包装为列表
+        from datetime import datetime as _dt
+        try:
+            if isinstance(dates, (_dt, pd.Timestamp, str)) or not hasattr(dates, '__iter__'):
+                dates = [dates]
+        except Exception:
+            # 保守回退：若检测失败，尝试直接将其封装为列表
+            dates = [dates]
+
+        try:
+            date_index = pd.DatetimeIndex(pd.to_datetime(dates)).dropna().sort_values().unique()
+        except Exception as e:
+            logger.warning(f"{symbol}: build_daily_dataframe 无法解析 dates 参数 - {e}")
+            return pd.DataFrame(columns=['symbol', 'date'])
         if len(date_index) == 0:
             return pd.DataFrame(columns=['symbol', 'date'])
         

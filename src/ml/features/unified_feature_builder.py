@@ -163,40 +163,54 @@ class UnifiedFeatureBuilder:
             logger.info("构建价量特征...")
             df_pv = self._build_price_volume_features(symbols, as_of_date, history_data)
         else:
+            # 保持最小结构，方便后续 merge
             df_pv = pd.DataFrame({'symbol': symbols})
-        
-        # Step 2: 构建市场因子特征
+
+        # Step 2: 构建市场因子并合并
         if self.enable_market:
             logger.info("构建市场因子...")
             market_universe = universe_symbols or symbols
             df_market = self._build_market_features(symbols, as_of_date, history_data, market_universe)
-            # 合并
-            if len(df_market) > 0:
+            if isinstance(df_market, pd.DataFrame) and len(df_market) > 0:
                 df_pv = df_pv.merge(df_market, on='symbol', how='left', suffixes=('', '_market'))
-        
+
         # Step 3: 添加行业特征
         if self.enable_industry:
             logger.info("添加行业特征...")
             df_pv = add_industry_features(df_pv, self.db_manager, merge_low_freq=True)
-        
+
         # Step 4: 添加板块特征
         if self.enable_board:
             logger.info("添加板块特征...")
             df_pv = add_board_features(df_pv, symbol_col='symbol')
-        
-        # Step 5: 添加基本面特征（财务数据）
+
+        # Step 5: 添加基本面特征（如果启用）
         if self.enable_fundamental:
             logger.info("添加基本面特征...")
+            # 确保有 date 列（某些路径下 df_pv 的 date 保存在索引）
+            if 'date' not in df_pv.columns:
+                try:
+                    if isinstance(df_pv.index, pd.DatetimeIndex):
+                        df_pv = df_pv.reset_index()
+                        if 'index' in df_pv.columns and 'date' not in df_pv.columns:
+                            df_pv.rename(columns={'index': 'date'}, inplace=True)
+                        logger.debug('已从索引恢复 date 列')
+                    else:
+                        # 若无日期信息，添加当前日期以便后续合并不会异常
+                        df_pv['date'] = pd.Timestamp.now()
+                        logger.debug('DataFrame 无 DatetimeIndex，已添加当前 date 列作为回退')
+                except Exception:
+                    logger.debug('尝试恢复 date 列失败，继续调用 _add_fundamental_features 以触发更明确的日志')
             df_pv = self._add_fundamental_features(df_pv, as_of_date)
-        
-        # Step 6: 构建标签（如果需要）
+
+        # 构建标签（如果需要）
         if return_labels:
             logger.info(f"构建 {label_period} 天预测标签...")
             df_pv = self._add_labels(df_pv, label_period, as_of_date)
-        
+
         # 清理和验证
         df_pv = self._clean_features(df_pv)
-        
+
         logger.info(f"✅ 特征构建完成: {len(df_pv)} 行 x {len(df_pv.columns)} 列")
         
         # 🚀 保存到缓存（不缓存标签数据）
@@ -640,7 +654,30 @@ class UnifiedFeatureBuilder:
         
         # 替换inf为nan
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        
+
+        # ---- 列名兼容映射（处理训练时与预测时常见的命名差异） ----
+        # 例如: debt_to_asset_ratio -> debt_to_asset, market_cap -> market_cap (保持),
+        # pe_ttm_valid/pb_valid: 若不存在则基于相关列创建占位布尔列
+        col_map = {
+            'debt_to_asset_ratio': 'debt_to_asset',
+            'total_revenue': 'revenue',
+            'net_profit_yoy_growth': 'net_profit_yoy',
+            'revenue_yoy_growth': 'revenue_yoy',
+            'log_market_cap': 'log_market_cap',
+        }
+        for src, dst in col_map.items():
+            if src in df.columns and dst not in df.columns:
+                df[dst] = df[src]
+
+        # 创建 pe_ttm_valid / pb_valid 这些常用的有效性列（若模型需要）
+        try:
+            if 'pe_ttm' in df.columns and 'pe_ttm_valid' not in df.columns:
+                df['pe_ttm_valid'] = (~df['pe_ttm'].isna()) & (df['pe_ttm'] > 0)
+            if 'pb' in df.columns and 'pb_valid' not in df.columns:
+                df['pb_valid'] = (~df['pb'].isna()) & (df['pb'] > 0)
+        except Exception:
+            pass
+
         return df
     
     def get_numerical_features(self) -> List[str]:
@@ -660,8 +697,7 @@ class UnifiedFeatureBuilder:
                 # 估值特征
                 'market_cap', 'log_market_cap', 'circ_market_cap', 
                 'pe_ttm', 'pe_ttm_valid', 'pb', 'pb_valid',
-                'roe', 'net_profit_margin',
-                
+        
                 # 盈利特征
                 'roe_latest', 'roa', 'gross_profit_margin',
                 'net_profit', 'total_revenue', 'roe_yoy_growth',
