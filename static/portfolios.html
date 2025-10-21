@@ -99,6 +99,11 @@
                 <p class="text-xs text-gray-500 mt-1">关闭后组合将按固定周期调仓，不触发止盈止损和自适应风控。</p>
             </div>
             <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">调仓周期（天）</label>
+                <input id="inputRebalanceInterval" type="number" min="1" max="365" value="30" class="w-full px-3 py-2 border rounded">
+                <p class="text-xs text-gray-500 mt-1">组合每隔多少天进行一次调仓，建议 7-90 天之间。</p>
+            </div>
+            <div class="mb-4">
                 <label class="block text-sm font-medium text-gray-700 mb-1">候选股票数量上限</label>
                 <input id="inputCandidateLimit" type="number" min="0" placeholder="留空使用默认值" class="w-full px-3 py-2 border rounded">
                 <p class="text-xs text-gray-500 mt-1">0 表示不限数量；建议限制规模以提升建仓效率。</p>
@@ -137,6 +142,7 @@ const btnSubmit = document.getElementById('btnSubmit');
 const inputName = document.getElementById('inputName');
 const inputTopN = document.getElementById('inputTopN');
 const inputCapital = document.getElementById('inputCapital');
+const inputRebalanceInterval = document.getElementById('inputRebalanceInterval');
 const selectMode = document.getElementById('selectMode');
 const backtrackOptions = document.getElementById('backtrackOptions');
 const inputBacktrackDate = document.getElementById('inputBacktrackDate');
@@ -152,6 +158,7 @@ function toggleModal(show) {
         inputName.value = '';
         inputTopN.value = 20;
         inputCapital.value = 1000000;
+        inputRebalanceInterval.value = 30;
         inputBacktrackDate.value = '';
         backtrackOptions.classList.add('hidden');
         selectMode.value = 'auto';
@@ -398,6 +405,11 @@ async function createPortfolio() {
         return;
     }
     payload.auto_trading = inputAutoTrading.checked;
+
+    const rebalanceInterval = Number(inputRebalanceInterval.value);
+    if (Number.isFinite(rebalanceInterval) && rebalanceInterval >= 1) {
+        payload.rebalance_interval_days = rebalanceInterval;
+    }
 
     const candidateLimitRaw = inputCandidateLimit.value.trim();
     if (candidateLimitRaw !== '') {

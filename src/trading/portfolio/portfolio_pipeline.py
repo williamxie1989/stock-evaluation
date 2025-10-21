@@ -311,14 +311,33 @@ class PortfolioPipeline:
         # 统一列名（lowercase）
         cols = {c.lower(): c for c in df.columns}
         def get_col(name):
-            return df[cols[name]] if name in cols else df.get(name)
+            """安全地获取列数据，确保返回 Series"""
+            if name in cols:
+                col_data = df[cols[name]]
+            else:
+                col_data = df.get(name)
+            
+            # 确保返回 Series 而不是 DataFrame
+            if isinstance(col_data, pd.DataFrame):
+                # 如果意外得到 DataFrame，取第一列
+                return col_data.iloc[:, 0] if not col_data.empty else pd.Series(dtype=float, index=df.index)
+            elif col_data is None:
+                # 如果列不存在，返回空 Series
+                return pd.Series(dtype=float, index=df.index)
+            return col_data
+        
+        # 安全构建新 DataFrame
+        volume_col = get_col('volume')
+        if volume_col is None or volume_col.isna().all():
+            # 如果 volume 不存在或全为 NaN，尝试 turnover
+            volume_col = get_col('turnover')
         
         out = pd.DataFrame({
             'open': get_col('open'),
             'close': get_col('close'),
             'high': get_col('high'),
             'low': get_col('low'),
-            'volume': get_col('volume') if 'volume' in cols or 'volume' in df.columns else df.get('turnover')
+            'volume': volume_col
         }, index=df.index)
         out = out.dropna()
         

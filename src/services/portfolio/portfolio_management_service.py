@@ -109,6 +109,7 @@ class PortfolioInfo:
     benchmark: str
     risk_level: str
     strategy_tags: List[str]
+    rebalance_interval_days: int = 30
 
     def summary(self, valuation: PortfolioValuation) -> Dict[str, Any]:
         return {
@@ -121,6 +122,7 @@ class PortfolioInfo:
             "benchmark": self.benchmark,
             "risk_level": self.risk_level,
             "strategy_tags": self.strategy_tags,
+            "rebalance_interval_days": self.rebalance_interval_days,
             "nav_value": round(valuation.nav_value, 6),
             "total_value": round(valuation.nav_total, 2),
             "daily_return_pct": round(valuation.daily_return_pct, 6),
@@ -131,7 +133,7 @@ class PortfolioInfo:
 
 @dataclass
 class PortfolioDetail(PortfolioInfo):
-    holdings: List[PortfolioHoldingSnapshot]
+    holdings: List[PortfolioHoldingSnapshot] = field(default_factory=list)
     notes: Optional[str] = None
     rebalance_history: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -667,6 +669,7 @@ def _hydrate_summary(row: Dict[str, Any]) -> PortfolioInfo:
         benchmark=row.get("benchmark") or "",
         risk_level=row.get("risk_level") or "",
         strategy_tags=strategy_tags,
+        rebalance_interval_days=int(row.get("rebalance_interval_days") or 30),
     )
 
 
@@ -896,6 +899,7 @@ def _hydrate_detail(
         benchmark=info.benchmark,
         risk_level=info.risk_level,
         strategy_tags=info.strategy_tags,
+        rebalance_interval_days=info.rebalance_interval_days,
         holdings=holdings,
         notes=portfolio_row.get("notes"),
         rebalance_history=rebalance_history,
@@ -1179,6 +1183,7 @@ def _simulate_backtrack_portfolio(
     auto_trading: bool, 
     weight_overrides: Optional[Dict[str, float]] = None, 
     candidate_limit: Optional[int] = None,
+    rebalance_interval_days: Optional[int] = None,
 ) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
     resolved_limit = resolve_candidate_limit(candidate_limit if candidate_limit is not None else pipeline.candidate_limit)
     logger.info(f"[回溯入口] auto_trading={auto_trading}, start_ts={start_ts}, end_ts={end_ts}, top_n={top_n}, initial_capital={initial_capital}, candidate_limit={candidate_limit}, resolved_limit={resolved_limit}")
@@ -1195,6 +1200,7 @@ def _simulate_backtrack_portfolio(
                 top_n=top_n, 
                 initial_capital=initial_capital, 
                 candidate_limit=resolved_limit,
+                rebalance_interval_days=rebalance_interval_days,
             )
         logger.info("[回溯分支] 进入_simulate_backtrack_passive")
         return _simulate_backtrack_passive(
@@ -1204,6 +1210,7 @@ def _simulate_backtrack_portfolio(
             top_n=top_n, 
             initial_capital=initial_capital, 
             candidate_limit=resolved_limit,
+            rebalance_interval_days=rebalance_interval_days,
         )
     except Exception as e:
         import traceback
@@ -1233,6 +1240,7 @@ def _simulate_backtrack_active(
     top_n: int,
     initial_capital: float,
     candidate_limit: Optional[int],
+    rebalance_interval_days: Optional[int] = None,
 ) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
     """基于 PortfolioPipeline + AdaptiveTradingSystem 运行回溯建仓与调仓仿真。"""
 
@@ -1282,7 +1290,8 @@ def _simulate_backtrack_active(
     if len(business_days) == 0 or business_days[0].normalize() != start_date.normalize():
         business_days = business_days.insert(0, start_date)
 
-    rebal_dates = _generate_rebalance_dates(start_date, end_date, _get_rebalance_interval_days())
+    rebalance_interval = rebalance_interval_days if rebalance_interval_days is not None and rebalance_interval_days >= 1 else _get_rebalance_interval_days()
+    rebal_dates = _generate_rebalance_dates(start_date, end_date, rebalance_interval)
     if data_access:
         adjusted: List[pd.Timestamp] = []
         seen: Set[pd.Timestamp] = set()
@@ -2021,6 +2030,7 @@ def _simulate_backtrack_passive(
     top_n: int,
     initial_capital: float,
     candidate_limit: Optional[int],
+    rebalance_interval_days: Optional[int] = None,
 ) -> Tuple[List[PortfolioHoldingSnapshot], Dict[str, PriceQuote], List[Dict[str, Any]], List[Dict[str, Any]], PortfolioValuation, datetime]:
     """回溯模拟被动调仓组合表现"""
     
@@ -2135,22 +2145,31 @@ def _simulate_backtrack_passive(
             hist = series.loc[:ts]
             price = hist.iloc[-1] if not hist.empty else None
             price_time = hist.index[-1] if not hist.empty else None
-            if price is None or pd.isna(price):
+            # 确保 price 是标量值，避免 Series 的布尔判断歧义
+            if price is not None and isinstance(price, pd.Series):
+                price = price.iloc[0] if not price.empty else None
+            if price is None or (pd.api.types.is_scalar(price) and pd.isna(price)):
                 future = series.loc[ts:]
                 if not future.empty:
                     price = future.iloc[0]
+                    if isinstance(price, pd.Series):
+                        price = price.iloc[0] if not price.empty else None
                     price_time = future.index[0]
                     hist = series.loc[:price_time]
-            if price is None or pd.isna(price):
+            if price is None or (pd.api.types.is_scalar(price) and pd.isna(price)):
                 continue
             prev_candidates = hist.iloc[:-1]
             prev = prev_candidates.iloc[-1] if not prev_candidates.empty else None
+            # 确保 prev 也是标量值
+            if prev is not None and isinstance(prev, pd.Series):
+                prev = prev.iloc[0] if not prev.empty else None
             price_time_ts = pd.Timestamp(price_time) if price_time is not None else None
-            return float(price), price_time_ts, (float(prev) if prev is not None else None)
+            return float(price), price_time_ts, (float(prev) if prev is not None and not pd.isna(prev) else None)
         return None, None, None
 
     # 生成调仓日期
-    rebal_dates = _generate_rebalance_dates(start_date, end_date, _get_rebalance_interval_days())
+    rebalance_interval = rebalance_interval_days if rebalance_interval_days is not None and rebalance_interval_days >= 1 else _get_rebalance_interval_days()
+    rebal_dates = _generate_rebalance_dates(start_date, end_date, rebalance_interval)
     if rebal_dates.empty:
         rebal_dates = pd.DatetimeIndex([start_date])
 
@@ -2471,6 +2490,7 @@ def _persist_portfolio(
         "daily_return_pct",
         "total_return_pct",
         "last_valued_at",
+        "rebalance_interval_days",
         "created_at",
         "updated_at",
     ]
@@ -2488,6 +2508,7 @@ def _persist_portfolio(
         valuation.daily_return_pct,
         valuation.total_return_pct,
         last_valued_at,
+        detail.rebalance_interval_days,
         created_at,
         updated_at,
     ]
@@ -2929,7 +2950,14 @@ def _calculate_daily_nav_with_rebalance_history(
                     valid = False
                     break
                 
-                price = float(frame.loc[dt, price_col])
+                # 确保获取标量值而不是 Series
+                price_data = frame.loc[dt, price_col]
+                if isinstance(price_data, pd.Series):
+                    price_data = price_data.iloc[0] if not price_data.empty else None
+                if price_data is None or pd.isna(price_data):
+                    valid = False
+                    break
+                price = float(price_data)
                 total_value += shares * price
             
             if valid:
@@ -3007,8 +3035,12 @@ def _calculate_portfolio_valuation(
         if price_col is None or frame.empty:
             quotes[holding.symbol] = PriceQuote(latest_price=0.0, previous_price=None, last_trade_at=None)
             continue
-        latest_price = float(frame[price_col].iloc[-1])
-        previous_price = float(frame[price_col].iloc[-2]) if len(frame) > 1 else None
+        # 确保获取单个值而不是 Series
+        price_series = frame[price_col]
+        if isinstance(price_series, pd.DataFrame):
+            price_series = price_series.iloc[:, 0]
+        latest_price = float(price_series.iloc[-1])
+        previous_price = float(price_series.iloc[-2]) if len(price_series) > 1 else None
         last_ts = pd.Timestamp(frame.index[-1]).to_pydatetime()
         nav_total += holding.shares * latest_price
         if previous_price is not None:
@@ -3098,7 +3130,14 @@ def _calculate_portfolio_valuation(
                 if price_col is None:
                     valid = False
                     break
-                price_val = float(frame.loc[dt, price_col])
+                # 确保获取标量值而不是 Series
+                price_data = frame.loc[dt, price_col]
+                if isinstance(price_data, pd.Series):
+                    price_data = price_data.iloc[0] if not price_data.empty else None
+                if price_data is None or pd.isna(price_data):
+                    valid = False
+                    break
+                price_val = float(price_data)
                 total_value += holding.shares * price_val
             if not valid:
                 continue
@@ -3232,6 +3271,7 @@ def create_portfolio_auto(
     auto_trading: Optional[bool] = None,
     weight_overrides: Optional[Dict[str, float]] = None,
     candidate_limit: Optional[int] = None,
+    rebalance_interval_days: Optional[int] = None,
 ) -> Dict[str, Any]:
     pipeline = _get_pipeline(initial_capital, top_n)
     auto_trading_flag = _parse_optional_bool(auto_trading, _default_auto_trading())
@@ -3347,6 +3387,7 @@ def create_portfolio_auto(
             cost_price_map=cost_price_map_auto if cost_price_map_auto else None,
             portfolio_id=-1,  # 临时组合，尚未持久化
         )
+        rebalance_interval = rebalance_interval_days if rebalance_interval_days is not None and rebalance_interval_days >= 1 else _get_rebalance_interval_days()
         detail = PortfolioDetail(
             id=-1,
             name=name,
@@ -3362,6 +3403,7 @@ def create_portfolio_auto(
                 "快速建仓" if used_selector else ("本地等权" if used_price_fallback else "等权分散"),
                 "自动调仓" if auto_trading_flag else "自动调仓:关闭",
             ],
+            rebalance_interval_days=rebalance_interval,
             holdings=snapshots,
             notes=(
                 "智能推荐自动建仓（快速选股模式）"
@@ -3413,6 +3455,7 @@ def create_portfolio_backtrack(
     auto_trading: Optional[bool] = None,
     weight_overrides: Optional[Dict[str, float]] = None,
     candidate_limit: Optional[int] = None,
+    rebalance_interval_days: Optional[int] = None,
 ) -> Dict[str, Any]:
     pipeline = _get_pipeline(initial_capital, top_n)
     data_access = getattr(pipeline, "data_access", None)
@@ -3439,7 +3482,9 @@ def create_portfolio_backtrack(
         auto_trading=bool(auto_trading_flag),
         weight_overrides=weight_overrides,
         candidate_limit=candidate_limit,
+        rebalance_interval_days=rebalance_interval_days,
     )
+    rebalance_interval = rebalance_interval_days if rebalance_interval_days is not None and rebalance_interval_days >= 1 else _get_rebalance_interval_days()
     strategy_tags = [
         "智能选股",
         f"Top{top_n}",
@@ -3456,6 +3501,7 @@ def create_portfolio_backtrack(
         benchmark="沪深300",
         risk_level=_infer_risk_level(top_n),
         strategy_tags=strategy_tags,
+        rebalance_interval_days=rebalance_interval,
         holdings=holdings_snapshots,
         notes=f"回溯建仓（起始 {start_ts.date().isoformat()}）",
         rebalance_history=rebalance_events,
