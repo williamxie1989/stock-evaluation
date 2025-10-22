@@ -26,10 +26,12 @@ ENABLE_LABEL_NEUTRAL_BAND = False  # 是否引入中性区间
 LABEL_NEUTRAL_QUANTILE = 0.5  # 中性区间上界（仅当启用neutral band时有效）
 LABEL_USE_MARKET_BASELINE = False  # 是否使用市场基准构建超额收益标签
 LABEL_USE_INDUSTRY_NEUTRAL = True  # 是否对行业截面做去均值
+INDUSTRY_RESIDUAL_MIN_SAMPLES = 4  # 行业残差最小有效样本数，少于该值将降级处理
+ENABLE_CROSS_SECTIONAL_RESIDUAL_FALLBACK = True  # 行业残差不足时是否回退到截面去均值
 
 # 批量训练配置
 ENABLE_BATCH_TRAINING = True  # 🆕 是否启用批量训练模式（一次性训练多只股票）
-BATCH_TRAINING_SIZE = 150  # 🆕 每批训练的股票数量（可根据内存调整：10-300）
+BATCH_TRAINING_SIZE = 300  # 🆕 每批训练的股票数量（可根据内存调整：10-300）
 # 批量训练优势：
 #   - 使用真正的横截面quantile策略（每天多只股票排序）
 #   - 正样本率稳定在设定分位数（如25%）
@@ -112,7 +114,11 @@ FEATURE_SELECTION_SHAP_TREE_LIMIT = None  # SHAP树深限制（None表示自动�
 FEATURE_SELECTION_GROUP_LIMIT = 4  # 每个前缀/主题最大保留特征数
 FEATURE_SELECTION_CORR_THRESHOLD = 0.95  # 特征去重的相关性上限
 CLS_PRODUCTION_THRESHOLD = 0.16  # 生产使用的分类阈值
-ENABLE_REGRESSION_TASK = False  # 默认关闭回归任务，待标签质量提升后再启用
+# 阈值自适应配置
+AUTO_ADJUST_CLASSIFICATION_THRESHOLD = True  # 根据验证集概率分布动态微调阈值
+TARGET_CLASSIFICATION_POS_RATE = None  # 默认使用标签实际正例占比，可设为期望占比(0-1)
+
+ENABLE_REGRESSION_TASK = False  # 暂停回归任务，待标签质量提升后再启用
 
 # 特征选择缓存
 PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
