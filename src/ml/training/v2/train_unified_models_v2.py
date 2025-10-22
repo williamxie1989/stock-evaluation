@@ -207,7 +207,7 @@ def prepare_training_data(
                 symbol,
                 start_date,
                 end_date,
-                adjust_mode='qfq'
+                adjust_mode='hfq'
             )
 
             # 🔧 使用 MIN_TRAINING_DAYS 作为数据足够性检查阈值（而非 LOOKBACK_DAYS）
@@ -215,7 +215,7 @@ def prepare_training_data(
                 logger.warning(f"  跳过: 不复权数据不足 ({len(price_df) if price_df is not None else 0} < {MIN_TRAINING_DAYS})")
                 failed_symbols.append((symbol, 'data_insufficient'))
                 quality_stats['data_insufficient'] += 1
-                continue
+                continue 
 
             std_price_df = _standardize_price_frame(price_df)
             if len(std_price_df) < MIN_TRAINING_DAYS:
@@ -230,7 +230,7 @@ def prepare_training_data(
                 symbol,
                 start_date,
                 end_date,
-                adjust_mode='qfq'
+                adjust_mode='hfq'
             )
 
             if qfq_df is None or len(qfq_df) == 0:
@@ -842,6 +842,23 @@ def train_models(
     feature_cols = numerical_features + categorical_features
     X = df[feature_cols].copy()
     
+    observed_pos_rate = float(df['label_cls'].mean()) if 'label_cls' in df.columns else None
+    if observed_pos_rate is not None:
+        logger.info("当前数据正样本率: %.2f%%", observed_pos_rate * 100)
+
+    target_pos_rate = TARGET_CLASSIFICATION_POS_RATE if 'TARGET_CLASSIFICATION_POS_RATE' in globals() else None
+    target_rate_source = "配置"
+    if target_pos_rate is None or target_pos_rate <= 0 or target_pos_rate >= 1:
+        target_pos_rate = observed_pos_rate
+        target_rate_source = "样本"
+
+    if target_pos_rate is not None:
+        logger.info("目标正样本率: %.2f%% (%s)", target_pos_rate * 100, target_rate_source)
+    else:
+        logger.info("目标正样本率: 未设置，将保持默认阈值")
+
+    auto_adjust_threshold = AUTO_ADJUST_CLASSIFICATION_THRESHOLD if 'AUTO_ADJUST_CLASSIFICATION_THRESHOLD' in globals() else False
+
     # 初始化训练器
     trainer = EnhancedTrainerV2(
         numerical_features=numerical_features,
@@ -864,6 +881,9 @@ def train_models(
             'shap_background_size': FEATURE_SELECTION_SHAP_BACKGROUND_SIZE,
             'shap_tree_limit': FEATURE_SELECTION_SHAP_TREE_LIMIT,
             'cls_threshold': CLS_PRODUCTION_THRESHOLD,
+            'auto_adjust_threshold': auto_adjust_threshold,
+            'target_positive_rate': target_pos_rate,
+            'observed_positive_rate': observed_pos_rate,
             'enable_regression_task': train_regression,
             'enable_sample_weighting': ENABLE_SAMPLE_WEIGHTING,
             'sample_weight_halflife': SAMPLE_WEIGHT_HALFLIFE_YEARS,
@@ -1020,13 +1040,19 @@ def train_models(
             best_pipeline = best_cls['pipeline']
             all_pred = best_pipeline.predict_proba(X)[:, 1]
 
-            production_threshold = trainer.config.get('cls_threshold', CLS_THRESHOLD)
+            production_threshold = best_cls['metrics'].get(
+                'production_threshold',
+                trainer.config.get('cls_threshold', CLS_THRESHOLD)
+            )
             optimal_threshold = best_cls['metrics'].get('optimal_threshold', production_threshold)
-            thresholds = OrderedDict([
-                ('prod', production_threshold),
-                ('opt', optimal_threshold),
-                ('0.5', 0.5)
-            ])
+            dynamic_threshold = best_cls['metrics'].get('dynamic_threshold')
+
+            thresholds = OrderedDict()
+            thresholds['prod'] = production_threshold
+            thresholds['opt'] = optimal_threshold
+            if dynamic_threshold is not None:
+                thresholds['dyn'] = dynamic_threshold
+            thresholds['0.5'] = 0.5
 
             monthly_results = evaluate_by_month(
                 y_cls,

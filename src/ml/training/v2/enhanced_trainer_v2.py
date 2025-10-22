@@ -14,6 +14,7 @@ import os
 import json
 import hashlib
 from pathlib import Path
+import math
 
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
@@ -664,17 +665,43 @@ class EnhancedTrainerV2:
     @staticmethod
     def _evaluate_threshold_metrics(y_true: pd.Series, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
         preds = (y_score >= threshold).astype(int)
+        positive_rate = float(preds.mean())
         if preds.sum() == 0:
             return {
                 'precision': 0.0,
                 'recall': 0.0,
-                'f1': 0.0
+                'f1': 0.0,
+                'positive_rate': positive_rate
             }
         return {
             'precision': float(precision_score(y_true, preds, zero_division=0)),
             'recall': float(recall_score(y_true, preds, zero_division=0)),
-            'f1': float(f1_score(y_true, preds, zero_division=0))
+            'f1': float(f1_score(y_true, preds, zero_division=0)),
+            'positive_rate': positive_rate
         }
+
+    @staticmethod
+    def _derive_dynamic_threshold(
+        scores: np.ndarray,
+        target_rate: Optional[float],
+        fallback: float,
+        clip_range: Tuple[float, float] = (0.01, 0.99)
+    ) -> Optional[float]:
+        if scores is None or len(scores) == 0:
+            return None
+        if target_rate is None or not (0 < target_rate < 1):
+            return None
+
+        quantile_level = float(np.clip(1.0 - target_rate, 0.0, 1.0))
+        threshold = float(np.quantile(scores, quantile_level))
+
+        if np.isnan(threshold) or not math.isfinite(threshold):
+            return None
+
+        lo, hi = clip_range
+        threshold = float(np.clip(threshold, lo, hi))
+
+        return threshold if not math.isclose(threshold, fallback, rel_tol=1e-5, abs_tol=1e-5) else fallback
 
     def _log_fold_classification_diagnostics(
         self,
@@ -2106,17 +2133,50 @@ class EnhancedTrainerV2:
             metrics['val_brier_calibrated'] = cal_brier
             logger.info("校准后 Brier: %.4f (改善 %.4f)", cal_brier, metrics['val_brier'] - cal_brier)
 
-        production_threshold = float(self.config.get('cls_threshold', CLS_THRESHOLD))
+        baseline_threshold = float(self.config.get('cls_threshold', CLS_THRESHOLD))
+        production_threshold = baseline_threshold
+
+        target_positive_rate = self.config.get('target_positive_rate')
+        dynamic_threshold = None
+        dynamic_metrics: Dict[str, float] = {}
+
+        if self.config.get('auto_adjust_threshold', False):
+            dynamic_threshold = self._derive_dynamic_threshold(
+                calibrated_scores,
+                target_positive_rate,
+                fallback=baseline_threshold
+            )
+            if dynamic_threshold is not None and not math.isclose(dynamic_threshold, production_threshold, rel_tol=1e-3, abs_tol=1e-4):
+                logger.info(
+                    "动态阈值调整: %.3f → %.3f (目标正样本率 %.2f%%)",
+                    production_threshold,
+                    dynamic_threshold,
+                    target_positive_rate * 100 if target_positive_rate else float('nan')
+                )
+                production_threshold = dynamic_threshold
+            elif dynamic_threshold is not None:
+                logger.info("动态阈值与初始阈值一致: %.3f", dynamic_threshold)
+
         prod_metrics = self._evaluate_threshold_metrics(y_val, calibrated_scores, production_threshold)
+        if dynamic_threshold is not None:
+            dynamic_metrics = prod_metrics.copy()
+
         optimal_threshold, threshold_metrics = self._find_optimal_threshold(y_val, calibrated_scores)
         high_threshold = min(0.6, max(production_threshold + 0.05, optimal_threshold + 0.03))
         high_metrics = self._evaluate_threshold_metrics(y_val, calibrated_scores, high_threshold)
         metrics['optimal_threshold'] = optimal_threshold
         metrics.update({f"optimal_{k}": v for k, v in threshold_metrics.items()})
+        metrics['baseline_threshold'] = baseline_threshold
         metrics['production_threshold'] = production_threshold
         metrics.update({f"production_{k}": v for k, v in prod_metrics.items()})
+        metrics['dynamic_threshold'] = dynamic_threshold
+        if dynamic_metrics:
+            metrics.update({f"dynamic_{k}": v for k, v in dynamic_metrics.items()})
         metrics['high_threshold'] = high_threshold
         metrics.update({f"high_{k}": v for k, v in high_metrics.items()})
+
+        # 将最终阈值写回配置，供后续流程和模型持久化使用
+        self.config['cls_threshold'] = production_threshold
 
         logger.info(
             "最佳阈值 %.3f → 验证 Precision %.4f / Recall %.4f / F1 %.4f",
@@ -2132,6 +2192,15 @@ class EnhancedTrainerV2:
             prod_metrics.get('recall', np.nan),
             prod_metrics.get('f1', np.nan)
         )
+        if dynamic_threshold is not None and not math.isclose(dynamic_threshold, baseline_threshold, rel_tol=1e-3, abs_tol=1e-4):
+            logger.info(
+                "动态阈值 %.3f → Precision %.4f / Recall %.4f / F1 %.4f (预测占比 %.2f%%)",
+                dynamic_threshold,
+                dynamic_metrics.get('precision', np.nan),
+                dynamic_metrics.get('recall', np.nan),
+                dynamic_metrics.get('f1', np.nan),
+                dynamic_metrics.get('positive_rate', 0.0) * 100 if 'positive_rate' in dynamic_metrics else float('nan')
+            )
 
         val_dates = None
         if isinstance(X_val, pd.DataFrame) and '_date' in X_val.columns:
@@ -2160,7 +2229,9 @@ class EnhancedTrainerV2:
             'calibrator': calibrator,
             'selected_features': list(selected_features),
             'metrics': metrics,
-            'threshold': optimal_threshold,
+            'threshold': production_threshold,
+            'optimal_threshold': optimal_threshold,
+            'dynamic_threshold': dynamic_threshold,
             'training_date': datetime.now().strftime('%Y-%m-%d'),
             'config': self.config.copy(),
             'stage5_metadata': {

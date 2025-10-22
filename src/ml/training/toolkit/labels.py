@@ -4,6 +4,15 @@
 import logging
 from typing import Dict, List, Optional
 
+try:
+    from config.prediction_config import (
+        INDUSTRY_RESIDUAL_MIN_SAMPLES,
+        ENABLE_CROSS_SECTIONAL_RESIDUAL_FALLBACK
+    )
+except Exception:  # pragma: no cover - 配置导入失败时使用默认值
+    INDUSTRY_RESIDUAL_MIN_SAMPLES = None
+    ENABLE_CROSS_SECTIONAL_RESIDUAL_FALLBACK = True
+
 import numpy as np
 import pandas as pd
 
@@ -27,7 +36,9 @@ def add_labels_corrected(
     market_column: str = 'MKT',
     use_industry_neutral: bool = False,
     industry_column: str = 'industry',
-    stock_data: Optional[pd.DataFrame] = None
+    stock_data: Optional[pd.DataFrame] = None,
+    industry_residual_min_samples: Optional[int] = INDUSTRY_RESIDUAL_MIN_SAMPLES,
+    enable_cross_sectional_residual_fallback: bool = ENABLE_CROSS_SECTIONAL_RESIDUAL_FALLBACK
 ) -> pd.DataFrame:
     """使用前复权价格构建标签，并提供原始价格对照。
 
@@ -68,6 +79,10 @@ def add_labels_corrected(
         行业列列名（默认 industry）。
     stock_data : DataFrame, optional
         兼容旧接口，等价于 ``price_data``。
+    industry_residual_min_samples : int, optional
+        计算行业残差所需的最小行业样本数，默认取配置值，缺省时退回原逻辑。
+    enable_cross_sectional_residual_fallback : bool
+        当行业样本不足时，是否回退到截面去均值以减少缺失残差。
     """
     if price_data is None and stock_data is not None:
         price_data = stock_data
@@ -271,21 +286,46 @@ def add_labels_corrected(
             group_counts = grouped.transform('count')
 
             # 需要足够的同日同行业样本才有意义进行残差计算
-            effective_min = max(min(min_samples_per_date, 5), 3)
-            min_required = effective_min
+            if industry_residual_min_samples is not None:
+                min_required = max(2, int(industry_residual_min_samples))
+            else:
+                min_required = max(min(min_samples_per_date, 5), 3)
+
             sufficient_mask = group_counts >= min_required
+            result['future_residual_return'] = np.nan
 
             if sufficient_mask.any():
-                industry_mean = grouped.transform('mean')
-                residual_series = base_series - industry_mean
-                result['future_residual_return'] = residual_series
-                if (~sufficient_mask).any():
-                    result.loc[~sufficient_mask, 'future_residual_return'] = np.nan
-                residual_rows = int(sufficient_mask.sum())
-                coverage = residual_rows / len(result) if len(result) else 0.0
+                try:
+                    industry_mean = grouped.transform('mean')
+                    residual_series = base_series - industry_mean
+                    result.loc[sufficient_mask, 'future_residual_return'] = residual_series[sufficient_mask]
+                except Exception as exc:  # pragma: no cover - 容错日志
+                    logger.warning("  行业残差计算异常，回退原始收益标签: %s", exc)
+                    sufficient_mask[:] = False
+
+            if enable_cross_sectional_residual_fallback:
+                missing_residual_mask = result['future_residual_return'].isna() & base_series.notna()
+                if missing_residual_mask.any():
+                    cross_section_means = base_series.groupby(result['date']).transform('mean')
+                    cross_section_residual = base_series - cross_section_means
+                    result.loc[missing_residual_mask, 'future_residual_return'] = cross_section_residual[missing_residual_mask]
+
+            residual_rows = int(result['future_residual_return'].notna().sum())
+            coverage = residual_rows / len(result) if len(result) else 0.0
+
+            if residual_rows == 0:
+                if not enable_cross_sectional_residual_fallback:
+                    logger.debug("行业中性跳过: 日期/行业样本不足，且未启用截面回退")
+                else:
+                    logger.debug("行业中性跳过: 行业与截面残差均不可用")
+                result['future_residual_return'] = np.nan
+                stats['industry_residual_rows'] = 0
+                target_series = base_series
+            else:
+                remaining_mask = result['future_residual_return'].isna()
                 poor_industries: List[str] = []
-                if coverage < 0.5:
-                    insufficient_groups = result.loc[~sufficient_mask, ['date', '__industry__']]
+                if remaining_mask.any():
+                    insufficient_groups = result.loc[remaining_mask, ['date', '__industry__']]
                     poor_industries = (
                         insufficient_groups['__industry__']
                         .value_counts()
@@ -294,23 +334,20 @@ def add_labels_corrected(
                         .tolist()
                     )
                 logger.info(
-                    "  行业中性覆盖率: %.2f%% (%d/%d)%s",
+                    "  残差覆盖率: %.2f%% (%d/%d)%s",
                     coverage * 100,
                     residual_rows,
                     len(result),
                     f" | 覆盖不足行业Top: {poor_industries}" if poor_industries else ""
                 )
-                if coverage < 0.35:
-                    logger.warning("  行业中性覆盖率过低(<35%%)，回退使用原始收益标签")
+                if coverage < 0.25:
+                    logger.warning("  残差覆盖率过低(<25%%)，回退使用原始收益标签")
                     stats['industry_residual_rows'] = 0
                     result['future_residual_return'] = np.nan
                     target_series = base_series
                 else:
                     stats['industry_residual_rows'] = residual_rows
-                    target_series = result['future_residual_return'].where(sufficient_mask, base_series)
-            else:
-                logger.debug("行业中性跳过: 日期/行业样本不足，使用原始收益标签")
-                result['future_residual_return'] = np.nan
+                    target_series = result['future_residual_return'].where(result['future_residual_return'].notna(), base_series)
 
     result['label_reg'] = target_series
 
